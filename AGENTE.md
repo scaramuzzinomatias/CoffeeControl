@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 23/03/2026 — firmware ESP32-C3 v3 COMPLETO + modo offline implementado + pinout definitivo. Repo en GitHub: https://github.com/scaramuzzinomatias/CoffeeControl
+> Última actualización: 23/03/2026 — online/offline de máquinas + fix cascada NFC al borrar empleado + backend 0.0.0.0 + URL normalize. Repo en GitHub: https://github.com/scaramuzzinomatias/CoffeeControl
 >
 > **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
@@ -183,6 +183,7 @@ GET  /api/dashboard/uid-history/:uid   → últimos 50 taps de un UID específic
 GET  /api/machines                     → lista con estado y estadísticas
 GET  /api/machines/pending             → máquinas sin aprobar
 POST /api/machines/pending/:id/approve { name, location }
+GET  /api/machines                    → lista con estado (campo `online: bool` calculado — true si last_seen < 3 min)
 POST /api/machines/pending/:id/reject
 POST /api/machines/:id/block           { reason }
 POST /api/machines/:id/unblock
@@ -196,7 +197,7 @@ PATCH /api/employees/:id/limit         { daily_limit }
 POST  /api/employees/:id/cards         { uid, label }   ← upsert: ON CONFLICT actualiza
 PATCH /api/employees/:id/cards/:cardId { active?, label?, employee_id? }  ← toggle/renombrar/reasignar
 DELETE /api/employees/:id/cards/:cardId
-DELETE /api/employees/:id              (soft delete — pone active=false)
+DELETE /api/employees/:id              (soft delete — pone active=false EN EMPLOYEES y active=false en todas sus nfc_cards, transacción atómica)
 
 GET  /api/reports/machines             → ranking de máquinas por consumo
 GET  /api/reports/machines/:id/employees  → top empleados de una máquina
@@ -341,8 +342,10 @@ El ESP32-C3 UART admite como máximo `UART_DATA_8_BITS` — `uart_word_length_t`
 - [x] **DB migration_v4.sql** (columna `over_limit`) → `backend/sql/migration_v4.sql` ✅
 - [x] **Endpoints offline** (`GET /api/tap/cards`, `POST /api/tap/queue`) → `backend/src/routes/tap.js` ✅
 - [ ] **Ejecutar `migration_v4.sql`** contra la DB de producción: `psql $DATABASE_URL -f backend/sql/migration_v4.sql`
-- [ ] **Flashear firmware** al ESP32-C3: `pio run -e esp32c3 -t upload` (modo BOOT: mantener BOOT → presionar EN → soltar BOOT)
-- [ ] **Notificaciones por email/WhatsApp** cuando un empleado es bloqueado o supera el límite
+- [ ] **Flashear firmware** al ESP32-C3: `pio run -e esp32c3 -t upload` (modo BOOT: mantener BOOT → presionar EN → soltar BOOT)- [x] **Backend escucha en 0.0.0.0** (accesible desde LAN, no solo localhost) → `server.js` ✅
+- [x] **URL normalize en firmware** — `readConfig()` y `saveConfig()` convierten `Http://` → `http://` para evitar bug de teclado móvil en portal cautivo ✅
+- [x] **DELETE empleado cascada a tarjetas NFC** — la ruta usa transacción: desactiva empleado + desactiva sus nfc_cards en un solo query atómico ✅
+- [x] **Indicador online/offline de máquinas** — campo `online` en `GET /api/machines` (true si `last_seen < 3 min`), punto verde/gris en la tabla, métrica en dashboard. Heartbeat del firmware llama a `registerMachine()` cada 60s para mantener `last_seen` fresco ✅- [ ] **Notificaciones por email/WhatsApp** cuando un empleado es bloqueado o supera el límite
 - [ ] **Exportar reportes** a Excel/PDF
 - [ ] **Multi-tenant** para modo SaaS (campo `tenant_id` en todas las tablas, schema separado por empresa)
 - [ ] **OTA (Over The Air)** actualización de firmware desde el panel
