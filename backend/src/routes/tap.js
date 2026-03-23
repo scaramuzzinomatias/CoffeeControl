@@ -183,6 +183,148 @@ router.post('/reconcile', async (req, res) => {
     }
 });
 
+// ══════════════════════════════════════════════════════
+//  GET /api/tap/cards
+//  El firmware ESP32-C3 descarga el cache de tarjetas para modo offline.
+//  Retorna: [ { uid, daily_limit, used_today }, ... ]
+// ══════════════════════════════════════════════════════
+router.get('/cards', require('../middleware/machineAuth'), async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                nc.uid,
+                e.daily_limit,
+                COALESCE(COUNT(t.id) FILTER (
+                    WHERE t.approved   = true
+                      AND t.tapped_at >= CURRENT_DATE
+                      AND t.tapped_at <  CURRENT_DATE + INTERVAL '1 day'
+                ), 0)::int AS used_today
+             FROM nfc_cards nc
+             JOIN employees e ON e.id = nc.employee_id
+             LEFT JOIN taps t ON t.employee_id = nc.employee_id
+             WHERE nc.active = true AND e.active = true
+             GROUP BY nc.uid, e.daily_limit`
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('[CARDS] Error:', err.message);
+        res.status(500).json({ error: 'Error interno' });
+    }
+});
+
+// ══════════════════════════════════════════════════════
+//  POST /api/tap/queue
+//  El firmware envía eventos acumulados offline en lotes.
+//  Body: [ { uid, item_id, amount, ok, ts }, ... ]
+//    uid  — UID hex de la tarjeta
+//    ok   — true = venta exitosa, false = cancelada/fallida
+//    ts   — Unix timestamp del evento (segundos)
+//  Retorna: { ok, processed, errors }
+// ══════════════════════════════════════════════════════
+router.post('/queue', require('../middleware/machineAuth'), async (req, res) => {
+    const events  = req.body;
+    const machine = req.machine;
+
+    if (!Array.isArray(events)) {
+        return res.status(400).json({ error: 'Body debe ser un array JSON' });
+    }
+    if (events.length > 100) {
+        return res.status(400).json({ error: 'Máximo 100 eventos por lote' });
+    }
+
+    let processed = 0;
+    let errors    = 0;
+
+    for (const ev of events) {
+        const { uid, item_id, amount, ok, ts } = ev;
+        if (!uid) continue;
+
+        const upperUid = String(uid).toUpperCase().trim();
+        // ts es Unix timestamp en segundos; si falta, usar "ahora"
+        const tappedAt = ts ? new Date(Number(ts) * 1000) : new Date();
+
+        try {
+            // Buscar tarjeta y empleado
+            const cardResult = await pool.query(
+                `SELECT nc.employee_id, e.daily_limit, e.active
+                 FROM nfc_cards nc
+                 JOIN employees e ON e.id = nc.employee_id
+                 WHERE nc.uid = $1 AND nc.active = true`,
+                [upperUid]
+            );
+
+            if (cardResult.rowCount === 0) {
+                // Tarjeta desconocida: registrar como rechazada
+                await pool.query(
+                    `INSERT INTO taps
+                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
+                     VALUES ($1, $2, NULL, false, 'card_unknown', NULL, $3)`,
+                    [upperUid, machine.id, tappedAt]
+                );
+                processed++;
+                continue;
+            }
+
+            const { employee_id, daily_limit, active } = cardResult.rows[0];
+
+            if (!active || !ok) {
+                // Empleado inactivo o venta fallida → no cuenta contra el límite
+                await pool.query(
+                    `INSERT INTO taps
+                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
+                     VALUES ($1, $2, $3, false, $4, false, $5)`,
+                    [upperUid, machine.id, employee_id,
+                     active ? null : 'inactive', tappedAt]
+                );
+                processed++;
+                continue;
+            }
+
+            // ok = true: café dispensado offline
+            // Verificar si superó el límite: contar taps aprobados ese día ANTES de este evento
+            const dayStart = new Date(tappedAt);
+            dayStart.setUTCHours(0, 0, 0, 0);
+            const dayEnd = new Date(dayStart);
+            dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+            const countResult = await pool.query(
+                `SELECT COUNT(*) AS cnt
+                 FROM taps
+                 WHERE employee_id = $1
+                   AND approved    = true
+                   AND tapped_at  >= $2
+                   AND tapped_at   < $3
+                   AND tapped_at   < $4`,
+                [employee_id, dayStart, dayEnd, tappedAt]
+            );
+            const countBefore = parseInt(countResult.rows[0].cnt, 10);
+            const overLimit   = countBefore >= daily_limit;
+
+            await pool.query(
+                `INSERT INTO taps
+                    (nfc_uid, machine_id, employee_id, approved, confirmed,
+                     item_id, amount_cents, over_limit, tapped_at)
+                 VALUES ($1, $2, $3, true, true, $4, $5, $6, $7)`,
+                [upperUid, machine.id, employee_id,
+                 item_id || null, amount || null, overLimit, tappedAt]
+            );
+
+            if (overLimit) {
+                console.log(`[QUEUE] over_limit: uid=${upperUid} (${countBefore}/${daily_limit} ese dia)`);
+            }
+            broadcast({ event: 'queue_event', machine: machine.name, uid: upperUid, over_limit: overLimit });
+            processed++;
+
+        } catch (err) {
+            console.error(`[QUEUE] Error uid=${upperUid}:`, err.message);
+            errors++;
+        }
+    }
+
+    console.log(`[QUEUE] Máquina ${machine.name}: ${processed} procesados, ${errors} errores`);
+    res.status(200).json({ ok: true, processed, errors });
+});
+
 // ── Helper: insertar registro en taps ────────────────
 async function logTap({ uid, machine, employeeId, approved, reason }) {
     const result = await pool.query(
