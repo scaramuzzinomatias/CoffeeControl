@@ -1,0 +1,1348 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoffeeControl — Administración</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+// ══════════════════════════════════════════════════════
+//  USUARIOS (solo gerente/admin)
+// ══════════════════════════════════════════════════════
+async function loadUsers(){
+  render('<div class="page-title">Usuarios del panel</div><div class="empty">Cargando...</div>');
+  try{
+    const d = await api('GET','/api/admin-users');
+    renderUsers(d.users||[]);
+  }catch(e){render('<div class="page-title">Usuarios del panel</div><p style="color:var(--txd)">'+e.message+'</p>');}
+}
+
+function renderUsers(users){
+  const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor'};
+  const roleBadge = {admin:'bi',gerente:'bi',supervisor:'bw'};
+  const rows = users.map(u=>`<tr>
+    <td><strong>${u.username}</strong>${u.full_name?'<div style="font-size:11px;color:var(--tx3)">'+u.full_name+'</div>':''}</td>
+    <td><span class="badge ${roleBadge[u.role]||'bs'}">${roleLabel[u.role]||u.role}</span></td>
+    <td>${u.department||'<span style="color:var(--tx3)">Todos</span>'}</td>
+    <td><span class="badge ${u.active?'bs':'bd'}">${u.active?'Activo':'Inactivo'}</span></td>
+    <td style="font-size:11px;color:var(--tx3)">${new Date(u.created_at).toLocaleDateString('es-AR')}</td>
+    <td style="white-space:nowrap">
+      <button class="btn btn-ghost btn-xs" onclick="openEditUser(${u.id},'${u.username}','${u.role}','${u.full_name||''}','${u.department||''}')">Editar</button>
+      <button class="btn btn-xs" style="background:var(--bgd);color:var(--txd);margin-left:4px" onclick="deleteUser(${u.id},'${u.username}')">Eliminar</button>
+    </td>
+  </tr>`).join('');
+
+  render(`
+  <div class="topbar">
+    <div class="page-title">Usuarios del panel</div>
+    <button class="btn btn-primary btn-sm" onclick="openAddUser()">+ Nuevo usuario</button>
+  </div>
+  <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+    <div style="font-size:13px;color:var(--txi)">
+      <strong>Roles:</strong>
+      &nbsp;·&nbsp;<strong>Gerente</strong> — acceso total, puede crear/editar usuarios
+      &nbsp;·&nbsp;<strong>Supervisor</strong> — puede ver dashboard y reportes, sin acceso a configuración
+    </div>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Usuario</th><th>Rol</th><th>Área</th><th>Estado</th><th>Creado</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="empty">Sin usuarios</td></tr>'}</tbody>
+    </table>
+  </div>`);
+}
+
+function openAddUser(){
+  openModal('Nuevo usuario',`
+    <div class="field-row">
+      <div class="field"><label>Nombre de usuario *</label><input id="uUser" placeholder="supervisor.ventas" autocomplete="off"></div>
+      <div class="field"><label>Nombre completo</label><input id="uFull" placeholder="María García"></div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Rol *</label>
+        <select id="uRole">
+          <option value="gerente">Gerente (acceso total)</option>
+          <option value="supervisor" selected>Supervisor (solo lectura)</option>
+        </select>
+      </div>
+      <div class="field"><label>Área (opcional — limita vista del supervisor)</label><input id="uDep" placeholder="IT, Ventas, etc."></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Contraseña * (mín. 8 caracteres)</label><input id="uPass" type="password" autocomplete="new-password"></div>
+      <div class="field"><label>Repetir contraseña</label><input id="uPass2" type="password" autocomplete="new-password"></div>
+    </div>
+    <div class="err-banner" id="uErr"></div>
+  `,'saveUser()');
+}
+
+async function saveUser(){
+  const pass=document.getElementById('uPass').value;
+  const pass2=document.getElementById('uPass2').value;
+  if(pass!==pass2){showModalErr('uErr','Las contraseñas no coinciden');return;}
+  try{
+    await api('POST','/api/admin-users',{
+      username:v('uUser'),password:pass,role:v('uRole'),
+      full_name:v('uFull'),department:v('uDep')
+    });
+    closeModal();loadUsers();
+  }catch(e){showModalErr('uErr',e.message);}
+}
+
+function openEditUser(id,username,role,fullName,department){
+  openModal('Editar: '+username,`
+    <div class="field-row">
+      <div class="field"><label>Nombre completo</label><input id="uFull" value="${fullName}"></div>
+      <div class="field">
+        <label>Rol</label>
+        <select id="uRole">
+          <option value="gerente" ${role==='gerente'?'selected':''}>Gerente</option>
+          <option value="supervisor" ${role==='supervisor'?'selected':''}>Supervisor</option>
+        </select>
+      </div>
+    </div>
+    <div class="field"><label>Área</label><input id="uDep" value="${department}" placeholder="Dejar vacío = acceso a todos"></div>
+    <div class="field"><label>Nueva contraseña (dejar vacío para no cambiar)</label><input id="uPass" type="password" autocomplete="new-password" placeholder="••••••••"></div>
+    <div class="err-banner" id="uErr"></div>
+  `,`updateUser(${id})`);
+}
+
+async function updateUser(id){
+  const pass=document.getElementById('uPass').value;
+  const body={full_name:v('uFull'),role:v('uRole'),department:v('uDep')};
+  if(pass) body.password=pass;
+  try{
+    await api('PATCH',`/api/admin-users/${id}`,body);
+    closeModal();loadUsers();
+  }catch(e){showModalErr('uErr',e.message);}
+}
+
+async function deleteUser(id,username){
+  if(!confirm('¿Desactivar al usuario "'+username+'"?')) return;
+  try{await api('DELETE',`/api/admin-users/${id}`);loadUsers();}
+  catch(e){alert('Error: '+e.message);}
+}
+
+
+// ══════════════════════════════════════════════════════
+//  MÁQUINAS PENDIENTES
+// ══════════════════════════════════════════════════════
+async function checkPending(){
+  try{
+    const d=await api('GET','/api/machines/pending');
+    const n=(d.pending||[]).length;
+    const badge=document.getElementById('pendingBadge');
+    if(badge){badge.textContent=n;badge.style.display=n>0?'inline':'none';}
+  }catch(_){}
+}
+
+function showPendingBadge(){
+  const badge=document.getElementById('pendingBadge');
+  if(!badge) return;
+  const cur=parseInt(badge.textContent||'0');
+  badge.textContent=cur+1;
+  badge.style.display='inline';
+  // Flash para llamar la atención
+  badge.style.transform='scale(1.4)';
+  setTimeout(()=>badge.style.transform='',400);
+}
+
+async function renderPendingSection(container){
+  try{
+    const d=await api('GET','/api/machines/pending');
+    const pend=d.pending||[];
+    if(!pend.length){container.innerHTML='';return;}
+    const rows=pend.map(p=>{
+      const since=timeSince(p.first_seen);
+      const ping=timeSince(p.last_ping);
+      return `<tr>
+        <td><span style="font-family:monospace;font-size:12px;font-weight:500">${p.mac}</span></td>
+        <td style="font-size:11px;color:var(--tx3)">Vista hace ${since}</td>
+        <td style="font-size:11px;color:var(--tx3)">Ping hace ${ping}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-primary btn-xs" onclick="approvePending(${p.id},'${p.mac}')">Aprobar</button>
+          <button class="btn btn-xs" style="background:var(--bgd);color:var(--txd);margin-left:4px" onclick="rejectPending(${p.id})">Rechazar</button>
+        </td>
+      </tr>`;
+    }).join('');
+    container.innerHTML=`
+      <div class="card" style="border-color:#E24B4A;margin-bottom:16px">
+        <div class="card-title" style="color:var(--txd)">
+          <span>Máquinas pendientes de aprobación (${pend.length})</span>
+        </div>
+        <p style="font-size:12px;color:var(--tx2);margin-bottom:12px">
+          Estas máquinas se conectaron a la red y esperan ser aprobadas. Asignales un nombre y ubicación.
+        </p>
+        <table>
+          <thead><tr><th>MAC address</th><th>Primera vez</th><th>Último ping</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }catch(_){container.innerHTML='';}
+}
+
+async function approvePending(id,mac){
+  openModal('Aprobar máquina',`
+    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">MAC: <code style="font-family:monospace;font-size:12px">${mac}</code></p>
+    <div class="field"><label>Nombre de la máquina *</label><input id="pName" placeholder="Máquina A — Piso 1" autofocus></div>
+    <div class="field"><label>Ubicación</label><input id="pLoc" placeholder="Piso 1, sector entrada"></div>
+    <div class="err-banner" id="pErr"></div>
+  `,`doApprovePending(${id})`);
+}
+
+async function doApprovePending(id){
+  const name=document.getElementById('pName').value.trim();
+  if(!name){showModalErr('pErr','El nombre es requerido');return;}
+  try{
+    await api('POST',`/api/machines/pending/${id}/approve`,{name,location:v('pLoc')});
+    closeModal();checkPending();loadMachines();
+  }catch(e){showModalErr('pErr',e.message);}
+}
+
+async function rejectPending(id){
+  if(!confirm('¿Rechazar esta máquina? Se eliminará de la lista.')) return;
+  try{await api('POST',`/api/machines/pending/${id}/reject`);checkPending();loadMachines();}
+  catch(e){alert('Error: '+e.message);}
+}
+
+</script>
+<style>
+:root{
+  --bg:#fff;--bg2:#f5f5f3;--bg3:#eeede9;
+  --bgi:#e6f1fb;--bgs:#eaf3de;--bgw:#faeeda;--bgd:#fcebeb;
+  --tx:#1a1a18;--tx2:#5f5e5a;--tx3:#9c9a92;
+  --txi:#0c447c;--txs:#27500a;--txw:#633806;--txd:#791f1f;
+  --br:rgba(30,30,20,.12);--brm:rgba(30,30,20,.22);
+  --r:8px;--rl:12px;
+  --f:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#1e1e1c;--bg2:#282825;--bg3:#111110;
+  --bgi:#042c53;--bgs:#173404;--bgw:#412402;--bgd:#501313;
+  --tx:#e8e7e1;--tx2:#a8a69e;--tx3:#6e6c66;
+  --txi:#85b7eb;--txs:#c0dd97;--txw:#fac775;--txd:#f09595;
+  --br:rgba(255,255,240,.10);--brm:rgba(255,255,240,.20);
+}}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:var(--f);background:var(--bg3);color:var(--tx);min-height:100vh;}
+
+/* LOGIN */
+#loginScreen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;}
+.login-box{background:var(--bg);border:1px solid var(--br);border-radius:var(--rl);padding:36px;width:100%;max-width:380px;}
+.login-logo{font-size:18px;font-weight:500;margin-bottom:4px;}
+.login-sub{font-size:12px;color:var(--tx3);margin-bottom:28px;}
+.login-err{background:var(--bgd);color:var(--txd);border-radius:var(--r);padding:8px 12px;font-size:13px;margin-bottom:12px;display:none;}
+
+/* APP SHELL */
+#appScreen{display:none;min-height:100vh;}
+.sidebar{position:fixed;top:0;left:0;width:220px;height:100vh;background:var(--bg);border-right:1px solid var(--br);display:flex;flex-direction:column;z-index:100;}
+.sidebar-logo{padding:20px 18px 0;font-size:15px;font-weight:500;}
+.sidebar-sub{padding:2px 18px 16px;font-size:11px;color:var(--tx3);}
+.sidebar-sep{height:1px;background:var(--br);margin:0 18px 8px;}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 18px;cursor:pointer;border-radius:var(--r);margin:0 8px 2px;font-size:13px;color:var(--tx2);transition:background .15s;}
+.nav-item:hover{background:var(--bg2);}
+.nav-item.on{background:var(--bg2);color:var(--tx);font-weight:500;}
+.nav-icon{width:16px;text-align:center;font-size:14px;flex-shrink:0;}
+.sidebar-bottom{margin-top:auto;padding:12px 8px;}
+.main{margin-left:220px;padding:28px;min-height:100vh;}
+.page-title{font-size:18px;font-weight:500;margin-bottom:20px;}
+
+/* INPUTS / FORMS */
+input,select,textarea{border:1px solid var(--brm);border-radius:var(--r);font-size:13px;font-family:var(--f);color:var(--tx);background:var(--bg);padding:8px 10px;width:100%;}
+input:focus,select:focus{outline:2px solid var(--txi);border-color:transparent;}
+label{font-size:12px;color:var(--tx2);display:block;margin-bottom:4px;}
+.field{margin-bottom:14px;}
+.field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.field-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+
+/* BUTTONS */
+.btn{padding:8px 16px;border-radius:var(--r);font-size:13px;font-family:var(--f);cursor:pointer;font-weight:500;border:none;transition:opacity .15s;}
+.btn:hover{opacity:.85;}
+.btn-primary{background:#185FA5;color:#fff;}
+.btn-danger {background:#A32D2D;color:#fff;}
+.btn-ghost  {background:var(--bg2);color:var(--tx);border:1px solid var(--brm);}
+.btn-sm{padding:5px 12px;font-size:12px;}
+.btn-xs{padding:3px 8px;font-size:11px;}
+
+/* CARDS / TABLES */
+.card{background:var(--bg);border:1px solid var(--br);border-radius:var(--rl);padding:20px;margin-bottom:16px;}
+.card-title{font-size:14px;font-weight:500;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;}
+.metric{background:var(--bg2);border-radius:var(--r);padding:14px 12px;}
+.mlbl{font-size:11px;color:var(--tx2);margin-bottom:5px;}
+.mval{font-size:22px;font-weight:500;}
+.mval.danger{color:var(--txd);}
+.mval.warn{color:var(--txw);}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{text-align:left;font-size:11px;font-weight:500;color:var(--tx2);text-transform:uppercase;letter-spacing:.05em;padding:0 10px 10px;}
+td{padding:10px;border-bottom:1px solid var(--br);vertical-align:middle;}
+tr:last-child td{border-bottom:none;}
+tr:hover td{background:var(--bg2);}
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:100px;font-size:11px;font-weight:500;}
+.bs{background:var(--bgs);color:var(--txs);}
+.bw{background:var(--bgw);color:var(--txw);}
+.bd{background:var(--bgd);color:var(--txd);}
+.bi{background:var(--bgi);color:var(--txi);}
+
+/* MODAL */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:200;display:none;align-items:center;justify-content:center;padding:20px;}
+.modal-bg.show{display:flex;}
+.modal{background:var(--bg);border-radius:var(--rl);padding:28px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;}
+.modal-title{font-size:16px;font-weight:500;margin-bottom:20px;}
+.modal-footer{display:flex;gap:10px;justify-content:flex-end;margin-top:20px;}
+
+/* MISC */
+.ws-pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:100px;background:var(--bg2);color:var(--tx3);border:1px solid var(--br);}
+.ws-pill.ok{background:var(--bgs);color:var(--txs);border-color:transparent;}
+.ws-dot{width:6px;height:6px;border-radius:50%;background:currentColor;}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:10px;}
+.section-lbl{font-size:11px;font-weight:500;color:var(--tx2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
+.empty{color:var(--tx3);font-size:13px;padding:20px 0;text-align:center;}
+.avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;flex-shrink:0;}
+.err-banner{background:var(--bgd);color:var(--txd);border-radius:var(--r);padding:8px 12px;font-size:12px;margin-bottom:12px;display:none;}
+.search-bar{padding:7px 10px;border-radius:var(--r);border:1px solid var(--brm);font-size:13px;font-family:var(--f);color:var(--tx);background:var(--bg);min-width:200px;}
+
+@media(max-width:700px){.sidebar{display:none;}.main{margin-left:0;padding:16px;}.metrics{grid-template-columns:repeat(2,1fr);}.field-row,.field-row3{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="loginScreen">
+<div class="login-box">
+  <div class="login-logo">CoffeeControl</div>
+  <div class="login-sub">Panel de administración</div>
+  <div class="login-err" id="loginErr"></div>
+  <div class="field"><label>Usuario</label><input type="text" id="loginUser" value="admin" autocomplete="username"></div>
+  <div class="field"><label>Contraseña</label><input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password"></div>
+  <div class="field" style="margin-bottom:6px">
+    <label>URL del backend</label>
+    <input type="text" id="loginUrl" placeholder="http://192.168.1.100:3000">
+  </div>
+  <button class="btn btn-primary" style="width:100%;margin-top:10px" onclick="doLogin()">Ingresar</button>
+</div>
+</div>
+
+<!-- APP -->
+<div id="appScreen">
+<div class="sidebar">
+  <div class="sidebar-logo">CoffeeControl</div>
+  <div class="sidebar-sub">Panel de administración</div>
+  <div class="sidebar-sep"></div>
+  <div class="nav-item on"  onclick="nav('dashboard')"  id="n-dashboard"><span class="nav-icon">◈</span>Dashboard</div>
+  <div class="nav-item"     onclick="nav('machines')"   id="n-machines"><span class="nav-icon">⬡</span>Máquinas <span id="pendingBadge" style="display:none;background:#E24B4A;color:#fff;border-radius:100px;font-size:10px;padding:1px 6px;margin-left:4px">0</span></div>
+  <div class="nav-item"     onclick="nav('employees')"  id="n-employees"><span class="nav-icon">◉</span>Empleados</div>
+  <div class="nav-item"     onclick="nav('reports')"    id="n-reports"><span class="nav-icon">◎</span>Reportes</div>
+  <div class="nav-item"     onclick="nav('live')"       id="n-live"><span class="nav-icon">●</span>Feed en vivo</div>
+  <div class="nav-item"     onclick="nav('unknown')"    id="n-unknown"><span class="nav-icon">⚑</span>Tarjetas <span id="unknownBadge" style="display:none;background:#E24B4A;color:#fff;border-radius:100px;font-size:10px;padding:1px 6px;margin-left:4px">0</span></div>
+  <div class="nav-item"     onclick="nav('users')"      id="n-users" style="display:none"><span class="nav-icon">◐</span>Usuarios</div>
+  <div id="userInfo" style="padding:8px 18px 0;font-size:12px;color:var(--tx3)"></div>
+  <div class="sidebar-bottom">
+    <div class="ws-pill" id="wsPill" style="margin-bottom:10px;width:100%;justify-content:center"><span class="ws-dot"></span><span id="wsLbl">Desconectado</span></div>
+    <div class="nav-item" onclick="doLogout()" style="color:var(--txd)"><span class="nav-icon">←</span>Cerrar sesión</div>
+  </div>
+</div>
+<div class="main" id="mainContent"></div>
+</div>
+
+<!-- MODALS -->
+<div class="modal-bg" id="modal"><div class="modal" id="modalInner"></div></div>
+
+<script>
+// ══════════════════════════════════════════════════════
+//  Estado
+// ══════════════════════════════════════════════════════
+let BASE = localStorage.getItem('cc_url2') || 'http://localhost:3000';
+let TOKEN = localStorage.getItem('cc_token') || '';
+let WS = null;
+let currentPage = 'dashboard';
+const AV=[{bg:'#e6f1fb',c:'#0c447c'},{bg:'#faeeda',c:'#633806'},{bg:'#e1f5ee',c:'#085041'},{bg:'#fcebeb',c:'#791f1f'},{bg:'#eaf3de',c:'#27500a'},{bg:'#fbeaf0',c:'#72243e'},{bg:'#eeedfe',c:'#3c3489'},{bg:'#faece7',c:'#712b13'}];
+
+// ══════════════════════════════════════════════════════
+//  Init
+// ══════════════════════════════════════════════════════
+document.getElementById('loginUrl').value = BASE;
+if(TOKEN) showApp();
+
+// ══════════════════════════════════════════════════════
+//  AUTH
+// ══════════════════════════════════════════════════════
+async function doLogin(){
+  BASE = document.getElementById('loginUrl').value.trim().replace(/\/$/,'');
+  localStorage.setItem('cc_url2', BASE);
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  const err = document.getElementById('loginErr');
+  err.style.display='none';
+  try{
+    const res = await fetch(BASE+'/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const d = await res.json();
+    if(!res.ok) throw new Error(d.error||'Error');
+    TOKEN = d.token;
+    localStorage.setItem('cc_token', TOKEN);
+    showApp();
+  }catch(e){
+    err.textContent = e.message;
+    err.style.display='block';
+  }
+}
+document.getElementById('loginPass').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
+
+function doLogout(){
+  TOKEN=''; localStorage.removeItem('cc_token');
+  if(WS){WS.close();WS=null;}
+  document.getElementById('appScreen').style.display='none';
+  document.getElementById('loginScreen').style.display='flex';
+}
+
+function showApp(){
+  try{
+    const payload = JSON.parse(atob(TOKEN.split('.')[1]));
+    const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor'}[payload.role]||payload.role;
+    const ui = document.getElementById('userInfo');
+    if(ui) ui.innerHTML = '<strong>'+payload.username+'</strong><br>'+roleLabel;
+    // Solo gerente/admin ve la sección usuarios
+    const nu = document.getElementById('n-users');
+    if(nu && (payload.role==='gerente'||payload.role==='admin')) nu.style.display='flex';
+    // Supervisor: ocultar máquinas/empleados si es necesario (ver permisos)
+  }catch(_){}
+  document.getElementById('loginScreen').style.display='none';
+  document.getElementById('appScreen').style.display='block';
+  connectWS();
+  nav('dashboard');
+  checkPending();
+  setInterval(checkPending, 30000);
+  loadUnknownBadge();
+}
+
+// ══════════════════════════════════════════════════════
+//  API helper
+// ══════════════════════════════════════════════════════
+async function api(method, path, body){
+  const opts={method,headers:{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}};
+  if(body) opts.body=JSON.stringify(body);
+  const res=await fetch(BASE+path,opts);
+  if(res.status===401){doLogout();throw new Error('Sesión expirada');}
+  const d=await res.json();
+  if(!res.ok) throw new Error(d.error||'Error HTTP '+res.status);
+  return d;
+}
+
+// ══════════════════════════════════════════════════════
+//  WebSocket
+// ══════════════════════════════════════════════════════
+function connectWS(){
+  if(WS){WS.close();WS=null;}
+  const url=BASE.replace(/^http/,'ws')+'/ws';
+  try{WS=new WebSocket(url);}catch(e){setWS('err');return;}
+  WS.onopen=()=>setWS('ok');
+  WS.onclose=()=>{setWS('off');setTimeout(connectWS,5000);};
+  WS.onerror=()=>setWS('err');
+  WS.onmessage=(e)=>{
+    try{
+      const msg=JSON.parse(e.data);
+      if(currentPage==='dashboard') loadDashboard();
+      if(currentPage==='live') prependLive(msg);
+      if(currentPage==='machines'||(msg.event==='machine_blocked'||msg.event==='machine_unblocked'||msg.event==='machine_pending'||msg.event==='machine_approved')) loadMachines();
+      if(msg.event==='machine_pending') showPendingBadge();
+      if(msg.event==='card_unknown') handleUnknownCard(msg);
+    }catch(_){}
+  };
+}
+function setWS(s){
+  const p=document.getElementById('wsPill'),l=document.getElementById('wsLbl');
+  p.className='ws-pill';
+  if(s==='ok'){p.classList.add('ok');l.textContent='En vivo';}
+  else if(s==='err'){l.textContent='Error WS';}
+  else{l.textContent='Desconectado';}
+}
+
+// ══════════════════════════════════════════════════════
+//  NAV
+// ══════════════════════════════════════════════════════
+function nav(page){
+  currentPage=page;
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('on'));
+  const ni=document.getElementById('n-'+page);
+  if(ni) ni.classList.add('on');
+  const pages={dashboard:loadDashboard,machines:loadMachines,employees:loadEmployees,reports:loadReports,live:loadLive,unknown:loadUnknown,users:loadUsers};
+  if(pages[page]) pages[page]();
+}
+
+function render(html){document.getElementById('mainContent').innerHTML=html;}
+
+// ══════════════════════════════════════════════════════
+//  DASHBOARD
+// ══════════════════════════════════════════════════════
+let dashChart=null;
+async function loadDashboard(){
+  render('<div class="page-title">Dashboard</div><div class="empty">Cargando...</div>');
+  try{
+    const [today,monthly,machines]=await Promise.all([
+      api('GET','/api/dashboard/today'),
+      api('GET','/api/dashboard/monthly'),
+      api('GET','/api/machines'),
+    ]);
+    renderDashboard(today,monthly,machines);
+  }catch(e){render('<div class="page-title">Dashboard</div><div class="bd badge">'+e.message+'</div>');}
+}
+
+function renderDashboard(today,monthly,machinesData){
+  const emps=today.employees||[];
+  const s=today.summary||{};
+  const mc=monthly.total_spent_cents||0;
+  const mt=(monthly.employees||[]).reduce((a,e)=>a+parseInt(e.taps_total||0),0);
+  const blk=s.blocked_employees||0;
+  const mBlk=(machinesData.machines||[]).filter(m=>m.blocked).length;
+
+  const metricsHtml=[
+    ['Gasto mensual','$'+Math.round(mc/100).toLocaleString('es-AR'),''],
+    ['Cafés este mes',mt.toLocaleString(),''],
+    ['Empleados bloqueados hoy',blk,blk>0?'danger':''],
+    ['Máquinas bloqueadas',mBlk,mBlk>0?'warn':''],
+  ].map(([l,v,cls])=>`<div class="metric"><div class="mlbl">${l}</div><div class="mval ${cls}">${v}</div></div>`).join('');
+
+  const sorted=[...emps].sort((a,b)=>b.taps_today-a.taps_today);
+  const rankHtml=sorted.map((e,i)=>{
+    const av=AV[i%8];
+    const ini=e.employee_name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+    const st=empStatus(e);
+    return `<tr>
+      <td><div style="display:flex;align-items:center;gap:8px"><div class="avatar" style="background:${av.bg};color:${av.c}">${ini}</div><div><div style="font-weight:500;font-size:13px">${e.employee_name}</div><div style="font-size:11px;color:var(--tx3)">${e.department||''}</div></div></div></td>
+      <td>${e.taps_today}/${e.daily_limit}</td>
+      <td>$${Math.round((e.spent_today_cents||0)/100).toLocaleString('es-AR')}</td>
+      <td>${stBadge(st)}</td>
+      <td><button class="btn btn-ghost btn-xs" onclick="showEmployeeDetail(${e.employee_id})">Ver</button></td>
+    </tr>`;
+  }).join('');
+
+  const html=`
+  <div class="topbar"><div class="page-title">Dashboard</div><div style="font-size:12px;color:var(--tx3)">${new Date().toLocaleString('es-AR')}</div></div>
+  <div class="metrics">${metricsHtml}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div class="card">
+      <div class="card-title">Ranking hoy</div>
+      <table><thead><tr><th>Empleado</th><th>Cafés</th><th>$</th><th>Estado</th><th></th></tr></thead><tbody>${rankHtml}</tbody></table>
+    </div>
+    <div class="card">
+      <div class="card-title">Consumo hoy</div>
+      <div style="position:relative;height:240px"><canvas id="dashChart"></canvas></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Alertas activas</div>
+    <div id="alertsBox"></div>
+  </div>`;
+
+  render(html);
+
+  const wa=emps.filter(e=>empStatus(e)!=='ok');
+  document.getElementById('alertsBox').innerHTML=wa.length
+    ?wa.map(e=>{const b=empStatus(e)==='blocked';return `<div style="background:${b?'var(--bgd)':'var(--bgw)'};color:${b?'var(--txd)':'var(--txw)'};border-radius:var(--r);padding:9px 12px;margin-bottom:8px;font-size:13px"><strong>${e.employee_name}</strong> — ${b?`Bloqueado (${e.taps_today}/${e.daily_limit} hoy)`:`Advertencia (${e.taps_today}/${e.daily_limit} hoy)`}</div>`;}).join('')
+    :'<div class="empty">Sin alertas activas.</div>';
+
+  const labels=sorted.map(e=>e.employee_name.split(' ')[0]);
+  const data=sorted.map(e=>parseInt(e.taps_today));
+  const colors=sorted.map(e=>empStatus(e)==='blocked'?'#E24B4A':empStatus(e)==='warning'?'#EF9F27':'#1D9E75');
+  const canvas=document.getElementById('dashChart');
+  if(canvas){
+    if(dashChart) dashChart.destroy();
+    dashChart=new Chart(canvas,{type:'bar',data:{labels,datasets:[{data,backgroundColor:colors,borderRadius:4,borderSkipped:false}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10},color:'#888',maxRotation:40,autoSkip:false}},y:{grid:{color:'rgba(128,128,128,.08)'},ticks:{font:{size:10},color:'#888'}}}}});
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  MÁQUINAS
+// ══════════════════════════════════════════════════════
+let allMachines=[];
+
+async function loadMachines(){
+  render('<div class="page-title">Máquinas</div><div class="empty">Cargando...</div>');
+  try{
+    const d=await api('GET','/api/machines');
+    allMachines=d.machines||[];
+    renderMachines();
+  }catch(e){render('<div class="page-title">Máquinas</div><p style="color:var(--txd)">'+e.message+'</p>');}
+}
+
+function renderMachines(){
+  render(`
+  <div id="pendingContainer"></div>
+  <div class="topbar">
+    <div class="page-title">Máquinas</div>
+    <button class="btn btn-primary btn-sm" onclick="openAddMachine()">+ Nueva máquina</button>
+  </div>
+  <div class="card">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--br)">
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Buscar</label>
+        <input id="mfSearch" placeholder="Nombre / ubicación…" oninput="applyMachineFilters()"
+          style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2);width:180px">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Estado</label>
+        <select id="mfStatus" onchange="applyMachineFilters()"
+          style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Todos</option>
+          <option value="active">Activa</option>
+          <option value="inactive">Inactiva</option>
+          <option value="blocked">Bloqueada</option>
+        </select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Actividad</label>
+        <select id="mfActivity" onchange="applyMachineFilters()"
+          style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Toda</option>
+          <option value="today">Con tap hoy</option>
+          <option value="none">Sin actividad este mes</option>
+        </select>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="resetMachineFilters()" style="align-self:flex-end">Limpiar filtros</button>
+    </div>
+    <table>
+      <thead><tr><th>Nombre / Ubicación</th><th>Estado</th><th>Hoy</th><th>Mes</th><th>$ Mes</th><th>Último tap</th><th></th></tr></thead>
+      <tbody id="machinesTbody"></tbody>
+    </table>
+  </div>`);
+  renderPendingSection(document.getElementById('pendingContainer'));
+  applyMachineFilters();
+}
+
+function applyMachineFilters(){
+  const q=(document.getElementById('mfSearch')?.value||'').toLowerCase().trim();
+  const st=document.getElementById('mfStatus')?.value||'';
+  const act=document.getElementById('mfActivity')?.value||'';
+  const filtered=allMachines.filter(m=>{
+    if(q && !`${m.name} ${m.location||''}`.toLowerCase().includes(q)) return false;
+    if(st){const s=m.blocked?'blocked':m.active?'active':'inactive'; if(s!==st) return false;}
+    if(act==='today' && !(m.taps_today>0)) return false;
+    if(act==='none' && (m.taps_month>0)) return false;
+    return true;
+  });
+  const rows=filtered.map(m=>{
+    const since=m.last_tap_at?timeSince(m.last_tap_at):'Nunca';
+    const stBg=m.blocked?'bd':m.active?'bs':'bw';
+    const stLbl=m.blocked?'Bloqueada':m.active?'Activa':'Inactiva';
+    return `<tr>
+      <td><strong>${m.name}</strong><div style="font-size:11px;color:var(--tx3)">${m.location||'—'}</div></td>
+      <td><span class="badge ${stBg}">${stLbl}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:3px">${m.blocked_reason||''}</div>`:''}</td>
+      <td>${m.taps_today||0}</td>
+      <td>${m.taps_month||0}</td>
+      <td>$${Math.round((m.cost_month_cents||0)/100).toLocaleString('es-AR')}</td>
+      <td style="font-size:11px;color:var(--tx3)">${since}</td>
+      <td style="white-space:nowrap">
+        ${m.blocked
+          ?`<button class="btn btn-ghost btn-xs" onclick="unblockMachine(${m.id},'${m.name}')">Desbloquear</button>`
+          :`<button class="btn btn-xs" style="background:var(--bgd);color:var(--txd)" onclick="blockMachine(${m.id},'${m.name}')">Bloquear</button>`}
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="machineDetail(${m.id},'${m.name}')">Ver</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px;color:var(--txd)" onclick="deleteMachine(${m.id},'${m.name}')">Eliminar</button>
+      </td>
+    </tr>`;
+  }).join('');
+  const tbody=document.getElementById('machinesTbody');
+  if(tbody) tbody.innerHTML=rows||'<tr><td colspan="7" class="empty">Sin resultados</td></tr>';
+}
+
+function resetMachineFilters(){
+  ['mfSearch','mfStatus','mfActivity'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+  applyMachineFilters();
+}
+
+async function deleteMachine(id,name){
+  if(!confirm(`¿Eliminar la máquina "${name}"? Esta acción no se puede deshacer.`)) return;
+  try{await api('DELETE',`/api/machines/${id}`);loadMachines();}
+  catch(e){alert('Error: '+e.message);}
+}
+
+async function blockMachine(id,name){
+  const reason=prompt(`Motivo del bloqueo para "${name}" (opcional):`);
+  if(reason===null) return;
+  try{
+    await api('POST',`/api/machines/${id}/block`,{reason:reason||'Bloqueada por administrador'});
+    loadMachines();
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function unblockMachine(id,name){
+  if(!confirm(`¿Desbloquear "${name}"?`)) return;
+  try{await api('POST',`/api/machines/${id}/unblock`);loadMachines();}
+  catch(e){alert('Error: '+e.message);}
+}
+
+async function machineDetail(id,name){
+  try{
+    const [rep,taps]=await Promise.all([
+      api('GET',`/api/reports/machines/${id}/employees`),
+      api('GET',`/api/machines/${id}/taps?limit=20`),
+    ]);
+    const empRows=(rep.employees||[]).map(e=>`<tr><td>${e.employee_name}</td><td>${e.legajo||'—'}</td><td>${e.department||'—'}</td><td>${e.taps_count}</td><td>$${Math.round((e.spent_cents||0)/100).toLocaleString('es-AR')}</td></tr>`).join('');
+    const tapRows=(taps.taps||[]).map(t=>`<tr><td>${t.employee_name}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ OK':'✕ Rechazado'}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
+    openModal(`Máquina: ${name}`,`
+      <div class="section-lbl" style="margin-bottom:8px">Top empleados (mes actual)</div>
+      <table style="margin-bottom:20px"><thead><tr><th>Empleado</th><th>Legajo</th><th>Área</th><th>Cafés</th><th>$</th></tr></thead><tbody>${empRows||'<tr><td colspan="5" class="empty">Sin datos</td></tr>'}</tbody></table>
+      <div class="section-lbl" style="margin-bottom:8px">Últimos 20 taps</div>
+      <table><thead><tr><th>Empleado</th><th>Resultado</th><th>Hora</th></tr></thead><tbody>${tapRows||'<tr><td colspan="3" class="empty">Sin taps</td></tr>'}</tbody></table>
+    `,'',true);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+function openAddMachine(){
+  openModal('Nueva máquina',`
+    <div class="field"><label>Nombre *</label><input id="mName" placeholder="Máquina E — Piso 3"></div>
+    <div class="field"><label>Ubicación</label><input id="mLoc" placeholder="Piso 3, sector contabilidad"></div>
+    <div class="field"><label>Secret (clave del ESP8266) *</label><input id="mSecret" placeholder="cc-secret-5"></div>
+    <div class="err-banner" id="mErr"></div>
+  `,`saveMachine()`);
+}
+
+async function saveMachine(){
+  const name=document.getElementById('mName').value.trim();
+  const location=document.getElementById('mLoc').value.trim();
+  const secret=document.getElementById('mSecret').value.trim();
+  if(!name||!secret){showModalErr('mErr','Nombre y secret son requeridos');return;}
+  try{
+    await api('POST','/api/machines',{name,location,secret});
+    closeModal();loadMachines();
+  }catch(e){showModalErr('mErr',e.message);}
+}
+
+// ══════════════════════════════════════════════════════
+//  EMPLEADOS
+// ══════════════════════════════════════════════════════
+let allEmployees=[];
+
+async function loadEmployees(){
+  render('<div class="page-title">Empleados</div><div class="empty">Cargando...</div>');
+  try{
+    const d=await api('GET','/api/employees');
+    allEmployees=d.employees||[];
+    renderEmployees();
+  }catch(e){render('<p style="color:var(--txd)">'+e.message+'</p>');}
+}
+
+function renderEmployees(){
+  const depts=[...new Set(allEmployees.map(e=>e.department).filter(Boolean))].sort();
+  const deptOpts=depts.map(d=>`<option value="${d}">${d}</option>`).join('');
+  render(`
+  <div class="topbar">
+    <div class="page-title">Empleados</div>
+    <button class="btn btn-primary btn-sm" onclick="openAddEmployee()">+ Nuevo empleado</button>
+  </div>
+  <div class="card">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--br)">
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Buscar</label>
+        <input id="efSearch" placeholder="Nombre, legajo, DNI, email…" oninput="applyEmployeeFilters()"
+          style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2);width:200px">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Área</label>
+        <select id="efDept" onchange="applyEmployeeFilters()"
+          style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Todas</option>${deptOpts}
+        </select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Tarjetas NFC</label>
+        <select id="efCards" onchange="applyEmployeeFilters()"
+          style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Todas</option>
+          <option value="active">Con tarjeta activa</option>
+          <option value="none">Sin tarjeta activa</option>
+        </select>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="resetEmployeeFilters()" style="align-self:flex-end">Limpiar filtros</button>
+    </div>
+    <table>
+      <thead><tr><th>Nombre</th><th>Legajo</th><th>DNI</th><th>Área</th><th>Límite</th><th>Tarjetas</th><th></th></tr></thead>
+      <tbody id="employeesTbody"></tbody>
+    </table>
+  </div>`);
+  applyEmployeeFilters();
+}
+
+function applyEmployeeFilters(){
+  const q=(document.getElementById('efSearch')?.value||'').toLowerCase().trim();
+  const dept=document.getElementById('efDept')?.value||'';
+  const cards=document.getElementById('efCards')?.value||'';
+  const filtered=allEmployees.filter(e=>{
+    if(q && !`${e.name} ${e.legajo||''} ${e.dni||''} ${e.email||''}`.toLowerCase().includes(q)) return false;
+    if(dept && e.department!==dept) return false;
+    const active=(e.nfc_cards||[]).filter(c=>c.active).length;
+    if(cards==='active' && active===0) return false;
+    if(cards==='none' && active>0) return false;
+    return true;
+  });
+  const rows=filtered.map((e,i)=>{
+    const av=AV[i%8];
+    const ini=e.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+    const activeCards=(e.nfc_cards||[]).filter(c=>c.active).length;
+    return `<tr>
+      <td><div style="display:flex;align-items:center;gap:8px">
+        <div class="avatar" style="background:${av.bg};color:${av.c}">${ini}</div>
+        <div><div style="font-weight:500">${e.name}</div><div style="font-size:11px;color:var(--tx3)">${e.email||'—'}</div></div>
+      </div></td>
+      <td>${e.legajo||'—'}</td>
+      <td>${e.dni||'—'}</td>
+      <td>${e.department||'—'}</td>
+      <td>${e.daily_limit} cafés/día</td>
+      <td>${activeCards} tarjeta${activeCards!==1?'s':''}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-ghost btn-xs" onclick="showEmployeeDetail(${e.id})">Ver</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openEditEmployee(${e.id})">Editar</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openAddCard(${e.id},'${e.name}')">+ NFC</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px;color:var(--txd)" onclick="deleteEmployee(${e.id},'${e.name}')">Eliminar</button>
+      </td>
+    </tr>`;
+  }).join('');
+  const tbody=document.getElementById('employeesTbody');
+  if(tbody) tbody.innerHTML=rows||'<tr><td colspan="7" class="empty">Sin empleados</td></tr>';
+}
+
+function resetEmployeeFilters(){
+  ['efSearch','efDept','efCards'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+  applyEmployeeFilters();
+}
+
+async function showEmployeeDetail(id){
+  try{
+    const d=await api('GET',`/api/employees/${id}`);
+    const e=d.employee;
+    const machRows=(d.machines_this_month||[]).map(m=>`<tr><td>${m.machine_name}</td><td>${m.location||'—'}</td><td>${m.taps_count}</td><td>$${Math.round((m.spent_cents||0)/100).toLocaleString('es-AR')}</td></tr>`).join('');
+    const tapRows=(d.recent_taps||[]).map(t=>`<tr><td>${t.machine_name}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓':'✕'}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
+    const empId=e.id;
+    const cardRows=(e.nfc_cards||[]).map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--br)">
+      <div style="min-width:0">
+        <strong style="font-size:12px;font-family:monospace">${c.uid}</strong>
+        <span style="font-size:11px;color:var(--tx3);margin-left:6px">${c.label}</span>
+        <span class="badge ${c.active?'bs':'bd'}" style="font-size:10px;margin-left:6px">${c.active?'Activa':'Inactiva'}</span>
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0">
+        <button class="btn btn-ghost btn-xs" onclick="toggleCard(${empId},${c.id},${c.active})">${c.active?'Desactivar':'Activar'}</button>
+        <button class="btn btn-ghost btn-xs" onclick="renameCard(${empId},${c.id},this)"  data-label="${c.label.replace(/"/g,'&quot;')}">Renombrar</button>
+        <button class="btn btn-ghost btn-xs" onclick="reassignCard(${c.id},'${c.uid}')">Reasignar</button>
+      </div>
+    </div>`).join('');
+
+    openModal(e.name,`
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;font-size:13px">
+        <div><span style="color:var(--tx3)">DNI:</span> ${e.dni||'—'}</div>
+        <div><span style="color:var(--tx3)">Legajo:</span> ${e.legajo||'—'}</div>
+        <div><span style="color:var(--tx3)">Área:</span> ${e.department||'—'}</div>
+        <div><span style="color:var(--tx3)">Límite:</span> ${e.daily_limit} cafés/día</div>
+        <div><span style="color:var(--tx3)">Email:</span> ${e.email||'—'}</div>
+        <div><span style="color:var(--tx3)">Teléfono:</span> ${e.phone||'—'}</div>
+      </div>
+      <div class="section-lbl" style="margin-bottom:8px">Tarjetas NFC</div>
+      <div style="margin-bottom:20px">${cardRows||'<div class="empty">Sin tarjetas</div>'}</div>
+      <div class="section-lbl" style="margin-bottom:8px">Consumo por máquina (mes actual)</div>
+      <table style="margin-bottom:20px"><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés</th><th>$</th></tr></thead><tbody>${machRows||'<tr><td colspan="4" class="empty">Sin consumo este mes</td></tr>'}</tbody></table>
+      <div class="section-lbl" style="margin-bottom:8px">Últimos 30 taps</div>
+      <table><thead><tr><th>Máquina</th><th>Resultado</th><th>Fecha/hora</th></tr></thead><tbody>${tapRows||'<tr><td colspan="3" class="empty">Sin taps</td></tr>'}</tbody></table>
+    `,'',true);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+function openAddEmployee(){
+  openModal('Nuevo empleado',`
+    <div class="field-row">
+      <div class="field"><label>Nombre completo *</label><input id="eN" placeholder="Juan Pérez"></div>
+      <div class="field"><label>Área / Departamento</label><input id="eDep" placeholder="IT"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>DNI</label><input id="eDni" placeholder="30123456"></div>
+      <div class="field"><label>Legajo</label><input id="eLeg" placeholder="EMP-001"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Email</label><input id="eEmail" type="email" placeholder="juan@empresa.com"></div>
+      <div class="field"><label>Teléfono</label><input id="eTel" placeholder="+54 11 1234-5678"></div>
+    </div>
+    <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="4" min="1" max="50"></div>
+    <div class="err-banner" id="eErr"></div>
+  `,'saveEmployee()');
+}
+
+async function saveEmployee(){
+  const name=document.getElementById('eN').value.trim();
+  if(!name){showModalErr('eErr','El nombre es requerido');return;}
+  try{
+    await api('POST','/api/employees',{
+      name,department:v('eDep'),email:v('eEmail'),dni:v('eDni'),
+      legajo:v('eLeg'),phone:v('eTel'),daily_limit:parseInt(v('eLim'))||4
+    });
+    closeModal();loadEmployees();
+  }catch(e){showModalErr('eErr',e.message);}
+}
+
+async function openEditEmployee(id){
+  try{
+    const d=await api('GET',`/api/employees/${id}`);
+    const e=d.employee;
+    openModal('Editar: '+e.name,`
+      <div class="field-row">
+        <div class="field"><label>Nombre *</label><input id="eN" value="${e.name}"></div>
+        <div class="field"><label>Área</label><input id="eDep" value="${e.department||''}"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>DNI</label><input id="eDni" value="${e.dni||''}"></div>
+        <div class="field"><label>Legajo</label><input id="eLeg" value="${e.legajo||''}"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Email</label><input id="eEmail" value="${e.email||''}"></div>
+        <div class="field"><label>Teléfono</label><input id="eTel" value="${e.phone||''}"></div>
+      </div>
+      <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="${e.daily_limit}" min="1" max="50"></div>
+      <div class="err-banner" id="eErr"></div>
+    `,`updateEmployee(${id})`);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function updateEmployee(id){
+  try{
+    await api('PATCH',`/api/employees/${id}`,{
+      name:v('eN'),department:v('eDep'),email:v('eEmail'),dni:v('eDni'),
+      legajo:v('eLeg'),phone:v('eTel'),daily_limit:parseInt(v('eLim'))||4
+    });
+    closeModal();loadEmployees();
+  }catch(e){showModalErr('eErr',e.message);}
+}
+
+async function deleteEmployee(id,name){
+  if(!confirm(`¿Eliminar al empleado "${name}"? Se desactivará su cuenta y tarjetas.`)) return;
+  try{await api('DELETE',`/api/employees/${id}`);loadEmployees();}
+  catch(e){alert('Error: '+e.message);}
+}
+
+function openAddCard(empId,empName){
+  openModal(`Registrar tarjeta NFC — ${empName}`,`
+    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">Ingresá el UID de la tarjeta. Podés leerlo con una app NFC en el celular (ej: NFC Tools) o con el lector RC522 del dispositivo.</p>
+    <div class="field"><label>UID de la tarjeta (hexadecimal) *</label><input id="cardUid" placeholder="A1B2C3D4" style="font-family:monospace;text-transform:uppercase"></div>
+    <div class="field"><label>Etiqueta (opcional)</label><input id="cardLabel" placeholder="Tarjeta principal / Llavero"></div>
+    <div class="err-banner" id="cardErr"></div>
+  `,`saveCard(${empId})`);
+}
+
+async function saveCard(empId){
+  const uid=document.getElementById('cardUid').value.toUpperCase().trim();
+  const label=document.getElementById('cardLabel').value.trim();
+  if(!uid){showModalErr('cardErr','El UID es requerido');return;}
+  try{
+    await api('POST',`/api/employees/${empId}/cards`,{uid,label:label||'Tarjeta'});
+    closeModal();loadEmployees();
+  }catch(e){showModalErr('cardErr',e.message);}
+}
+
+async function toggleCard(empId,cardId,currentActive){
+  try{
+    await api('PATCH',`/api/employees/${empId}/cards/${cardId}`,{active:!currentActive});
+    showEmployeeDetail(empId);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function renameCard(empId,cardId,btn){
+  const currentLabel=btn.getAttribute('data-label')||'';
+  const newLabel=prompt('Nueva etiqueta para la tarjeta:',currentLabel);
+  if(newLabel===null) return; // cancelado
+  try{
+    await api('PATCH',`/api/employees/${empId}/cards/${cardId}`,{label:newLabel.trim()||'Tarjeta'});
+    showEmployeeDetail(empId);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function reassignCard(cardId,uid){
+  try{
+    const d=await api('GET','/api/employees');
+    const opts=(d.employees||[]).map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
+    openModal('Reasignar tarjeta',`
+      <p style="font-size:13px;color:var(--tx2);margin-bottom:12px">UID: <code style="font-family:monospace;background:var(--bg2);padding:2px 6px;border-radius:4px">${uid}</code></p>
+      <label>Nuevo empleado</label>
+      <select id="reassignEmpId" style="width:100%;padding:8px;border:1px solid var(--br);border-radius:var(--r);font-size:13px;margin-top:4px">${opts}</select>
+      <div id="reassignErr" style="display:none;color:var(--txd);font-size:12px;margin-top:8px"></div>
+    `,`saveReassignCard(${cardId})`);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function saveReassignCard(cardId){
+  const newEmpId=document.getElementById('reassignEmpId').value;
+  try{
+    await api('PATCH',`/api/employees/0/cards/${cardId}`,{employee_id:parseInt(newEmpId)});
+    closeModal();loadEmployees();
+  }catch(e){showModalErr('reassignErr',e.message);}
+}
+
+// ══════════════════════════════════════════════════════
+//  REPORTES
+// ══════════════════════════════════════════════════════
+async function loadReports(){
+  render('<div class="page-title">Reportes</div><div class="empty">Cargando...</div>');
+  try{
+    const [machines,emps]=await Promise.all([
+      api('GET','/api/reports/machines'),
+      api('GET','/api/employees'),
+    ]);
+    renderReports(machines.machines||[],emps.employees||[]);
+  }catch(e){render('<p style="color:var(--txd)">'+e.message+'</p>');}
+}
+
+function renderReports(machines,emps){
+  const mRows=machines.map((m,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${m.name}</td>
+    <td>${m.location||'—'}</td>
+    <td>${m.taps_today||0}</td>
+    <td><strong>${m.taps_month||0}</strong></td>
+    <td><strong>$${Math.round((m.cost_month_cents||0)/100).toLocaleString('es-AR')}</strong></td>
+    <td style="font-size:11px;color:var(--tx3)">${m.last_tap_at?timeSince(m.last_tap_at):'Nunca'}</td>
+    <td><button class="btn btn-ghost btn-xs" onclick="machineDetail(${m.id},'${m.name}')">Detalle</button></td>
+  </tr>`).join('');
+
+  const empOptions=emps.map(e=>`<option value="${e.id}">${e.name} (${e.legajo||e.department||''})</option>`).join('');
+
+  render(`
+  <div class="page-title">Reportes</div>
+  <div class="card">
+    <div class="card-title">Ranking de máquinas — mes actual</div>
+    <table><thead><tr><th>Máquina</th><th>Ubicación</th><th>Hoy</th><th>Cafés mes</th><th>$ mes</th><th>Último uso</th><th></th></tr></thead>
+    <tbody>${mRows||'<tr><td colspan="7" class="empty">Sin datos</td></tr>'}</tbody></table>
+  </div>
+  <div class="card">
+    <div class="card-title">Consumo por empleado — ¿dónde consumió?</div>
+    <div style="display:flex;gap:10px;align-items:flex-end;margin-bottom:16px;flex-wrap:wrap">
+      <div style="flex:1;min-width:200px"><label>Empleado</label><select id="empSelect">${empOptions}</select></div>
+      <button class="btn btn-primary btn-sm" onclick="loadEmpMachines()">Consultar</button>
+    </div>
+    <div id="empMachineResult"></div>
+  </div>`);
+}
+
+async function loadEmpMachines(){
+  const id=document.getElementById('empSelect').value;
+  const el=document.getElementById('empMachineResult');
+  el.innerHTML='<div class="empty">Cargando...</div>';
+  try{
+    const d=await api('GET',`/api/reports/employees/${id}/machines`);
+    const rows=(d.machines||[]).map(m=>`<tr>
+      <td>${m.machine_name}</td><td>${m.location||'—'}</td>
+      <td>${m.taps_count}</td>
+      <td>$${Math.round((m.spent_cents||0)/100).toLocaleString('es-AR')}</td>
+    </tr>`).join('');
+    el.innerHTML=rows
+      ?`<table><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés (mes)</th><th>$ (mes)</th></tr></thead><tbody>${rows}</tbody></table>`
+      :'<div class="empty">Sin consumo este mes en ninguna máquina.</div>';
+  }catch(e){el.innerHTML='<div style="color:var(--txd)">'+e.message+'</div>';}
+}
+
+// ══════════════════════════════════════════════════════
+//  FEED EN VIVO
+// ══════════════════════════════════════════════════════
+let liveItems=[];
+
+async function loadLive(){
+  render(`
+  <div class="topbar">
+    <div class="page-title">Feed en vivo</div>
+    <button class="btn btn-ghost btn-sm" onclick="clearLiveView()" style="margin-left:auto;color:var(--txd)">Limpiar vista</button>
+  </div>
+  <div class="card">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--br)">
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Estado</label>
+        <select id="lfStatus" onchange="renderLive()" style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Todos</option>
+          <option value="approved">✓ Aprobados</option>
+          <option value="denied">✕ Rechazados</option>
+        </select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Máquina</label>
+        <select id="lfMachine" onchange="renderLive()" style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Todas</option>
+        </select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Empleado</label>
+        <input id="lfEmp" oninput="renderLive()" placeholder="Buscar nombre…" style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2);width:140px">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="font-size:11px;color:var(--tx3)">Motivo rechazo</label>
+        <select id="lfReason" onchange="renderLive()" style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
+          <option value="">Todos</option>
+          <option value="limit_reached">Límite alcanzado</option>
+          <option value="card_unknown">Tarjeta desconocida</option>
+          <option value="inactive">Empleado inactivo</option>
+        </select>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="resetLiveFilters()" style="align-self:flex-end">Limpiar filtros</button>
+    </div>
+    <div id="liveBox"><div class="empty">Cargando...</div></div>
+  </div>`);
+  try{
+    const d=await api('GET','/api/dashboard/feed');
+    liveItems=d.taps||[];
+    updateLiveMachineFilter();
+    renderLive();
+  }catch(e){
+    const el=document.getElementById('liveBox');
+    if(el) el.innerHTML='<div style="color:var(--txd)">'+e.message+'</div>';
+  }
+}
+
+function updateLiveMachineFilter(){
+  const sel=document.getElementById('lfMachine');
+  if(!sel) return;
+  const current=sel.value;
+  const machines=[...new Set(liveItems.map(t=>t.machine_name).filter(Boolean))].sort();
+  sel.innerHTML='<option value="">Todas</option>'+machines.map(m=>`<option value="${m}"${m===current?' selected':''}>${m}</option>`).join('');
+}
+
+function renderLive(){
+  const el=document.getElementById('liveBox');
+  if(!el) return;
+
+  const status  = document.getElementById('lfStatus')?.value  || '';
+  const machine = document.getElementById('lfMachine')?.value || '';
+  const emp     = (document.getElementById('lfEmp')?.value    || '').toLowerCase().trim();
+  const reason  = document.getElementById('lfReason')?.value  || '';
+
+  let items=liveItems;
+  if(status==='approved') items=items.filter(t=> t.approved);
+  if(status==='denied')   items=items.filter(t=>!t.approved);
+  if(machine)             items=items.filter(t=>t.machine_name===machine);
+  if(emp)                 items=items.filter(t=>(t.employee_name||'').toLowerCase().includes(emp)||(t.nfc_uid||'').toLowerCase().includes(emp));
+  if(reason)              items=items.filter(t=>t.deny_reason===reason);
+
+  const hasFilter=status||machine||emp||reason;
+  if(!items.length){
+    el.innerHTML=`<div class="empty">Sin registros${hasFilter?' que coincidan con los filtros':' hoy'}.</div>`;
+    return;
+  }
+
+  el.innerHTML=items.map(t=>{
+    const ok=t.approved;
+    const col=ok?'var(--txs)':'var(--txd)';
+    const hora=new Date(t.tapped_at).toLocaleString('es-AR',{hour:'2-digit',minute:'2-digit',second:'2-digit',day:'numeric',month:'short'});
+    return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--br)">
+      <span style="font-weight:500;font-size:12px;color:${col};width:14px;flex-shrink:0">${ok?'✓':'✕'}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:500">${t.employee_name||'Desconocido'}</div>
+        <div style="font-size:11px;color:var(--tx3)">${t.machine_name}${t.deny_reason?' · '+t.deny_reason:''}</div>
+        ${t.nfc_uid?`<div style="font-size:10px;color:var(--tx3);font-family:monospace;margin-top:1px">${t.nfc_uid}</div>`:''}
+      </div>
+      <div style="text-align:right;flex-shrink:0">
+        <div style="font-size:12px;color:${col}">${ok&&t.amount_cents?'$'+Math.round(t.amount_cents/100).toLocaleString('es-AR'):ok?'OK':'Rechazado'}</div>
+        <div style="font-size:10px;color:var(--tx3)">${hora}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function resetLiveFilters(){
+  ['lfStatus','lfMachine','lfReason'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+  const ef=document.getElementById('lfEmp');if(ef)ef.value='';
+  renderLive();
+}
+
+function clearLiveView(){
+  liveItems=[];
+  renderLive();
+}
+
+function prependLive(msg){
+  if(!['tap_approved','tap_denied','card_unknown'].includes(msg.event)) return;
+  liveItems.unshift({
+    employee_name: msg.employee||null,
+    nfc_uid:       msg.uid||null,
+    machine_name:  msg.machine||'—',
+    approved:      msg.event==='tap_approved',
+    deny_reason:   msg.event==='card_unknown'?'card_unknown':msg.event==='tap_denied'?'limit_reached':null,
+    tapped_at:     new Date().toISOString()
+  });
+  if(liveItems.length>100) liveItems.pop();
+  updateLiveMachineFilter();
+  renderLive();
+}
+
+// ══════════════════════════════════════════════════════
+//  TARJETAS DESCONOCIDAS
+// ══════════════════════════════════════════════════════
+let unknownCards=[];
+
+// ── helpers localStorage para UIDs descartados ──────
+function getDiscarded(){
+  try{ return new Set(JSON.parse(localStorage.getItem('cc_discarded_uids')||'[]')); }
+  catch(_){ return new Set(); }
+}
+function saveDiscarded(set){
+  localStorage.setItem('cc_discarded_uids', JSON.stringify([...set]));
+}
+function addDiscarded(uid){
+  const s=getDiscarded(); s.add(uid); saveDiscarded(s);
+}
+function removeDiscarded(uid){
+  const s=getDiscarded(); s.delete(uid); saveDiscarded(s);
+}
+
+// Precarga los UIDs desconocidos de DB al iniciar la app (para el badge)
+async function loadUnknownBadge(){
+  try{
+    const d=await api('GET','/api/dashboard/unknown-uids');
+    const discarded=getDiscarded();
+    (d.uids||[]).forEach(u=>{
+      if(discarded.has(u.uid)) return; // descartado por el usuario
+      if(!unknownCards.find(c=>c.uid===u.uid)){
+        unknownCards.push({uid:u.uid,machine:u.machine||'—',machine_id:u.machine_id,ts:u.ts});
+      }
+    });
+    const badge=document.getElementById('unknownBadge');
+    if(badge){
+      if(unknownCards.length>0){badge.textContent=unknownCards.length;badge.style.display='';}
+      else badge.style.display='none';
+    }
+  }catch(e){console.warn('loadUnknownBadge:',e.message);}
+}
+
+function handleUnknownCard(msg){
+  // Si la tarjeta fue descartada, el nuevo tap del ESP la "reactiva"
+  removeDiscarded(msg.uid);
+  if(unknownCards.find(c=>c.uid===msg.uid)) return;
+  unknownCards.unshift({uid:msg.uid,machine:msg.machine||'—',machine_id:msg.machine_id,ts:new Date().toISOString()});
+  const badge=document.getElementById('unknownBadge');
+  if(badge){badge.textContent=unknownCards.length;badge.style.display='';}
+  if(currentPage==='unknown') renderUnknownCards();
+}
+
+async function loadUnknown(){
+  try{
+    const d=await api('GET','/api/dashboard/unknown-uids');
+    const discarded=getDiscarded();
+    // Mezclar: los de DB que no estén descartados ni ya en memoria
+    (d.uids||[]).forEach(u=>{
+      if(discarded.has(u.uid)) return;
+      if(!unknownCards.find(c=>c.uid===u.uid)){
+        unknownCards.push({uid:u.uid,machine:u.machine||'—',machine_id:u.machine_id,ts:u.ts});
+      }
+    });
+    const badge=document.getElementById('unknownBadge');
+    if(badge){
+      if(unknownCards.length>0){badge.textContent=unknownCards.length;badge.style.display='';}
+      else badge.style.display='none';
+    }
+  }catch(e){console.warn('Error cargando UIDs desconocidos:',e.message);}
+  renderUnknownCards();
+}
+
+function renderUnknownCards(){
+  if(!unknownCards.length){
+    render(`<div class="topbar"><div class="page-title">Tarjetas desconocidas</div></div>
+    <div class="card"><div class="empty">Sin tarjetas desconocidas detectadas.<br><small style="color:var(--tx3)">Cuando alguien acerque una tarjeta sin asignar, aparecerá aquí en tiempo real.</small></div></div>`);
+    return;
+  }
+  const rows=unknownCards.map(c=>`<tr>
+    <td style="font-family:monospace;font-size:12px">${c.uid}</td>
+    <td>${c.machine}</td>
+    <td style="color:var(--tx3);font-size:12px">${timeSince(c.ts)}</td>
+    <td style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn btn-primary btn-xs" onclick="openAssignModal('${c.uid}')">Asignar</button>
+      <button class="btn btn-ghost btn-xs" onclick="showUidHistory('${c.uid}')">Ver intentos</button>
+      <button class="btn btn-ghost btn-xs" style="color:var(--txd)" onclick="discardUnknownCard('${c.uid}')">Descartar</button>
+    </td>
+  </tr>`).join('');
+  render(`<div class="topbar"><div class="page-title">Tarjetas desconocidas</div></div>
+  <div class="card">
+    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">Estas tarjetas fueron acercadas pero no tienen empleado asignado. Asignales un empleado para habilitarlas.</p>
+    <table><thead><tr><th>UID</th><th>Máquina</th><th>Detectada</th><th>Acciones</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`);
+}
+
+function discardUnknownCard(uid){
+  addDiscarded(uid); // persiste en localStorage
+  unknownCards=unknownCards.filter(c=>c.uid!==uid);
+  const badge=document.getElementById('unknownBadge');
+  if(badge){
+    if(unknownCards.length===0) badge.style.display='none';
+    else badge.textContent=unknownCards.length;
+  }
+  if(currentPage==='unknown') renderUnknownCards();
+}
+
+async function showUidHistory(uid){
+  try{
+    const d=await api('GET','/api/dashboard/uid-history/'+uid);
+    const rows=(d.taps||[]).map(t=>{
+      const hora=new Date(t.tapped_at).toLocaleString('es-AR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+      return `<tr>
+        <td>${t.machine}</td>
+        <td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ Aprobado':'✕ '+(t.deny_reason||'Denegado')}</td>
+        <td style="font-size:11px;color:var(--tx3)">${hora}</td>
+      </tr>`;
+    }).join('');
+    openModal(`Historial UID: ${uid}`,
+      `<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">${d.total} intento${d.total!==1?'s':''} registrado${d.total!==1?'s':''}</p>
+       <table><thead><tr><th>Máquina</th><th>Resultado</th><th>Fecha/hora</th></tr></thead>
+       <tbody>${rows||'<tr><td colspan="3" class="empty">Sin registros</td></tr>'}</tbody></table>`,
+      '',true);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function openAssignModal(uid){
+  const d=await api('GET','/api/employees');
+  const opts=(d.employees||[]).map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
+  openModal('Asignar tarjeta NFC',`
+    <p style="font-size:13px;color:var(--tx2);margin-bottom:12px">UID: <code style="font-family:monospace;background:var(--bg2);padding:2px 6px;border-radius:4px">${uid}</code></p>
+    <label>Empleado</label>
+    <select id="assignEmpId" style="width:100%;padding:8px;border:1px solid var(--br);border-radius:var(--r);font-size:13px;margin-bottom:10px">${opts}</select>
+    <label>Etiqueta (opcional)</label>
+    <input type="text" id="assignLabel" placeholder="ej: Tarjeta principal" style="width:100%;padding:8px;border:1px solid var(--br);border-radius:var(--r);font-size:13px">
+    <div id="assignErr" style="display:none;color:var(--txd);font-size:12px;margin-top:8px"></div>
+  `,`saveAssignCard('${uid}')`);
+}
+
+async function saveAssignCard(uid){
+  const empId=document.getElementById('assignEmpId').value;
+  const label=document.getElementById('assignLabel').value.trim();
+  try{
+    await api('POST',`/api/employees/${empId}/cards`,{uid,label:label||null});
+    unknownCards=unknownCards.filter(c=>c.uid!==uid);
+    const badge=document.getElementById('unknownBadge');
+    if(badge){
+      if(unknownCards.length===0) badge.style.display='none';
+      else badge.textContent=unknownCards.length;
+    }
+    closeModal();
+    if(currentPage==='unknown') renderUnknownCards();
+    if(currentPage==='employees') loadEmployees();
+  }catch(e){showModalErr('assignErr',e.message);}
+}
+
+// ══════════════════════════════════════════════════════
+//  MODAL helpers
+// ══════════════════════════════════════════════════════
+function openModal(title,body,saveCall,readOnly){
+  document.getElementById('modal').classList.add('show');
+  document.getElementById('modalInner').innerHTML=`
+    <div class="modal-title">${title}</div>
+    <div id="modalBody">${body}</div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cerrar</button>
+      ${!readOnly&&saveCall?`<button class="btn btn-primary" onclick="${saveCall}">Guardar</button>`:''}
+    </div>`;
+}
+function closeModal(){document.getElementById('modal').classList.remove('show');}
+document.getElementById('modal').addEventListener('click',e=>{ if(e.target===document.getElementById('modal')) closeModal(); });
+function showModalErr(id,msg){const el=document.getElementById(id);if(el){el.textContent=msg;el.style.display='block';}}
+
+// ══════════════════════════════════════════════════════
+//  Helpers
+// ══════════════════════════════════════════════════════
+function v(id){const el=document.getElementById(id);return el?el.value.trim()||null:null;}
+function empStatus(e){const r=parseInt(e.taps_today)/parseInt(e.daily_limit);return r>=1?'blocked':r>=.75?'warning':'ok';}
+function stBadge(s){return{blocked:'<span class="badge bd">Bloqueado</span>',warning:'<span class="badge bw">Advertencia</span>',ok:'<span class="badge bs">Normal</span>'}[s];}
+function timeSince(iso){
+  const d=new Date(iso);const now=new Date();const m=Math.floor((now-d)/60000);
+  if(m<1) return 'Ahora';if(m<60) return `Hace ${m} min`;
+  const h=Math.floor(m/60);if(h<24) return `Hace ${h}h`;
+  return d.toLocaleDateString('es-AR');
+}
+</script>
+</body>
+</html>
