@@ -9,21 +9,29 @@
  *   - LittleFS para cards.json y queue.json (modo offline)
  *   - Autenticación local: cache de hasta ~1500 tarjetas en RAM
  *   - Cola offline: hasta 1000 eventos, flush automático al reconectar
- *   - DS3231 RTC para reset de medianoche (I²C GPIO8/10), fallback NTP
- *   - MDB 9-bit por software igual que v2 (IRAM_ATTR, GPIO5/6)
+ *   - DS3231 RTC para reset de medianoche (I²C GPIO5/6), fallback NTP
+ *   - MDB 9-bit por software (IRAM_ATTR, GPIO20/21)
+ *     Nota: el ESP32-C3 NO soporta 9-bit en UART hardware (registro
+ *     bit_num tiene solo 2 bits → máx. 8 bits de dato). El bit-banging
+ *     con IRAM_ATTR es la única opción y funciona perfectamente.
  * ─────────────────────────────────────────────────────
- * Pines ESP32-C3 Super Mini:
+ * Pines ESP32-C3 Super Mini — pinout definitivo:
  *   GPIO0  = SPI SCK  (RC522)
  *   GPIO1  = SPI MOSI (RC522)
- *   GPIO2  = SPI MISO (RC522)
- *   GPIO3  = RC522 SS
- *   GPIO4  = RC522 RST
- *   GPIO5  = MDB RX (bit-banging, entrada del bus)
- *   GPIO6  = MDB TX (bit-banging, salida al bus)
- *   GPIO7  = LED externo (activo HIGH)
- *   GPIO8  = I²C SDA (DS3231)
+ *   GPIO3  = SPI MISO (RC522)   ← NO usar GPIO2: strapping pin
+ *   GPIO4  = RC522 SS  (CS)
+ *   GPIO7  = RC522 RST
+ *   GPIO5  = I²C SDA (DS3231)   ← pines recomendados por datasheet
+ *   GPIO6  = I²C SCL (DS3231)   ← Wire.begin(5, 6)
+ *   GPIO10 = LED externo (activo HIGH)
  *   GPIO9  = BOOT button (pull-up interno, LOW = presionado, reset config)
- *   GPIO10 = I²C SCL (DS3231)
+ *   GPIO20 = MDB TX (bit-banging, salida al bus)
+ *   GPIO21 = MDB RX (bit-banging, entrada del bus)
+ *
+ * Pines que NO conectar nada:
+ *   GPIO2  = strapping (debe estar HIGH al boot)
+ *   GPIO8  = LED onboard + strapping (debe estar HIGH al boot)
+ *   GPIO18/19 = USB D-/D+ (programación)
  */
 
 #include <Arduino.h>
@@ -43,15 +51,15 @@
 // ── Pines ─────────────────────────────────────────────
 #define PIN_SPI_SCK    0
 #define PIN_SPI_MOSI   1
-#define PIN_SPI_MISO   2
-#define PIN_RC522_SS   3
-#define PIN_RC522_RST  4
-#define PIN_MDB_RX     5
-#define PIN_MDB_TX     6
-#define PIN_LED        7
-#define PIN_I2C_SDA    8
-#define PIN_BOOT_BTN   9    // BOOT button: pull-up interno, LOW = presionado
-#define PIN_I2C_SCL   10
+#define PIN_SPI_MISO   3   // GPIO2 es strapping pin → usar GPIO3
+#define PIN_RC522_SS   4
+#define PIN_RC522_RST  7
+#define PIN_I2C_SDA    5   // pines recomendados por referencia oficial
+#define PIN_I2C_SCL    6
+#define PIN_LED       10
+#define PIN_BOOT_BTN   9   // BOOT button: pull-up interno, LOW = presionado
+#define PIN_MDB_TX    20   // GPIO20/21: UART0 nativo (no hay beneficio de HW
+#define PIN_MDB_RX    21   // para MDB 9-bit — ESP32-C3 max 8-bit en hardware)
 
 // ── Modo de deployment ────────────────────────────────
 // Opción B — servidor local (URL configurable en el portal)
