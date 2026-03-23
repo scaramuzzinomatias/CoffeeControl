@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 23/03/2026 — edge cases MDB/NFC identificados, punto de restauración git creado (commit `a25148b`).
+> Última actualización: 23/03/2026 — migración planificada a ESP32-C3 Super Mini + PlatformIO. Arquitectura offline con fallback local (cards.json + queue.json en SPIFFS).
 >
 > **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
@@ -14,16 +14,37 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 
 ## Decisiones de arquitectura tomadas
 
-### Hardware por máquina
-- **Microcontrolador:** ESP8266 (NodeMCU o Wemos D1 Mini) — ~$3 USD
+### Hardware por máquina (v2 — target de producción)
+- **Microcontrolador:** ESP32-C3 Super Mini — ~$2-3 USD
 - **Lector NFC:** RC522 (13.56 MHz, protocolo SPI) — ~$4 USD
 - **Adaptador de nivel:** MAX3232 (convierte 3.3V ESP ↔ 5V bus MDB) — ~$2 USD
-- **Total hardware por máquina:** ~$9 USD
+- **RTC:** DS3231 (I2C, batería de respaldo) — ~$1-2 USD ← **posible gracias a pines I2C libres**
+- **Total hardware por máquina:** ~$10-11 USD
+
+### Hardware por máquina (v1 — prototipo actual)
+- **Microcontrolador:** ESP8266 (NodeMCU o Wemos D1 Mini) — ~$3 USD
+- **Lector NFC:** RC522 — ~$4 USD
+- **Adaptador de nivel:** MAX3232 — ~$2 USD
+- **Sin RTC** — pines I2C (D1/D2) ocupados por MDB, no hay pines libres para DS3231
+- **Total:** ~$9 USD
 
 ### Por qué ESP8266 y no Raspberry Pi
 - RPi es overkill, cara (~$80), corre Linux (SD corruptible si se va la luz)
 - ESP8266 arranca en segundos, sin SO, consume poco, WiFi integrado
 - Se descartó Arduino solo porque no tiene WiFi nativo
+
+### Por qué migrar de ESP8266 a ESP32-C3 Super Mini
+| Factor | ESP8266 | ESP32-C3 Super Mini |
+|---|---|---|
+| Heap libre | ~30KB | ~380KB |
+| Pines I2C | Ocupados por MDB | GPIO8/GPIO10 libres |
+| UART hardware | 1 (debug) | 2 — UART1 libre para MDB |
+| MDB 9-bit | Bit-banging (SoftwareSerial) | UART1 nativo — más robusto |
+| RTC DS3231 | ❌ Sin pines | ✅ I2C libre |
+| Max tarjetas cache | 200 (seguro) | 2000+ |
+| Max cola offline | 100 (seguro) | 1000+ |
+| Precio | ~$3 | ~$2-3 |
+| Tamaño | NodeMCU grande / D1 Mini chico | Super Mini ≈ D1 Mini |
 
 ### Protocolo MDB (Multi-Drop Bus)
 - Las expendedoras usan MDB estándar ISO — el ESP se registra como **Cashless Peripheral** (tipo 0x10)
@@ -64,7 +85,7 @@ Se subió código de **VMflow.xyz** (ESP32-S3 + MDB + BLE + MQTT). Decisión: no
 
 | Capa | Tecnología |
 |---|---|
-| Firmware | C++ Arduino (ESP8266) |
+| Firmware | C++ Arduino / PlatformIO (ESP32-C3 Super Mini — target; ESP8266 — prototipo) |
 | Protocolo expendedora | MDB cashless peripheral |
 | NFC | RC522 vía SPI |
 | WiFi config | Portal cautivo (ESP8266WebServer) |
@@ -214,6 +235,7 @@ machine_approved    { event, mac, machine }
 
 ## Pines del hardware
 
+### ESP8266 — prototipo (pines actuales)
 ```
 ESP8266 (NodeMCU / Wemos D1 Mini)
 
@@ -227,6 +249,26 @@ RC522 (SPI):                    MDB (via MAX3232):
   GND     → GND
 
 LED de estado → LED_BUILTIN (activo LOW en NodeMCU)
+NOTA: D1/D2 (I2C estándar) ocupados por MDB → sin RTC DS3231 posible
+```
+
+### ESP32-C3 Super Mini — target de producción
+```
+ESP32-C3 Super Mini  (GPIOs disponibles: 0-10; GPIO18/19 = USB interno, no expuestos)
+
+RC522 (SPI hardware):           MDB (UART1 hardware — 9-bit nativo):
+  SS    → GPIO3                  TX → GPIO6 → MAX3232 T1IN → bus MDB
+  SCK   → GPIO0                  RX → GPIO5 ← MAX3232 R1OUT ← bus MDB
+  MOSI  → GPIO1
+  MISO  → GPIO2                DS3231 RTC (I2C — ahora posible):
+  RST   → GPIO4                  SDA → GPIO8
+  VCC   → 3.3V (¡no 5V!)        SCL → GPIO10
+  GND   → GND                    VCC → 3.3V / GND → GND
+
+LED de estado → GPIO7
+Reset lógico  → GPIO9 (botón BOOT integrado — no usar como GPIO de entrada normal)
+
+Total pines usados: 10 de 11 disponibles
 ```
 
 ---
@@ -286,7 +328,8 @@ LED de estado → LED_BUILTIN (activo LOW en NodeMCU)
 3. La tarjeta queda activa inmediatamente; el UID desaparece de la lista de desconocidos
 
 ### Pendiente / próximos pasos sugeridos
-- [ ] **Fix edge cases MDB/NFC** (CRÍTICO — ver sección siguiente)
+- [ ] **Migración ESP32-C3 Super Mini + PlatformIO** (ver sección "Migración ESP8266 → ESP32-C3")
+- [ ] **Modo offline con fallback local** (ver sección "Arquitectura offline")
 - [ ] **Notificaciones por email/WhatsApp** cuando un empleado es bloqueado o supera el límite
 - [ ] **Exportar reportes** a Excel/PDF
 - [ ] **Multi-tenant** para modo SaaS (campo `tenant_id` en todas las tablas, schema separado por empresa)
@@ -295,6 +338,138 @@ LED de estado → LED_BUILTIN (activo LOW en NodeMCU)
 - [ ] **Historial de cambios** (auditoría: quién cambió qué y cuándo)
 - [ ] **App móvil** para el gerente (o PWA del panel existente)
 - [ ] **Seguridad del payload MDB**: implementar XOR + timestamp como VMflow para evitar replay attacks
+
+---
+
+## Migración ESP8266 → ESP32-C3 Super Mini
+
+> Decisión tomada el 23/03/2026. ESP8266 se mantiene como plataforma de prototipo; ESP32-C3 Super Mini es el target de producción.
+
+### Toolchain: Arduino IDE → PlatformIO
+- `platformio.ini` como lockfile de dependencias (reproducible, versionado en git)
+- Multi-target: mismo `src/` compila para esp8266 y esp32c3 con environments separados
+- Build desde consola + compatible con CI/CD
+- El código C++ no cambia al cambiar de IDE
+
+### Qué cambia en el firmware
+
+| Componente | ESP8266 (actual) | ESP32-C3 (target) |
+|---|---|---|
+| MDB 9-bit | `MDB9bit.h` bit-banging SoftwareSerial | `HardwareSerial Serial1` con 9-bit nativo |
+| Filesystem | `#include <FS.h>` SPIFFS | `#include <LittleFS.h>` (mejor wear leveling) |
+| RTC | No disponible | DS3231 via I2C + librería RTClib (Adafruit) |
+| Hora offline | NTP único | DS3231 primario + NTP fallback |
+| WiFi/HTTP | `ESP8266WiFi.h` + `ESP8266HTTPClient.h` | `WiFi.h` + `HTTPClient.h` (misma API) |
+| JSON | ArduinoJson 6 | ArduinoJson 6 (sin cambios) |
+| Pines | Aliases `D0`-`D8` | Numérico `GPIO0`-`GPIO10` |
+
+### Qué NO cambia (compatibilidad ~85%)
+- Lógica completa: `postTap()`, `notifyVendResult()`, `handleNFC()`, `handleMDB()`, `reconcileTaps()`
+- Protocolo MDB (mismos comandos, mismas respuestas, mismo timing)
+- Todos los endpoints del backend
+- Portal cautivo, configuración NVS/EEPROM, autoregistro por MAC
+- Variables globales, edge case fixes (sessionTimeout, vendUsed, etc.)
+
+### Pasos concretos de migración
+1. Crear `CoffeeControl_v3/` con `platformio.ini` (environments: `esp8266` + `esp32c3`)
+2. Copiar lógica de `CoffeeControl_v2.ino` a `src/main.cpp`
+3. Reescribir `MDB9bit.h` para usar `Serial1.begin(9600, SERIAL_8N1)` con 9-bit en ESP32
+4. Cambiar includes WiFi/HTTP con `#ifdef ESP32` / `#elif defined(ESP8266)`
+5. Cambiar `SPIFFS` → `LittleFS`
+6. Redefinir pines con el nuevo mapa GPIO
+7. Agregar inicialización DS3231 (`#include <RTClib.h>`)
+
+---
+
+## Arquitectura offline — fallback local con estado replicado
+
+> Diseñada el 23/03/2026. Pendiente de implementación. Aplica a ESP32-C3 y también a ESP8266 (con límites).
+
+### Concepto
+**El backend es la fuente de verdad. El ESP replica localmente el estado necesario para aplicar las mismas políticas.**
+Si el backend no responde (pero WiFi/internet sí), el ESP opera con el último estado conocido y encola los eventos para sincronizar al reconectar.
+
+### Archivos en LittleFS/SPIFFS
+
+**`/cards.json`** — estado replicado de tarjetas autorizadas:
+```json
+{
+  "date": "2026-03-23",
+  "updated_at": 1711152000,
+  "cards": [
+    { "uid": "0A30FC80", "daily_limit": 3, "used_today": 1 }
+  ]
+}
+```
+- `used_today` = consumo global del empleado en el día (suma de todas las máquinas)
+- Se descarga al boot, al reconectar WiFi, y cada vez que el backend responde
+- En RAM: array estático `CardCache cardCache[MAX_CARDS]` — writes a SPIFFS solo en momentos clave (primera caída del backend, reconexión, cada 5 min si hay cambios)
+
+**`/queue.json`** — eventos pendientes de sincronizar:
+```json
+[{ "uid": "0A30FC80", "ts": 1711152000, "item_id": 3, "amount": 150, "ok": true }]
+```
+
+### Flujo normal (backend disponible)
+```
+NFC tap → POST /api/tap → backend decide → ESP obedece
+VEND_SUCCESS → POST /api/tap/result → backend actualiza used_today en DB
+ESP descarga cards.json actualizado → RAM refleja estado real
+```
+
+### Flujo offline (backend caído, WiFi/internet activo)
+```
+NFC tap → POST /api/tap falla (timeout 4s)
+  ├── UID no en cards.json → LED rojo — tarjeta desconocida
+  ├── used_today >= daily_limit → LED rojo — límite alcanzado
+  └── OK → dispensa, incrementa used_today en RAM, encola en queue.json
+
+VEND_SUCCESS → POST /api/tap/result falla → encola en queue.json
+
+Backend vuelve →
+  1. ESP vacía queue.json (POST /api/tap/queue en lotes de 50)
+  2. Backend procesa en orden cronológico:
+       - Si used_today global > daily_limit → confirmed=true, over_limit=true ⚠️
+  3. ESP descarga cards.json con used_today real desde DB
+```
+
+### Limitación multi-máquina documentada
+Cada ESP conoce el `used_today` del backend al momento de la última sincronización. Si múltiples ESPs están offline simultáneamente y el mismo empleado tapa en varios, puede superar el límite global. Al reconectar, el backend marca los excesos con `over_limit=true` para auditoría visible en el panel.
+
+### Reset de `used_today` a medianoche
+- **ESP32-C3 con DS3231:** comparar `cards.json.date` con fecha del RTC → si cambió → `used_today=0` en RAM + sobrescribir `cards.json`
+- **ESP8266 con NTP:** igual pero usando `configTime()` + `localtime()` — funciona mientras WiFi esté activo (el backend puede estar caído sin afectar NTP)
+- **Si WiFi también cae:** suspender modo offline hasta reconectar (escenario tan extremo que no justifica complejidad adicional)
+
+### Límites de capacidad
+| | ESP8266 | ESP32-C3 |
+|---|---|---|
+| `MAX_CARDS` seguro | 200 (~2.2KB RAM) | 2000+ |
+| `MAX_QUEUE` seguro | 100 (~1.8KB RAM) | 1000+ |
+| Cuello de botella | JsonDocument necesita bloque contiguo ~15KB | No aplica |
+
+### Cambios necesarios para implementar
+
+**DB (nueva migración):**
+```sql
+ALTER TABLE taps ADD COLUMN over_limit BOOLEAN DEFAULT false;
+```
+
+**Backend — 2 endpoints nuevos:**
+- `GET /api/tap/cards` → `[{ uid, daily_limit, used_today }]` (autenticado con `X-Machine-Mac`)
+- `POST /api/tap/queue` → procesa bulk `[{ uid, ts, item_id, amount, ok }]`, evalúa `over_limit`
+
+**Firmware — funciones nuevas:**
+- `downloadCards()` — GET `/api/tap/cards` → escribe `/cards.json` + carga en RAM
+- `localAuth(uid)` — busca en `cardCache[]`, verifica `used_today < daily_limit`
+- `incrementLocalUsed(uid)` — incrementa `used_today` en RAM únicamente
+- `saveCardsIfDirty()` — escribe RAM → `/cards.json` solo si hay cambios pendientes
+- `enqueueEvent(uid, ts, item_id, amount, ok)` — agrega a `/queue.json`
+- `flushQueue()` — POST `/api/tap/queue` en lotes ≤50, borra `/queue.json` si éxito
+- `checkMidnightReset()` — llamada en `loop()` cada minuto, resetea `used_today` si cambió el día
+
+**Panel admin:**
+- Badge/icono `over_limit` en historial de taps (color naranja, tooltip "exceso registrado en modo offline")
 
 ---
 
