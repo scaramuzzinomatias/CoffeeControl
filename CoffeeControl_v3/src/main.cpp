@@ -160,9 +160,10 @@ String wifiSSID    = "";
 String wifiPass    = "";
 String backendBase = BACKEND_URL;
 String macAddress  = "";
-bool   portalMode  = false;
-bool   wifiReady   = false;
-bool   rtcAvailable = false;
+bool   portalMode    = false;
+bool   wifiReady     = false;
+bool   backendReady  = false;   // true si /health respondio OK
+bool   rtcAvailable  = false;
 
 // ── Offline: cache de tarjetas ────────────────────────
 CardEntry cards[MAX_CARDS];
@@ -701,6 +702,8 @@ void startPortal() {
 // ══════════════════════════════════════════════════════
 //  WIFI
 // ══════════════════════════════════════════════════════
+bool checkBackend();   // forward declaration
+
 bool connectWiFi() {
     if (wifiSSID.length() == 0) return false;
 
@@ -722,6 +725,9 @@ bool connectWiFi() {
 
         // Sincronizar NTP (fallback para DS3231)
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+        // Verificar conectividad con el backend
+        checkBackend();
         return true;
     }
 
@@ -733,6 +739,30 @@ bool connectWiFi() {
 // ══════════════════════════════════════════════════════
 //  HTTP: tap, result, reconcile, register
 // ══════════════════════════════════════════════════════
+bool checkBackend() {
+    if (WiFi.status() != WL_CONNECTED) {
+        backendReady = false;
+        return false;
+    }
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, backendBase + "/health")) {
+        backendReady = false;
+        return false;
+    }
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    int code = http.GET();
+    http.end();
+    bool ok = (code == 200);
+    if (ok != backendReady) {
+        backendReady = ok;
+        Serial.printf("[BACKEND] %s (%s)\n",
+                      ok ? "CONECTADO" : "SIN RESPUESTA",
+                      backendBase.c_str());
+    }
+    return ok;
+}
+
 int postTap(const String& uid) {
     if (WiFi.status() != WL_CONNECTED) return -1;
 
@@ -1261,6 +1291,7 @@ void loop() {
             // Reconectado: vaciar cola y refrescar cards
             wifiReady = true;
             Serial.println("[WiFi] Reconectado");
+            checkBackend();
             flushQueue();
             downloadCards();
         }
@@ -1291,9 +1322,11 @@ void loop() {
     static unsigned long lastHeartbeat = 0;
     if (millis() - lastHeartbeat > 60000) {
         lastHeartbeat = millis();
+        checkBackend();   // re-verificar backend en cada heartbeat
         const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
-        Serial.printf("[STATUS] WiFi:%s | MDB:%s | Cards:%d | Queue:%d | RTC:%s\n",
+        Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | RTC:%s\n",
                       WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
+                      backendReady ? "OK" : "OFFLINE",
                       stStr[mdbState], cardCount, queueLen,
                       rtcAvailable ? "DS3231" : "NTP");
     }
