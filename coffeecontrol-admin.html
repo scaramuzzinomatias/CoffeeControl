@@ -494,12 +494,15 @@ function renderDashboard(today,monthly,machinesData){
   const mt=(monthly.employees||[]).reduce((a,e)=>a+parseInt(e.taps_total||0),0);
   const blk=s.blocked_employees||0;
   const mBlk=(machinesData.machines||[]).filter(m=>m.blocked).length;
+  const mOnline=(machinesData.machines||[]).filter(m=>m.online).length;
+  const mTotal=(machinesData.machines||[]).length;
 
   const metricsHtml=[
     ['Gasto mensual','$'+Math.round(mc/100).toLocaleString('es-AR'),''],
     ['Cafés este mes',mt.toLocaleString(),''],
     ['Empleados bloqueados hoy',blk,blk>0?'danger':''],
     ['Máquinas bloqueadas',mBlk,mBlk>0?'warn':''],
+    ['Máquinas online',`${mOnline}/${mTotal}`,mOnline===0&&mTotal>0?'warn':''],
   ].map(([l,v,cls])=>`<div class="metric"><div class="mlbl">${l}</div><div class="mval ${cls}">${v}</div></div>`).join('');
 
   const sorted=[...emps].sort((a,b)=>b.taps_today-a.taps_today);
@@ -624,8 +627,9 @@ function applyMachineFilters(){
     const since=m.last_tap_at?timeSince(m.last_tap_at):'Nunca';
     const stBg=m.blocked?'bd':m.active?'bs':'bw';
     const stLbl=m.blocked?'Bloqueada':m.active?'Activa':'Inactiva';
+    const onlineDot=`<span style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${m.online?'#22c55e':'#94a3b8'};display:inline-block" title="${m.online?'Online — activa en los últimos 3 min':'Offline'}"></span>`;
     return `<tr>
-      <td><strong>${m.name}</strong><div style="font-size:11px;color:var(--tx3)">${m.location||'—'}</div></td>
+      <td><div style="display:flex;align-items:center;gap:6px">${onlineDot}<div><strong>${m.name}</strong><div style="font-size:11px;color:var(--tx3)">${m.location||'—'}</div></div></div></td>
       <td><span class="badge ${stBg}">${stLbl}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:3px">${m.blocked_reason||''}</div>`:''}</td>
       <td>${m.taps_today||0}</td>
       <td>${m.taps_month||0}</td>

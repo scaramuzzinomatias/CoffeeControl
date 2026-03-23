@@ -1340,6 +1340,7 @@ void loop() {
     if (millis() - lastHeartbeat > 60000) {
         lastHeartbeat = millis();
         checkBackend();   // re-verificar backend en cada heartbeat
+        if (backendReady) registerMachine();  // actualiza last_seen para estado online/offline
         const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
         Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | RTC:%s\n",
                       WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
