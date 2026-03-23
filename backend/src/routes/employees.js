@@ -152,17 +152,31 @@ router.post('/:id/cards', async (req, res) => {
     }
 });
 
-// DELETE /api/employees/:id — eliminar empleado (soft delete)
+// DELETE /api/employees/:id — eliminar empleado (soft delete) + desactivar tarjetas
 router.delete('/:id', async (req, res) => {
+    const client = await pool.connect();
     try {
-        const result = await pool.query(
+        await client.query('BEGIN');
+        const result = await client.query(
             'UPDATE employees SET active=false WHERE id=$1 RETURNING id,name',
             [req.params.id]
         );
-        if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
+        if (result.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'No encontrado' });
+        }
+        // Desactivar todas las tarjetas del empleado
+        await client.query(
+            'UPDATE nfc_cards SET active=false WHERE employee_id=$1',
+            [req.params.id]
+        );
+        await client.query('COMMIT');
         res.json({ ok: true });
     } catch (err) {
+        await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
 });
 

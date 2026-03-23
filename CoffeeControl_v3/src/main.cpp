@@ -197,15 +197,30 @@ void readConfig() {
     wifiPass = prefs.getString("pass", "");
     String url = prefs.getString("url", "");
     prefs.end();
-    if (url.length() > 0) backendBase = url;
-    Serial.printf("[CFG] SSID guardada: %s\n", wifiSSID.c_str());
+    if (url.length() > 0) {
+        // Normalizar esquema a minúsculas (evitar "Http://" del portal)
+        if (url.startsWith("Http://") || url.startsWith("HTTP://")) {
+            url = "http://" + url.substring(7);
+        } else if (url.startsWith("Https://") || url.startsWith("HTTPS://")) {
+            url = "https://" + url.substring(8);
+        }
+        backendBase = url;
+    }
+    Serial.printf("[CFG] SSID guardada:   %s\n", wifiSSID.c_str());
+    Serial.printf("[CFG] Backend guardado: %s\n", backendBase.c_str());
 }
 
 void saveConfig(const String& ssid, const String& pass, const String& url) {
     prefs.begin("cc", false);  // read-write
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
-    prefs.putString("url", url.length() > 0 ? url : String(BACKEND_URL));
+    // Normalizar esquema a minúsculas antes de guardar
+    String urlNorm = url;
+    if (urlNorm.startsWith("Http://") || urlNorm.startsWith("HTTP://"))
+        urlNorm = "http://" + urlNorm.substring(7);
+    else if (urlNorm.startsWith("Https://") || urlNorm.startsWith("HTTPS://"))
+        urlNorm = "https://" + urlNorm.substring(8);
+    prefs.putString("url", urlNorm.length() > 0 ? urlNorm : String(BACKEND_URL));
     prefs.end();
     Serial.printf("[CFG] Config guardada — SSID: %s\n", ssid.c_str());
 }
@@ -744,22 +759,22 @@ bool checkBackend() {
         backendReady = false;
         return false;
     }
+    String url = backendBase + "/health";
+    Serial.printf("[BACKEND] Intentando: %s\n", url.c_str());
     WiFiClient client;
     HTTPClient http;
-    if (!http.begin(client, backendBase + "/health")) {
+    if (!http.begin(client, url)) {
+        Serial.println("[BACKEND] http.begin() fallo — URL invalida?");
         backendReady = false;
         return false;
     }
     http.setTimeout(HTTP_TIMEOUT_MS);
     int code = http.GET();
     http.end();
+    Serial.printf("[BACKEND] HTTP code: %d\n", code);
     bool ok = (code == 200);
-    if (ok != backendReady) {
-        backendReady = ok;
-        Serial.printf("[BACKEND] %s (%s)\n",
-                      ok ? "CONECTADO" : "SIN RESPUESTA",
-                      backendBase.c_str());
-    }
+    backendReady = ok;
+    Serial.printf("[BACKEND] %s\n", ok ? "CONECTADO" : "SIN RESPUESTA");
     return ok;
 }
 
@@ -903,7 +918,9 @@ void handleNFC() {
             Serial.println("[TAP] APROBADO (online)");
             approved = true;
         } else if (code == 403) {
-            Serial.println("[TAP] DENEGADO — limite diario");
+            // Leer body para distinguir razón
+            // (postTap devuelve solo el código; la razón viene en el body — se loguea genérico)
+            Serial.println("[TAP] DENEGADO (online) — verificar razon en backend");
             ledBlink(5, 80);
             return;
         } else if (code == 401) {
