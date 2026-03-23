@@ -171,6 +171,38 @@ router.post('/cancel', async (req, res) => {
     }
 });
 
+// ══════════════════════════════════════════════════════
+//  POST /api/tap/reconcile
+//  El ESP llama esto al arrancar (boot/reinicio).
+//  Marca como no-confirmados los taps approved=true, confirmed IS NULL
+//  de esta máquina con más de 2 minutos de antigüedad.
+//  Esto resuelve el Bug 4: reinicio mid-session deja taps huérfanos.
+// ══════════════════════════════════════════════════════
+router.post('/reconcile', async (req, res) => {
+    const machine = req.machine;
+    try {
+        const result = await pool.query(
+            `UPDATE taps
+             SET confirmed = false, approved = false
+             WHERE machine_id = $1
+               AND approved   = true
+               AND confirmed  IS NULL
+               AND tapped_at  < NOW() - INTERVAL '2 minutes'
+             RETURNING id`,
+            [machine.id]
+        );
+        const count = result.rowCount;
+        if (count > 0) {
+            console.log(`[RECONCILE] Máquina ${machine.name}: ${count} tap(s) huérfano(s) revertido(s) al boot`);
+            broadcast({ event: 'tap_reconciled', machine: machine.name, machine_id: machine.id, count });
+        }
+        res.status(200).json({ ok: true, reverted: count });
+    } catch (err) {
+        console.error('[RECONCILE] Error:', err.message);
+        res.status(500).json({ error: 'Error interno' });
+    }
+});
+
 // ── Helper: insertar registro en taps ────────────────
 async function logTap({ uid, machine, employeeId, approved, reason }) {
     const result = await pool.query(

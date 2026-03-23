@@ -113,7 +113,15 @@ uint16_t vendAmount     = 0;
 String   sessionUID     = "";
 uint16_t sessionItemId  = 0;
 uint16_t sessionAmount  = 0;
-unsigned long lastNFCRead = 0;
+unsigned long lastNFCRead    = 0;
+
+// ── Fix edge cases ────────────────────────────────────
+// Bug 5: timeout si MDB nunca llega a SESSION_IDLE → cancelar tap
+#define SESSION_TIMEOUT_MS  12000   // 12 s — si el VMC no abre sesión MDB, cancelar
+unsigned long sessionStartMs = 0;   // millis() cuando se puso pendingSession=true
+
+// Bug 2: cada sesión MDB solo autoriza 1 dispensado
+bool vendUsed = false;              // true después del primer VEND_SUCCESS en esta sesión
 
 String   wifiSSID    = "";
 String   wifiPass    = "";
@@ -379,6 +387,28 @@ bool connectWiFi() {
 }
 
 // ══════════════════════════════════════════════════════
+//  RECONCILE — al boot, revertir taps huérfanos (Bug 4)
+//  El backend marca approved=false los taps con confirmed IS NULL
+//  de esta máquina que tengan más de 2 minutos de antigüedad.
+// ══════════════════════════════════════════════════════
+void reconcileTaps() {
+    if (!wifiReady) return;
+    WiFiClient client; HTTPClient http;
+    String url = backendBase + "/api/tap/reconcile";
+    if (!http.begin(client, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Machine-Mac", macAddress);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    int code = http.POST("{}");
+    if (code == 200) {
+        Serial.println("[RECONCILE] OK — taps huerfanos revertidos");
+    } else {
+        Serial.printf("[RECONCILE] WARNING — HTTP %d\n", code);
+    }
+    http.end();
+}
+
+// ══════════════════════════════════════════════════════
 //  AUTOREGISTRO — POST /api/machines/register
 //  El backend recibe la MAC y crea la máquina como "pendiente"
 //  El admin la aprueba desde el panel
@@ -476,10 +506,11 @@ void setup() {
             Serial.println("[BOOT] Fallo WiFi → modo portal");
             startPortal();
         } else {
-            // Conectado → registrarse en el backend
+            // Conectado → registrarse y reconciliar taps huérfanos
             Serial.printf("[CFG] Backend: %s\n", backendBase.c_str());
             Serial.printf("[CFG] Modo deployment: %s\n", DEPLOYMENT_MODE);
             registerMachine();
+            reconcileTaps(); // Fix Bug 4: revertir taps approved sin confirmar de sesiones anteriores
         }
     }
 
@@ -497,9 +528,21 @@ void loop() {
     }
 
     // Modo normal: MDB + NFC
-    // NFC funciona siempre — no requiere que MDB haya llegado a ENABLED
     handleMDB();
     handleNFC();
+
+    // ── Fix Bug 5: timeout SESSION_IDLE ──────────────────
+    // Si pendingSession lleva más de SESSION_TIMEOUT_MS activo,
+    // la máquina expendedora nunca respondió → cancelar tap en backend
+    if (pendingSession && (millis() - sessionStartMs > SESSION_TIMEOUT_MS)) {
+        Serial.printf("[TMO] Timeout SESSION_IDLE (%d ms) — MDB no respondio, cancelando tap de %s\n",
+                      SESSION_TIMEOUT_MS, sessionUID.c_str());
+        String cancelUid = sessionUID;
+        sessionUID = ""; pendingSession = false; mdbState = DISABLED;
+        vendApproved = false; vendUsed = false;
+        notifyVendResult(cancelUid, 0, 0, false); // revierte approved en DB
+        ledBlink(4, 150);
+    }
 
     // Reconexión WiFi periódica
     static unsigned long lastWifiCheck = 0;
@@ -532,6 +575,16 @@ void handleNFC() {
     if (millis() - lastNFCRead < NFC_COOLDOWN_MS) return;
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
 
+    // ── Fix Bug 6: bloquear tap si hay sesión MDB activa ─
+    // Permitir solo en ENABLED o INACTIVE/DISABLED (máquina lista para nueva sesión)
+    if (mdbState == VEND_PENDING || mdbState == SESSION_IDLE) {
+        Serial.println("[NFC] TAP IGNORADO — sesion MDB activa, esperar a que cierre");
+        ledBlink(6, 60); // parpadeo rápido: indicar que ya hay sesión en curso
+        rfid.PICC_HaltA(); rfid.PCD_StopCrypto1();
+        lastNFCRead = millis();
+        return;
+    }
+
     lastNFCRead = millis();
 
     String uid = "";
@@ -552,6 +605,8 @@ void handleNFC() {
     if (code == 200) {
         Serial.println("[TAP] APROBADO — iniciando sesion MDB");
         sessionUID = uid; pendingSession = true; mdbState = SESSION_IDLE;
+        sessionStartMs = millis();  // Fix Bug 5: arrancar timeout
+        vendUsed = false;           // Fix Bug 2: resetear flag de dispensado
         ledBlink(2, 100);
     } else if (code == 403) {
         Serial.println("[TAP] DENEGADO — limite diario alcanzado");
@@ -633,7 +688,7 @@ void handleMDB() {
 void cmdReset() {
     Serial.println("[MDB] RESET recibido → estado: INACTIVE");
     mdbState=INACTIVE; justReset=true; pendingSession=false;
-    vendApproved=false; sessionUID=""; mdbSendACK();
+    vendApproved=false; vendUsed=false; sessionUID=""; mdbSendACK();
 }
 void cmdSetup(uint8_t*d,uint8_t len){
     if(len==0){mdbSendNAK();return;}
@@ -668,20 +723,36 @@ void cmdVend(uint8_t*d,uint8_t len){
     if(len==0){mdbSendNAK();return;}
     switch(d[0]){
         case VEND_REQUEST:
-            if(len>=5){sessionAmount=((uint16_t)d[1]<<8)|d[2];sessionItemId=((uint16_t)d[3]<<8)|d[4];
-            Serial.printf("[MDB] VEND_REQUEST — item #%d  $%d centavos\n", sessionItemId, sessionAmount);
-            vendApproved=true;vendAmount=sessionAmount;mdbState=VEND_PENDING;} break;
+            if(len>=5){
+                sessionAmount=((uint16_t)d[1]<<8)|d[2];
+                sessionItemId=((uint16_t)d[3]<<8)|d[4];
+                Serial.printf("[MDB] VEND_REQUEST — item #%d  $%d centavos\n", sessionItemId, sessionAmount);
+                // ── Fix Bug 2: solo autorizar 1 dispensado por autorizão NFC ──
+                if (vendUsed) {
+                    Serial.println("[MDB] VEND_REQUEST denegado — esta sesion ya dispenso 1 cafe");
+                    vendApproved=false; mdbState=VEND_PENDING;
+                } else {
+                    vendApproved=true; vendAmount=sessionAmount; mdbState=VEND_PENDING;
+                }
+            } break;
         case VEND_SUCCESS:
             Serial.println("[MDB] VEND_SUCCESS — venta confirmada por la maquina");
             notifyVendResult(sessionUID,sessionItemId,sessionAmount,true);
-            mdbSendACK();mdbState=SESSION_IDLE;sessionUID=""; break;
+            vendUsed=true; // Fix Bug 2: marcar que ya se dispensó en esta sesión
+            mdbSendACK();mdbState=SESSION_IDLE; break;
         case VEND_FAILURE:
             Serial.println("[MDB] VEND_FAILURE — venta fallida (error mecanico)");
             notifyVendResult(sessionUID,sessionItemId,sessionAmount,false);
-            mdbSendACK();mdbState=SESSION_IDLE;sessionUID=""; break;
+            mdbSendACK();mdbState=SESSION_IDLE;sessionUID="";vendUsed=false; break;
         case VEND_END:
             Serial.println("[MDB] VEND_END → sesion cerrada");
-            mdbSendByte(MDB_END_SESSION);mdbState=ENABLED;sessionUID=""; break;
+            // ── Fix Bug 1: si no hubo dispensado, cancelar tap en backend ──
+            if (sessionUID.length() > 0 && !vendUsed) {
+                Serial.printf("[MDB] VEND_END sin dispensado — cancelando tap de %s\n", sessionUID.c_str());
+                notifyVendResult(sessionUID, 0, 0, false);
+            }
+            mdbSendByte(MDB_END_SESSION); mdbState=ENABLED;
+            sessionUID=""; vendUsed=false; break;
         case VEND_CANCEL:
             Serial.println("[MDB] VEND_CANCEL");
             mdbSendByte(MDB_CANCELLED);mdbState=SESSION_IDLE; break;
@@ -696,7 +767,12 @@ void cmdReader(uint8_t*d,uint8_t len){
     }
     if(d[0]==READER_DISABLE){
         Serial.println("[MDB] READER DISABLE → NFC deshabilitado");
-        mdbState=DISABLED;sessionUID="";
+        // ── Fix Bug 1: si había sesión activa sin dispensado, cancelar tap ──
+        if (sessionUID.length() > 0 && !vendUsed) {
+            Serial.printf("[MDB] READER_DISABLE mid-session — cancelando tap de %s\n", sessionUID.c_str());
+            notifyVendResult(sessionUID, 0, 0, false);
+        }
+        mdbState=DISABLED; sessionUID=""; vendUsed=false; pendingSession=false;
     }
     mdbSendACK();
 }
