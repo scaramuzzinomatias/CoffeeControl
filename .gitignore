@@ -1,0 +1,16 @@
+# PlatformIO
+CoffeeControl_v3/.pio/build/
+CoffeeControl_v3/.pio/libdeps/
+CoffeeControl_v3/.pio/packages/
+CoffeeControl_v3/.pio/.cache/
+
+# Node.js
+backend/node_modules/
+node_modules/
+
+# Env files con credenciales reales
+backend/.env
+
+# OS
+.DS_Store
+Thumbs.db
