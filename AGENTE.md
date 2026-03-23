@@ -1,6 +1,8 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 23/03/2026 — fix autoregistro de máquinas (Opción B: REGISTRATION_SECRET).
+> Última actualización: 23/03/2026 — edge cases MDB/NFC identificados, punto de restauración git creado (commit `a25148b`).
+>
+> **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
 ---
 
@@ -120,7 +122,9 @@ employees       id, name, department, email, dni, legajo, phone, daily_limit, ac
 nfc_cards       id, uid (hex), employee_id, label, active
 machines        id, name, location, mac, secret, active, blocked, blocked_reason, last_seen
 pending_machines id, mac, first_seen, last_ping, approved
-taps            id, employee_id, machine_id, nfc_uid, approved, deny_reason, item_id, amount_cents, confirmed, tapped_at
+taps            id, employee_id (NULLABLE), machine_id, nfc_uid, approved, deny_reason,
+                   item_id, amount_cents, confirmed, tapped_at
+                -- employee_id es NULL cuando deny_reason = 'card_unknown'
 admin_users     id, username, password_hash, role, full_name, department, active
 
 -- Vistas calculadas:
@@ -149,35 +153,36 @@ POST /api/machines/register       { mac } → 200 (aprobada) | 202 (pendiente)  
 
 ### Panel admin — autenticación JWT (header Authorization: Bearer token)
 ```
-GET  /api/dashboard/today         → resumen del día + alertas
-GET  /api/dashboard/monthly       → resumen del mes
-GET  /api/dashboard/feed          → últimos 50 taps del día
+GET  /api/dashboard/today              → resumen del día + alertas
+GET  /api/dashboard/monthly            → resumen del mes
+GET  /api/dashboard/feed               → últimos 50 taps del día (incluye nfc_uid)
+GET  /api/dashboard/unknown-uids       → UIDs con taps card_unknown sin nfc_cards activa
+GET  /api/dashboard/uid-history/:uid   → últimos 50 taps de un UID específico
 
-GET  /api/machines                → lista con estado y estadísticas
-GET  /api/machines/pending        → máquinas sin aprobar
-POST /api/machines/pending/:id/approve  { name, location }
+GET  /api/machines                     → lista con estado y estadísticas
+GET  /api/machines/pending             → máquinas sin aprobar
+POST /api/machines/pending/:id/approve { name, location }
 POST /api/machines/pending/:id/reject
-POST /api/machines/:id/block      { reason }
+POST /api/machines/:id/block           { reason }
 POST /api/machines/:id/unblock
+DELETE /api/machines/:id               (soft delete — pone active=false)
 
-GET  /api/employees               → lista con tarjetas NFC
-GET  /api/employees/:id           → detalle + consumo por máquina + historial
-POST /api/employees               { name, department, email, dni, legajo, phone, daily_limit }
-PATCH /api/employees/:id          (mismos campos, todos opcionales)
-PATCH /api/employees/:id/limit    { daily_limit }
-POST /api/employees/:id/cards     { uid, label }
+GET  /api/employees                    → lista con tarjetas NFC
+GET  /api/employees/:id                → detalle + consumo por máquina + historial
+POST /api/employees                    { name, department, email, dni, legajo, phone, daily_limit }
+PATCH /api/employees/:id               (mismos campos, todos opcionales)
+PATCH /api/employees/:id/limit         { daily_limit }
+POST  /api/employees/:id/cards         { uid, label }   ← upsert: ON CONFLICT actualiza
+PATCH /api/employees/:id/cards/:cardId { active?, label?, employee_id? }  ← toggle/renombrar/reasignar
 DELETE /api/employees/:id/cards/:cardId
-DELETE /api/employees/:id             (soft delete — pone active=false)
+DELETE /api/employees/:id              (soft delete — pone active=false)
 
-GET  /api/machines                → lista con estado y estadísticas
-DELETE /api/machines/:id          (soft delete — pone active=false)
+GET  /api/reports/machines             → ranking de máquinas por consumo
+GET  /api/reports/machines/:id/employees  → top empleados de una máquina
+GET  /api/reports/employees/:id/machines  → en qué máquinas consumió un empleado
 
-GET  /api/reports/machines        → ranking de máquinas por consumo
-GET  /api/reports/machines/:id/employees   → top empleados de una máquina
-GET  /api/reports/employees/:id/machines   → en qué máquinas consumió un empleado
-
-GET  /api/admin-users             → lista usuarios del panel (solo gerente)
-POST /api/admin-users             { username, password, role, full_name, department }
+GET  /api/admin-users                  → lista usuarios del panel (solo gerente)
+POST /api/admin-users                  { username, password, role, full_name, department }
 PATCH /api/admin-users/:id
 DELETE /api/admin-users/:id
 ```
@@ -185,14 +190,15 @@ DELETE /api/admin-users/:id
 ### WebSocket — ws://host/ws
 Eventos que emite el servidor al dashboard:
 ```
-tap_approved        { employee, employee_id, tapsToday, daily_limit, machine, tap_id }
-tap_denied          { employee, employee_id, tapsToday, daily_limit, machine }
-vend_confirmed      { machine, item_id, amount }
-vend_cancelled      { machine }
-machine_blocked     { machine_id, machine, reason }
-machine_unblocked   { machine_id }
-machine_pending     { mac, message }
-machine_approved    { mac, machine }
+tap_approved        { event, uid, employee, employee_id, tapsToday, daily_limit, machine, machine_id, tap_id }
+tap_denied          { event, uid, employee, employee_id, tapsToday, daily_limit, machine, machine_id }
+card_unknown        { event, uid, machine, machine_id }   ← uid incluido desde v2
+vend_confirmed      { event, machine, item_id, amount }
+vend_cancelled      { event, machine }
+machine_blocked     { event, machine_id, machine, reason }
+machine_unblocked   { event, machine_id }
+machine_pending     { event, mac, message }
+machine_approved    { event, mac, machine }
 ```
 
 ---
@@ -260,27 +266,90 @@ LED de estado → LED_BUILTIN (activo LOW en NodeMCU)
 - Firmware ESP8266 con MDB 9 bits por software, NFC RC522, portal WiFi, autoregistro por MAC
 - Backend Node.js completo con todos los endpoints
 - Base de datos PostgreSQL con schema, vistas y migraciones
-- Panel de administración HTML completo:
-  - Login con JWT
+- `taps.employee_id` es **nullable** (para taps con `card_unknown`)
+- Panel de administración HTML completo (`coffeecontrol-admin.html`):
+  - Login con JWT, roles gerente/supervisor
   - Dashboard con métricas, ranking, alertas y gráfico en tiempo real
-  - Gestión de máquinas (CRUD, bloqueo, aprobación de pendientes, **eliminar**)
-  - Gestión de empleados (CRUD completo con DNI/legajo + tarjetas NFC, **eliminar**)
+  - **Gestión de máquinas** con filtros client-side: búsqueda, estado (activa/inactiva/bloqueada), actividad (tap hoy / sin actividad)
+  - **Gestión de empleados** con filtros client-side: búsqueda (nombre/legajo/DNI/email), área (auto-generada), tarjetas NFC (con/sin activa)
+  - Detalle de empleado: tarjetas NFC con acciones **Desactivar/Activar**, **Renombrar**, **Reasignar**
   - Reportes por máquina y por empleado
-  - Feed en vivo por WebSocket
+  - **Feed en vivo** con WebSocket, UID NFC visible, y 4 filtros client-side (estado, máquina, empleado, motivo rechazo) + botón "Limpiar vista"
+  - **Tarjetas desconocidas**: sección dedicada con badge en el nav, carga desde DB + WS en tiempo real, acciones **Asignar**, **Ver intentos** (historial modal), **Descartar** (persiste en `localStorage` con clave `cc_discarded_uids`; reaparece si el ESP tapea de nuevo)
   - Gestión de usuarios del panel con roles (gerente/supervisor)
-- Dashboard operativo standalone (coffeecontrol.html) con WebSocket
-- **Setup en Windows completado y documentado** (PostgreSQL 15, Node.js 22)
+- Dashboard operativo standalone (`coffeecontrol.html`) con WebSocket
+- Repositorio git inicializado; checkpoint `a25148b` representa este estado
+
+### Alta de empleado con tarjeta NFC — flujo actual
+1. Empleado acerca tarjeta a cualquier máquina → aparece en sección **Tarjetas desconocidas** del panel
+2. Admin hace clic en **Asignar** → selecciona empleado → guarda (llama `POST /api/employees/:id/cards`)
+3. La tarjeta queda activa inmediatamente; el UID desaparece de la lista de desconocidos
 
 ### Pendiente / próximos pasos sugeridos
-- [ ] **Sección "UIDs desconocidos"** en el panel para registrar tarjetas con un clic (cuando la tarjeta es rechazada por `card_unknown`, que aparezca en el panel para asignarla a un empleado)
+- [ ] **Fix edge cases MDB/NFC** (CRÍTICO — ver sección siguiente)
 - [ ] **Notificaciones por email/WhatsApp** cuando un empleado es bloqueado o supera el límite
 - [ ] **Exportar reportes** a Excel/PDF
 - [ ] **Multi-tenant** para modo SaaS (campo `tenant_id` en todas las tablas, schema separado por empresa)
 - [ ] **OTA (Over The Air)** actualización de firmware desde el panel
 - [ ] **Mapa de máquinas** con estado en tiempo real (verde/amarillo/rojo)
-- [ ] **Historial de cambios** (auditoría: quién cambió qué límite y cuándo)
+- [ ] **Historial de cambios** (auditoría: quién cambió qué y cuándo)
 - [ ] **App móvil** para el gerente (o PWA del panel existente)
 - [ ] **Seguridad del payload MDB**: implementar XOR + timestamp como VMflow para evitar replay attacks
+
+---
+
+## Edge cases MDB/NFC — análisis y estado de fixes
+
+> Auditados el 23/03/2026. Punto de restauración antes de los fixes: commit `a25148b`.
+
+| # | Caso | Estado antes del fix | Riesgo |
+|---|------|----------------------|--------|
+| 5 | MDB falla completamente (cable cortado, máquina apagada) | ❌ | Tap `approved=true` en DB pero máquina nunca dispensa. Límite consumido sin café. |
+| 2 | 2 cafés con 1 autorización (segunda `VEND_REQUEST` en misma sesión) | ❌ | `cmdVend VEND_REQUEST` aprueba automáticamente sin llamar a `postTap()`. Bypass total. |
+| 1 | NFC OK pero no consumió — `VEND_END` o `READER_DISABLE` sin cancelar | ❌ | Límite consumido, `notifyVendResult` no se llama en esos paths. |
+| 6 | Segundo tap mientras sesión MDB activa (`VEND_PENDING` / `SESSION_IDLE`) | ⚠️ | Sobreescribe `sessionUID` y `mdbState`, corrompe la máquina de estados MDB. |
+| 4 | Reinicio ESP mid-session (tap approved, no llegó a `VEND_SUCCESS/FAILURE`) | ⚠️ | Tap queda `approved=true, confirmed=null`. Sin reconciliación post-reboot. |
+| 3 | Corte de internet | ✅ | `postTap()` verifica WiFi; si no hay conexión no abre sesión. Reconexión cada 30s. |
+
+### Descripción técnica de cada bug
+
+**Bug 5 — MDB falla total:**
+```c
+// loop() en CoffeeControl_v2.ino:
+handleMDB();  // Si MDB nunca responde, nunca llega a ENABLED
+handleNFC();  // Pero NFC igual llama postTap() → aprueba → SESSION_IDLE eterno
+              // pendingSession=true para siempre, sin timeout
+```
+Fix requerido: timeout en `SESSION_IDLE` (~10-15s). Si no llega `BEGIN_SESSION` del VMC, cancelar tap.
+
+**Bug 2 — doble dispensado en una sesión:**
+```c
+case VEND_REQUEST:
+    vendApproved=true; vendAmount=sessionAmount; mdbState=VEND_PENDING;
+    // ← no verifica si ya hubo un VEND_SUCCESS en esta sesión
+    // ← no llama postTap() para una segunda unidad
+```
+Fix requerido: flag `vendCount` por sesión; si ya hubo un `VEND_SUCCESS` en esta sesión, denegar siguiente `VEND_REQUEST` o requerir nueva autenticación NFC.
+
+**Bug 1 — `VEND_END` / `READER_DISABLE` sin cancelar:**
+```c
+case VEND_END:
+    mdbSendByte(MDB_END_SESSION);
+    mdbState=ENABLED; sessionUID="";  // ← no llama notifyVendResult(false)
+
+if(d[0]==READER_DISABLE){
+    mdbState=DISABLED; sessionUID=""; // ← ídem
+}
+```
+Fix requerido: llamar `notifyVendResult(sessionUID, ..., false)` antes de borrar `sessionUID` si éste no está vacío y no hubo `VEND_SUCCESS` todavía.
+
+**Bug 6 — tap durante sesión activa:**
+Si el usuario tapa 2.5s después (cooldown vencido) mientras el ESP está en `VEND_PENDING`, `handleNFC()` sobreescribe `sessionUID` y `mdbState=SESSION_IDLE`, dejando el `VEND_PENDING` huérfano.
+Fix requerido: en `handleNFC()`, si `mdbState == VEND_PENDING || mdbState == SESSION_IDLE`, ignorar el tap con LED de indicación.
+
+**Bug 4 — reinicio mid-session:**
+No hay persistencia en EEPROM del `sessionUID` activo. Al reiniciar, queda un `tap approved, confirmed=null` en DB que nunca se resuelve.
+Fix sugerido (liviano): al boot, marcar los taps `approved=true, confirmed IS NULL` con más de 2 minutos como `confirmed=false, approved=false` via endpoint `POST /api/tap/reconcile` (el ESP lo llama al arrancar).
 
 ---
 
@@ -371,10 +440,74 @@ npm run dev                   # nodemon, puerto 3000
 
 3. **Fail-closed** — si el backend no responde o hay error de red, el ESP deniega el tap. Nunca aprueba por default.
 
-4. **VEND SUCCESS vs VEND FAILURE** — el backend no cuenta el consumo hasta recibir el `POST /api/tap/confirm`. Si la máquina falla mecánicamente, se llama `/cancel` y no se descuenta.
+4. **VEND SUCCESS vs VEND FAILURE** — `POST /api/tap/confirm` actualiza `confirmed=true`. `POST /api/tap/cancel` revierte `approved=false` para no contar en el límite diario.
 
 5. **El campo `secret` en la tabla machines** quedó como legacy desde v1. En v2 la autenticación es por MAC. El campo se mantiene para compatibilidad pero no se usa en `machineAuth.js`.
 
 6. **JWT expira en 8 horas** — el panel redirige al login automáticamente cuando el token vence (intercepta el 401).
 
 7. **El portal cautivo funciona en Android** directamente. En iOS a veces requiere abrir `http://192.168.4.1` manualmente en Safari si el portal no aparece solo.
+
+8. **`localStorage` key `cc_discarded_uids`** — array JSON con UIDs descartados de la lista de tarjetas desconocidas. Se elimina un UID del set si el ESP tapea de nuevo (`handleUnknownCard` llama `removeDiscarded(uid)` antes de todo).
+
+9. **`taps.employee_id` es nullable** — `ALTER TABLE taps ALTER COLUMN employee_id DROP NOT NULL` aplicado en producción el 23/03/2026. Taps `card_unknown` tienen `employee_id=null`.
+
+---
+
+## Historial de cambios
+
+### Sesión 23/03/2026 — parte 2 (filtros + auditoría edge cases)
+
+**Filtros empleados (client-side, sin requests extra):**
+- Array `allEmployees` almacena datos al cargar; `applyEmployeeFilters()` re-pinta el `<tbody>`
+- 3 filtros: búsqueda libre (nombre/legajo/DNI/email), área (auto-generada con `Set` de valores únicos), tarjetas NFC (con activa / sin activa)
+- Estilo idéntico al Feed en vivo: label arriba + barra `border-bottom` dentro del `.card`
+
+**Filtros máquinas (client-side, sin requests extra):**
+- Array `allMachines` almacena datos al cargar; `applyMachineFilters()` re-pinta el `<tbody>`
+- 3 filtros: búsqueda libre (nombre/ubicación), estado (activa/inactiva/bloqueada), actividad (tap hoy / sin actividad este mes)
+
+**Auditoría de edge cases MDB/NFC:**
+- 6 escenarios analizados, 3 bugs críticos (❌), 2 advertencias (⚠️), 1 OK (✅)
+- Ver sección "Edge cases MDB/NFC" para descripción técnica y fixes requeridos
+- Punto de restauración git: `git init` + `git add -A` + commit `a25148b` en `CoffeeControl_proyecto/`
+
+### Sesión 23/03/2026 — parte 1 (tarjetas desconocidas + feed + card actions)
+
+**Nuevos endpoints:**
+- `GET /api/dashboard/unknown-uids` — UIDs con taps `card_unknown` + sin entrada activa en `nfc_cards`
+- `GET /api/dashboard/uid-history/:uid` — últimos 50 taps de un UID
+- `PATCH /api/employees/:id/cards/:cardId` — toggle `active`, renombrar `label`, reasignar a otro empleado (sin filtrar por `employee_id` en WHERE)
+- `POST /api/employees/:id/cards` usa `ON CONFLICT (uid) DO UPDATE` (upsert)
+
+**Tarjetas desconocidas — sección completa en el panel:**
+- Badge en nav (número de UIDs sin asignar), se actualiza por WS en tiempo real
+- Acciones por UID: **Asignar** (modal selector empleado), **Ver intentos** (modal historial últimos 20 taps), **Descartar** (persiste en `localStorage`)
+- Descartados se recuperan automáticamente si el ESP vuelve a tapear ese UID
+- `loadUnknownBadge()` llamado en `showApp()` para pre-popular badge al login
+
+**Feed en vivo:**
+- `GET /api/dashboard/feed` usa `LEFT JOIN employees` para soportar taps sin empleado
+- Campo `nfc_uid` incluido en cada fila del feed
+- `broadcast()` incluye `uid` en todos los eventos WS
+- 4 filtros client-side: Estado, Máquina (auto-poblado desde datos), Empleado (texto), Motivo rechazo
+- Botón "Limpiar vista" vacía `liveItems[]`; "Limpiar filtros" resetea selectores
+
+**DB:** `ALTER TABLE taps ALTER COLUMN employee_id DROP NOT NULL`
+
+### Sesión 23/03/2026 — parte 0 (fix autoregistro)
+
+**Problema:** `POST /api/machines/register` protegido por `authJwt`; el ESP no tiene JWT.
+
+**Solución (REGISTRATION_SECRET compartido):**
+- `backend/.env` + `.env.example`: `REGISTRATION_SECRET=coffeecontrol-registro-2024`
+- `server.js`: middleware inline — `POST /register` verifica `X-Registration-Secret`; resto usa `authJwt`
+- `CoffeeControl_v2.ino`: `#define REGISTRATION_SECRET` + header en `registerMachine()`
+
+### Sesión 22/03/2026 — bugs iniciales
+
+1. `<script src>` con código inline — tag duplicado; corregido con cierre explícito
+2. Hash bcrypt incorrecto para password `coffeecontrol` — regenerado con Node.js
+3. Encoding cp1252 en schema.sql — nombres en DB corruptos; fix Node + `client_encoding: 'UTF8'` en `pool.js`
+4. Schema ejecutado 3 veces → duplicados — limpieza manual con `DELETE WHERE id > 4`
+5. Faltaban endpoints `DELETE` para máquinas y empleados — agregados como soft delete
