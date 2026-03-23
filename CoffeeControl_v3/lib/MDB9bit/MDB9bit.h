@@ -10,8 +10,13 @@
  *   9° bit = 0 → byte de DATO
  *
  * Conexión en ESP32-C3 Super Mini:
- *   MDB_TX = GPIO6  (salida al bus MDB)
- *   MDB_RX = GPIO5  (entrada del bus MDB)
+ *   MDB_TX = GPIO20  (salida al bus MDB)
+ *   MDB_RX = GPIO21  (entrada del bus MDB)
+ *
+ * Con optoacoplador PC817 en RX:
+ *   MDB HIGH (idle) → transistor saturado → GPIO LOW
+ *   MDB LOW  (start) → transistor corte   → GPIO HIGH
+ *   Se invierte la lectura con !digitalRead() y INPUT_PULLUP.
  */
 
 #pragma once
@@ -24,7 +29,7 @@ public:
 
     void begin() {
         pinMode(_tx, OUTPUT);
-        pinMode(_rx, INPUT);
+        pinMode(_rx, INPUT_PULLUP);  // pull-up necesario con PC817 (transistor open-collector)
         digitalWrite(_tx, HIGH);        // idle = HIGH en UART
         _bitUs = 1000000UL / MDB_BAUD;  // 104 µs a 9600 baud
     }
@@ -47,7 +52,8 @@ public:
 
     uint16_t read(uint32_t timeoutMs = 10) {
         uint32_t deadline = millis() + timeoutMs;
-        while (digitalRead(_rx) == HIGH) {
+        // PC817 invierte: idle MDB=HIGH → GPIO=LOW; start bit MDB=LOW → GPIO=HIGH
+        while (digitalRead(_rx) == LOW) {
             if (millis() > deadline) return 0xFFFF;
             yield();
         }
@@ -56,10 +62,10 @@ public:
 
         uint8_t value = 0;
         for (uint8_t i = 0; i < 8; i++) {
-            value |= (digitalRead(_rx) << i);
+            value |= (!digitalRead(_rx) << i);  // invertir por PC817
             delayMicroseconds(_bitUs);
         }
-        uint8_t bit9 = digitalRead(_rx);
+        uint8_t bit9 = !digitalRead(_rx);  // invertir por PC817
         delayMicroseconds(_bitUs);
 
         return ((uint16_t)bit9 << 8) | value;
