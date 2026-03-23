@@ -652,12 +652,13 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
         return;
     }
     WiFiClient client; HTTPClient http;
-    String url = backendBase + (ok ? "/api/tap/confirm" : "/api/tap/cancel");
+    String url = backendBase + "/api/tap/result";
     if (!http.begin(client, url)) return;
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
     http.setTimeout(HTTP_TIMEOUT_MS);
-    http.POST("{\"nfc_uid\":\"" + uid + "\",\"item_id\":" + itemId + ",\"amount\":" + amount + "}");
+    String body = "{\"nfc_uid\":\"" + uid + "\",\"vend_success\":" + (ok ? "true" : "false") + ",\"item_id\":" + itemId + ",\"amount\":" + amount + "}";
+    http.POST(body);
     http.end();
 }
 

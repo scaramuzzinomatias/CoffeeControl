@@ -100,73 +100,53 @@ router.post('/', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
-//  POST /api/tap/confirm
-//  El ESP8266 confirma que la máquina dispensó físicamente
-//  Body: { nfc_uid, machine_id, item_id, amount }
+//  POST /api/tap/result
+//  El ESP8266 informa el resultado final del expendio
+//  Body: { nfc_uid, vend_success, item_id?, amount? }
 // ══════════════════════════════════════════════════════
-router.post('/confirm', async (req, res) => {
-    const { nfc_uid, item_id, amount } = req.body;
+router.post('/result', async (req, res) => {
+    const { nfc_uid, vend_success, item_id, amount } = req.body;
     const machine = req.machine;
 
     if (!nfc_uid) return res.status(400).json({ error: 'nfc_uid requerido' });
 
     try {
-        // Actualizar el tap más reciente de este UID en esta máquina
-        await pool.query(
-            `UPDATE taps SET confirmed = true, item_id = $1, amount_cents = $2
-             WHERE id = (
-                SELECT id FROM taps
-                WHERE nfc_uid    = $3
-                  AND machine_id = $4
-                  AND approved   = true
-                  AND confirmed  IS NULL
-                ORDER BY tapped_at DESC
-                LIMIT 1
-             )`,
-            [item_id, amount, nfc_uid.toUpperCase(), machine.id]
-        );
-
-        broadcast({ event: 'vend_confirmed', machine: machine.name, item_id, amount });
+        if (vend_success) {
+            await pool.query(
+                `UPDATE taps SET confirmed = true, item_id = $1, amount_cents = $2
+                 WHERE id = (
+                    SELECT id FROM taps
+                    WHERE nfc_uid    = $3
+                      AND machine_id = $4
+                      AND approved   = true
+                      AND confirmed  IS NULL
+                    ORDER BY tapped_at DESC
+                    LIMIT 1
+                 )`,
+                [item_id, amount, nfc_uid.toUpperCase(), machine.id]
+            );
+            broadcast({ event: 'vend_confirmed', machine: machine.name, item_id, amount });
+        } else {
+            // Revertir approved para que no cuente en el límite diario
+            await pool.query(
+                `UPDATE taps SET confirmed = false, approved = false
+                 WHERE id = (
+                    SELECT id FROM taps
+                    WHERE nfc_uid    = $1
+                      AND machine_id = $2
+                      AND approved   = true
+                      AND confirmed  IS NULL
+                    ORDER BY tapped_at DESC
+                    LIMIT 1
+                 )`,
+                [nfc_uid.toUpperCase(), machine.id]
+            );
+            broadcast({ event: 'vend_cancelled', machine: machine.name });
+        }
         res.status(200).json({ ok: true });
 
     } catch (err) {
-        console.error('[CONFIRM] Error:', err.message);
-        res.status(500).json({ error: 'Error interno' });
-    }
-});
-
-// ══════════════════════════════════════════════════════
-//  POST /api/tap/cancel
-//  La máquina falló mecánicamente — no descontar consumo
-// ══════════════════════════════════════════════════════
-router.post('/cancel', async (req, res) => {
-    const { nfc_uid } = req.body;
-    const machine = req.machine;
-
-    if (!nfc_uid) return res.status(400).json({ error: 'nfc_uid requerido' });
-
-    try {
-        // Marcar como no confirmado Y revertir el approved
-        // para que no cuente en el límite diario
-        await pool.query(
-            `UPDATE taps SET confirmed = false, approved = false
-             WHERE id = (
-                SELECT id FROM taps
-                WHERE nfc_uid    = $1
-                  AND machine_id = $2
-                  AND approved   = true
-                  AND confirmed  IS NULL
-                ORDER BY tapped_at DESC
-                LIMIT 1
-             )`,
-            [nfc_uid.toUpperCase(), machine.id]
-        );
-
-        broadcast({ event: 'vend_cancelled', machine: machine.name });
-        res.status(200).json({ ok: true });
-
-    } catch (err) {
-        console.error('[CANCEL] Error:', err.message);
+        console.error('[RESULT] Error:', err.message);
         res.status(500).json({ error: 'Error interno' });
     }
 });
