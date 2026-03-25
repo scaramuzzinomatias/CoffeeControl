@@ -3,6 +3,7 @@ const express = require('express');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const pool    = require('../db/pool');
+const audit = require('../services/audit');
 
 const router  = express.Router();
 const SECRET  = process.env.JWT_SECRET || 'cc-dev-secret-change-in-prod';
@@ -61,6 +62,14 @@ router.post('/change-password', require('../middleware/authJwt'), async (req, re
 
         const hash = await bcrypt.hash(new_password, 10);
         await pool.query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
+        await audit.logAuditEvent({
+            req,
+            action: 'auth.change_password',
+            entityType: 'admin_user',
+            entityId: req.user.id,
+            entityLabel: req.user.username,
+            summary: `Cambió su contraseña (${req.user.username})`
+        });
 
         res.json({ ok: true });
     } catch (err) {

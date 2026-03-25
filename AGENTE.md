@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 23/03/2026 — online/offline de máquinas + fix cascada NFC al borrar empleado + backend 0.0.0.0 + URL normalize. Repo en GitHub: https://github.com/scaramuzzinomatias/CoffeeControl
+> Última actualización: 24/03/2026 — panel/admin, notificaciones, control remoto, WebSocket JWT, zona horaria operativa global y auditoría administrativa activos en el repo canónico.
 >
 > **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
@@ -38,9 +38,9 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 |---|---|---|
 | Heap libre | ~30KB | ~380KB |
 | Pines I2C | Ocupados por MDB | GPIO8/GPIO10 libres |
-| UART hardware | 1 (debug) | 2 disponibles |
-| MDB 9-bit | Bit-banging (`MDB9bit.h`) | Bit-banging con `IRAM_ATTR` (ESP32-C3 NO soporta 9-bit en HW) |
-| RTC DS3231 | ❌ Sin pines | ✅ I2C libre (GPIO5/6) |
+| UART hardware | 1 (debug) | 2 — UART1 libre para MDB |
+| MDB 9-bit | Bit-banging (SoftwareSerial) | UART1 nativo — más robusto |
+| RTC DS3231 | ❌ Sin pines | ✅ I2C libre |
 | Max tarjetas cache | 200 (seguro) | 2000+ |
 | Max cola offline | 100 (seguro) | 1000+ |
 | Precio | ~$3 | ~$2-3 |
@@ -183,7 +183,6 @@ GET  /api/dashboard/uid-history/:uid   → últimos 50 taps de un UID específic
 GET  /api/machines                     → lista con estado y estadísticas
 GET  /api/machines/pending             → máquinas sin aprobar
 POST /api/machines/pending/:id/approve { name, location }
-GET  /api/machines                    → lista con estado (campo `online: bool` calculado — true si last_seen < 3 min)
 POST /api/machines/pending/:id/reject
 POST /api/machines/:id/block           { reason }
 POST /api/machines/:id/unblock
@@ -197,7 +196,7 @@ PATCH /api/employees/:id/limit         { daily_limit }
 POST  /api/employees/:id/cards         { uid, label }   ← upsert: ON CONFLICT actualiza
 PATCH /api/employees/:id/cards/:cardId { active?, label?, employee_id? }  ← toggle/renombrar/reasignar
 DELETE /api/employees/:id/cards/:cardId
-DELETE /api/employees/:id              (soft delete — pone active=false EN EMPLOYEES y active=false en todas sus nfc_cards, transacción atómica)
+DELETE /api/employees/:id              (soft delete — pone active=false)
 
 GET  /api/reports/machines             → ranking de máquinas por consumo
 GET  /api/reports/machines/:id/employees  → top empleados de una máquina
@@ -253,32 +252,24 @@ LED de estado → LED_BUILTIN (activo LOW en NodeMCU)
 NOTA: D1/D2 (I2C estándar) ocupados por MDB → sin RTC DS3231 posible
 ```
 
-### ESP32-C3 Super Mini — target de producción (pinout DEFINITIVO)
+### ESP32-C3 Super Mini — target de producción
 ```
-ESP32-C3 Super Mini  (11 GPIOs utilizables: GPIO0-10; GPIO12-17=flash interno; GPIO18/19=USB; GPIO8=LED onboard+strapping)
+ESP32-C3 Super Mini  (GPIOs disponibles: 0-10; GPIO18/19 = USB interno, no expuestos)
 
-RC522 (SPI hardware):           MDB (bit-banging + IRAM_ATTR — 9-bit NO soportado por HW UART):
-  SS    → GPIO4                  TX → GPIO20 → MAX3232 T1IN → bus MDB
-  SCK   → GPIO0                  RX → GPIO21 ← MAX3232 R1OUT ← bus MDB
+RC522 (SPI hardware):           MDB (UART1 hardware — 9-bit nativo):
+  SS    → GPIO3                  TX → GPIO6 → MAX3232 T1IN → bus MDB
+  SCK   → GPIO0                  RX → GPIO5 ← MAX3232 R1OUT ← bus MDB
   MOSI  → GPIO1
-  MISO  → GPIO3  ← ¡NO GPIO2!  DS3231 RTC (I2C — SDA/SCL recomendados por datasheet):
-  RST   → GPIO7                  SDA → GPIO5
-  VCC   → 3.3V (¡no 5V!)        SCL → GPIO6
+  MISO  → GPIO2                DS3231 RTC (I2C — ahora posible):
+  RST   → GPIO4                  SDA → GPIO8
+  VCC   → 3.3V (¡no 5V!)        SCL → GPIO10
   GND   → GND                    VCC → 3.3V / GND → GND
 
-LED externo    → GPIO10 (activo HIGH)
-Reset lógico   → GPIO9 (botón BOOT integrado — mantener 5s → borra NVS)
+LED de estado → GPIO7
+Reset lógico  → GPIO9 (botón BOOT integrado — no usar como GPIO de entrada normal)
 
-── NO CONECTAR ──────────────────────────────────────────────
-GPIO2  → strapping pin (debe estar HIGH al boot, pull-up interno)
-GPIO8  → onboard blue LED + strapping (debe estar HIGH al boot)
-GPIO18 → USB D−  /  GPIO19 → USB D+
-
-Total pines usados: 11 de 11 disponibles
+Total pines usados: 10 de 11 disponibles
 ```
-
-**Por qué bit-banging y no UART hardware para MDB:**
-El ESP32-C3 UART admite como máximo `UART_DATA_8_BITS` — `uart_word_length_t` en ESP-IDF no tiene `UART_DATA_9_BITS`. Verificado en la [documentación oficial de Espressif](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/peripherals/uart.html). La solución es `MDB9bit.h` portada desde ESP8266 con `ICACHE_RAM_ATTR` → `IRAM_ATTR`.
 
 ---
 
@@ -322,10 +313,19 @@ El ESP32-C3 UART admite como máximo `UART_DATA_8_BITS` — `uart_word_length_t`
   - Login con JWT, roles gerente/supervisor
   - Dashboard con métricas, ranking, alertas y gráfico en tiempo real
   - **Gestión de máquinas** con filtros client-side: búsqueda, estado (activa/inactiva/bloqueada), actividad (tap hoy / sin actividad)
+  - **Control remoto de máquinas**: reinicio, cambio de WiFi, escaneo remoto de redes visibles y detalle de estado de red (SSID, IP, RSSI, backend y último error)
+  - **Alertas por email** para advertencia preventiva de límite, empleado bloqueado y máquina offline (si SMTP está configurado), con pantalla `Notificaciones` para destinatarios, eventos, umbral (`faltan N cafés`) y prueba manual; las plantillas quedan en configuración interna del backend
+  - **Pantalla `Sistema`** para definir la `business_timezone` global con identificadores IANA reales
+  - **Política diaria configurable por empleado**: `enforce`, `warn_only` y `off`, con advertencia opcional por email al empleado y a supervisores activos de la misma área
+  - **Timezone unificada** entre backend y firmware: dashboard/reportes usan `business_timezone`, `/api/tap/cards` entrega `date + next_reset_at`, y el ESP32-C3 resetea contadores offline con esa referencia
+  - **Estados explícitos para TAGs NFC**: `active`, `lost`, `inactive`, con acciones `Marcar perdido`, `Dar de baja`, `Reactivar` y `Reasignar`
+  - **Pantalla `Auditoría`** para revisar altas, ediciones, bajas, bloqueos, comandos remotos y cambios de configuración con actor, fecha y detalle técnico saneado
   - **Gestión de empleados** con filtros client-side: búsqueda (nombre/legajo/DNI/email), área (auto-generada), tarjetas NFC (con/sin activa)
-  - Detalle de empleado: tarjetas NFC con acciones **Desactivar/Activar**, **Renombrar**, **Reasignar**
-  - Reportes por máquina y por empleado
+  - Detalle de empleado: tarjetas NFC con acciones **Marcar perdido**, **Dar de baja**, **Reactivar**, **Renombrar**, **Reasignar**
+  - **Reportes avanzados** con rango `desde / hasta`, resumen operativo, evolución diaria, cortes por máquina/empleado/área, detalle modal y exportación Excel/PDF
+    - detalle exportable por empleado y por área, orientado a reuniones de gestión
   - **Feed en vivo** con WebSocket, UID NFC visible, y 4 filtros client-side (estado, máquina, empleado, motivo rechazo) + botón "Limpiar vista"
+  - **WebSocket del panel protegido con JWT** en el handshake de `/ws`
   - **Tarjetas desconocidas**: sección dedicada con badge en el nav, carga desde DB + WS en tiempo real, acciones **Asignar**, **Ver intentos** (historial modal), **Descartar** (persiste en `localStorage` con clave `cc_discarded_uids`; reaparece si el ESP tapea de nuevo)
   - Gestión de usuarios del panel con roles (gerente/supervisor)
 - Dashboard operativo standalone (`coffeecontrol.html`) con WebSocket
@@ -337,20 +337,19 @@ El ESP32-C3 UART admite como máximo `UART_DATA_8_BITS` — `uart_word_length_t`
 3. La tarjeta queda activa inmediatamente; el UID desaparece de la lista de desconocidos
 
 ### Pendiente / próximos pasos sugeridos
-- [x] **Migración ESP32-C3 Super Mini + PlatformIO** → commit `2456cc6` + pinout fix `b18e3a7` ✅
-- [x] **Modo offline con fallback local** → implementado en `CoffeeControl_v3/src/main.cpp` ✅
-- [x] **DB migration_v4.sql** (columna `over_limit`) → `backend/sql/migration_v4.sql` ✅
-- [x] **Endpoints offline** (`GET /api/tap/cards`, `POST /api/tap/queue`) → `backend/src/routes/tap.js` ✅
-- [ ] **Ejecutar `migration_v4.sql`** contra la DB de producción: `psql $DATABASE_URL -f backend/sql/migration_v4.sql`
-- [ ] **Flashear firmware** al ESP32-C3: `pio run -e esp32c3 -t upload` (modo BOOT: mantener BOOT → presionar EN → soltar BOOT)- [x] **Backend escucha en 0.0.0.0** (accesible desde LAN, no solo localhost) → `server.js` ✅
-- [x] **URL normalize en firmware** — `readConfig()` y `saveConfig()` convierten `Http://` → `http://` para evitar bug de teclado móvil en portal cautivo ✅
-- [x] **DELETE empleado cascada a tarjetas NFC** — la ruta usa transacción: desactiva empleado + desactiva sus nfc_cards en un solo query atómico ✅
-- [x] **Indicador online/offline de máquinas** — campo `online` en `GET /api/machines` (true si `last_seen < 3 min`), punto verde/gris en la tabla, métrica en dashboard. Heartbeat del firmware llama a `registerMachine()` cada 60s para mantener `last_seen` fresco ✅- [ ] **Notificaciones por email/WhatsApp** cuando un empleado es bloqueado o supera el límite
-- [ ] **Exportar reportes** a Excel/PDF
+- [ ] **Migración ESP32-C3 Super Mini + PlatformIO** (ver sección "Migración ESP8266 → ESP32-C3")
+- [ ] **Modo offline con fallback local** (ver sección "Arquitectura offline")
+- [x] **Notificaciones por email** cuando un empleado queda bloqueado por límite diario, cuando queda cerca del límite y cuando una máquina queda offline
+- [x] **Formulario de notificaciones** en el panel para destinatarios, eventos y envío de prueba
+- [x] **Timezone unificada configurable** con `business_timezone` global y pantalla `Sistema`
+- [x] **Flujo de TAG perdido / dado de baja / reactivación / reasignación**
+- [x] **Auditoría administrativa** en backend + pantalla de panel con filtros por entidad/acción
+- [x] **Reportes avanzados** con rango de fechas, gráficos y detalle exportable por empleado/área
+- [x] **Exportar reportes** a Excel/PDF
+- [ ] **Filtros avanzados en reportes** para empresas grandes (búsqueda rápida por empleado, área y recortes más específicos)
 - [ ] **Multi-tenant** para modo SaaS (campo `tenant_id` en todas las tablas, schema separado por empresa)
 - [ ] **OTA (Over The Air)** actualización de firmware desde el panel
 - [ ] **Mapa de máquinas** con estado en tiempo real (verde/amarillo/rojo)
-- [ ] **Historial de cambios** (auditoría: quién cambió qué y cuándo)
 - [ ] **App móvil** para el gerente (o PWA del panel existente)
 - [ ] **Seguridad del payload MDB**: implementar XOR + timestamp como VMflow para evitar replay attacks
 
@@ -370,7 +369,7 @@ El ESP32-C3 UART admite como máximo `UART_DATA_8_BITS` — `uart_word_length_t`
 
 | Componente | ESP8266 (actual) | ESP32-C3 (target) |
 |---|---|---|
-| MDB 9-bit | `MDB9bit.h` bit-banging + `noInterrupts()` | `MDB9bit.h` bit-banging + `IRAM_ATTR` (HW UART máx 8 bits) |
+| MDB 9-bit | `MDB9bit.h` bit-banging SoftwareSerial | `HardwareSerial Serial1` con 9-bit nativo |
 | Filesystem | `#include <FS.h>` SPIFFS | `#include <LittleFS.h>` (mejor wear leveling) |
 | RTC | No disponible | DS3231 via I2C + librería RTClib (Adafruit) |
 | Hora offline | NTP único | DS3231 primario + NTP fallback |
@@ -385,16 +384,14 @@ El ESP32-C3 UART admite como máximo `UART_DATA_8_BITS` — `uart_word_length_t`
 - Portal cautivo, configuración NVS/EEPROM, autoregistro por MAC
 - Variables globales, edge case fixes (sessionTimeout, vendUsed, etc.)
 
-### Pasos concretos de migración — **COMPLETADOS** ✅
-1. ~~Crear `CoffeeControl_v3/` con `platformio.ini`~~ → `CoffeeControl_v3/platormio.ini` creado con environment `esp32c3`
-2. ~~Copiar lógica de `CoffeeControl_v2.ino` a `src/main.cpp`~~ → portado + offline mode + 1300+ líneas
-3. ~~MDB 9-bit~~ → `MDB9bit.h` portado con `IRAM_ATTR` (HW UART max 8-bit, bit-banging obligatorio)
-4. ~~Cambiar includes WiFi/HTTP~~ → `WiFi.h` + `HTTPClient.h` para ESP32
-5. ~~`SPIFFS` → `LittleFS`~~ → implementado con streaming write
-6. ~~Redefinir pines~~ → pinout definitivo aplicado (ver sección anterior)
-7. ~~Agregar DS3231~~ → `RTClib` + `Wire.begin(5, 6)`, con NTP como fallback
-
-**Compilación:** `pio run -e esp32c3` → `SUCCESS 0 errores 0 warnings` (commit `2456cc6` → pinout fix `b18e3a7`)
+### Pasos concretos de migración
+1. Crear `CoffeeControl_v3/` con `platformio.ini` (environments: `esp8266` + `esp32c3`)
+2. Copiar lógica de `CoffeeControl_v2.ino` a `src/main.cpp`
+3. Reescribir `MDB9bit.h` para usar `Serial1.begin(9600, SERIAL_8N1)` con 9-bit en ESP32
+4. Cambiar includes WiFi/HTTP con `#ifdef ESP32` / `#elif defined(ESP8266)`
+5. Cambiar `SPIFFS` → `LittleFS`
+6. Redefinir pines con el nuevo mapa GPIO
+7. Agregar inicialización DS3231 (`#include <RTClib.h>`)
 
 ---
 
@@ -438,8 +435,8 @@ ESP descarga cards.json actualizado → RAM refleja estado real
 ```
 NFC tap → POST /api/tap falla (timeout 4s)
   ├── UID no en cards.json → LED rojo — tarjeta desconocida
-  ├── used_today >= daily_limit → LED rojo — límite alcanzado
-  └── OK → dispensa, incrementa used_today en RAM, encola en queue.json
+  ├── mode=enforce y used_today >= daily_limit → LED rojo — límite alcanzado
+  └── OK → dispensa, incrementa used_today en RAM, encola en queue.json (`warn_only` y `off` siguen permitiendo consumo)
 
 VEND_SUCCESS → POST /api/tap/result falla → encola en queue.json
 
@@ -647,47 +644,6 @@ npm run dev                   # nodemon, puerto 3000
 ---
 
 ## Historial de cambios
-
-### Sesión 23/03/2026 — parte 4 (firmware ESP32-C3 v3 + endpoints offline + pinout definitivo)
-
-**Firmware `CoffeeControl_v3/` creado desde cero con PlatformIO:**
-- `platformio.ini`: board `esp32-c3-devkitm-1`, framework arduino, LittleFS, dependencias bloqueadas
-- `lib/MDB9bit/MDB9bit.h`: portado desde ESP8266 con `ICACHE_RAM_ATTR` → `IRAM_ATTR`
-- `src/main.cpp`: 1300+ líneas, port completo de v2 + modo offline
-
-**Funciones offline implementadas:**
-- `downloadCards()` — GET `/api/tap/cards` → escribe `/cards.json` en LittleFS + carga RAM
-- `localAuth(uid)` — busca en `CardCache[]`, verifica `used_today < daily_limit`
-- `incrementLocalUsed(uid)` — incrementa `used_today` en RAM
-- `enqueueEvent(uid, itemId, amount, ok)` — persiste en `/queue.json` (streaming write)
-- `flushQueue()` — POST `/api/tap/queue` en lotes ≤50, borra queue si éxito
-- `checkMidnightReset()` — DS3231 primario + NTP fallback
-- `saveCards()` / `saveQueue()` — streaming writes, sin buffer completo en RAM
-- `handleNFC()` refinado: intenta online → si falla → `localAuth()` fallback
-- `notifyVendResult()` refinado: si offline → `enqueueEvent()` en lugar de HTTP POST
-- Reconexión: cada 30s verifica WiFi; al reconectar → `flushQueue()` + `downloadCards()`
-- Cards refresh: cada 10 minutos si online
-
-**Corrección de nombre de enum:** `DISABLED` → `MDB_DISABLED` (conflicto con `#define DISABLED 0x00` en `esp32-hal-gpio.h`)
-
-**Pinout definitivo (3 iteraciones de corrección):**
-1. GPIO8 era SDA de DS3231 → conflicto: LED onboard + strapping pin → movido a GPIO5
-2. GPIO2 era MISO → strapping pin → movido a GPIO3  
-3. MDB en GPIO20/21 (UART0 nativo) validado: ESP32-C3 UART HW máx 8-bit confirmado con documentación oficial Espressif → bit-banging obligatorio
-
-**Backend — nuevos endpoints:**
-- `GET /api/tap/cards` → `[{uid, daily_limit, used_today}]` para la máquina autenticada
-- `POST /api/tap/queue` → procesa bulk offline, detecta `over_limit` comparando taps del día
-- `backend/sql/migration_v4.sql`: `ALTER TABLE taps ADD COLUMN IF NOT EXISTS over_limit BOOLEAN DEFAULT false` + índice + vista actualizada
-
-**Commits:**
-- `2456cc6` — feat: firmware ESP32-C3 v3 + endpoints offline
-- `b18e3a7` — fix: pinout definitivo ESP32-C3 Super Mini
-- `f52181f` — chore: agregar .gitignore + excluir .pio/build, libdeps, node_modules
-
-**Repositorio subido a GitHub:** https://github.com/scaramuzzinomatias/CoffeeControl
-
----
 
 ### Sesión 23/03/2026 — parte 2 (filtros + auditoría edge cases)
 

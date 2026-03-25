@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CoffeeControl — Administración</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="vendor/exceljs.min.js"></script>
 <!-- Anti-FOUC: aplica tema antes del primer render -->
 <script>if(localStorage.getItem('cc_theme')==='light')document.documentElement.classList.add('light');</script>
 <script>
@@ -23,13 +26,17 @@ function renderUsers(users){
   const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor'};
   const roleBadge = {admin:'bi',gerente:'bi',supervisor:'bw'};
   const rows = users.map(u=>`<tr>
-    <td><strong>${u.username}</strong>${u.full_name?'<div style="font-size:11px;color:var(--tx3)">'+u.full_name+'</div>':''}</td>
+    <td>
+      <strong>${u.username}</strong>
+      ${u.full_name?'<div style="font-size:11px;color:var(--tx3)">'+u.full_name+'</div>':''}
+      ${u.email?'<div style="font-size:11px;color:var(--tx3)">'+u.email+'</div>':''}
+    </td>
     <td><span class="badge ${roleBadge[u.role]||'bs'}">${roleLabel[u.role]||u.role}</span></td>
     <td>${u.department||'<span style="color:var(--tx3)">Todos</span>'}</td>
     <td><span class="badge ${u.active?'bs':'bd'}">${u.active?'Activo':'Inactivo'}</span></td>
     <td style="font-size:11px;color:var(--tx3)">${new Date(u.created_at).toLocaleDateString('es-AR')}</td>
     <td style="white-space:nowrap">
-      <button class="btn btn-ghost btn-xs" onclick="openEditUser(${u.id},'${u.username}','${u.role}','${u.full_name||''}','${u.department||''}')">Editar</button>
+      <button class="btn btn-ghost btn-xs" onclick='openEditUser(${u.id},${JSON.stringify(u.username||'')},${JSON.stringify(u.role||'')},${JSON.stringify(u.full_name||'')},${JSON.stringify(u.department||'')},${JSON.stringify(u.email||'')})'>Editar</button>
       <button class="btn btn-xs" style="background:var(--bgd);color:var(--txd);margin-left:4px" onclick="deleteUser(${u.id},'${u.username}')">Eliminar</button>
     </td>
   </tr>`).join('');
@@ -71,6 +78,10 @@ function openAddUser(){
       <div class="field"><label>Área (opcional — limita vista del supervisor)</label><input id="uDep" placeholder="IT, Ventas, etc."></div>
     </div>
     <div class="field-row">
+      <div class="field"><label>Email</label><input id="uEmail" type="email" placeholder="supervisor@empresa.com"></div>
+      <div class="field"></div>
+    </div>
+    <div class="field-row">
       <div class="field"><label>Contraseña * (mín. 8 caracteres)</label><input id="uPass" type="password" autocomplete="new-password"></div>
       <div class="field"><label>Repetir contraseña</label><input id="uPass2" type="password" autocomplete="new-password"></div>
     </div>
@@ -85,13 +96,13 @@ async function saveUser(){
   try{
     await api('POST','/api/admin-users',{
       username:v('uUser'),password:pass,role:v('uRole'),
-      full_name:v('uFull'),department:v('uDep')
+      full_name:v('uFull'),department:v('uDep'),email:v('uEmail')
     });
     closeModal();loadUsers();
   }catch(e){showModalErr('uErr',e.message);}
 }
 
-function openEditUser(id,username,role,fullName,department){
+function openEditUser(id,username,role,fullName,department,email){
   openModal('Editar: '+username,`
     <div class="field-row">
       <div class="field"><label>Nombre completo</label><input id="uFull" value="${fullName}"></div>
@@ -103,7 +114,10 @@ function openEditUser(id,username,role,fullName,department){
         </select>
       </div>
     </div>
-    <div class="field"><label>Área</label><input id="uDep" value="${department}" placeholder="Dejar vacío = acceso a todos"></div>
+    <div class="field-row">
+      <div class="field"><label>Área</label><input id="uDep" value="${department}" placeholder="Dejar vacío = acceso a todos"></div>
+      <div class="field"><label>Email</label><input id="uEmail" type="email" value="${email||''}" placeholder="supervisor@empresa.com"></div>
+    </div>
     <div class="field"><label>Nueva contraseña (dejar vacío para no cambiar)</label><input id="uPass" type="password" autocomplete="new-password" placeholder="••••••••"></div>
     <div class="err-banner" id="uErr"></div>
   `,`updateUser(${id})`);
@@ -111,7 +125,7 @@ function openEditUser(id,username,role,fullName,department){
 
 async function updateUser(id){
   const pass=document.getElementById('uPass').value;
-  const body={full_name:v('uFull'),role:v('uRole'),department:v('uDep')};
+  const body={full_name:v('uFull'),role:v('uRole'),department:v('uDep'),email:v('uEmail')};
   if(pass) body.password=pass;
   try{
     await api('PATCH',`/api/admin-users/${id}`,body);
@@ -123,6 +137,456 @@ async function deleteUser(id,username){
   if(!confirm('¿Desactivar al usuario "'+username+'"?')) return;
   try{await api('DELETE',`/api/admin-users/${id}`);loadUsers();}
   catch(e){alert('Error: '+e.message);}
+}
+
+// ══════════════════════════════════════════════════════
+//  NOTIFICACIONES
+// ══════════════════════════════════════════════════════
+async function loadNotifications(){
+  render('<div class="page-title">Notificaciones</div><div class="empty">Cargando...</div>');
+  try{
+    const d = await api('GET','/api/notification-settings');
+    renderNotifications(d.settings||{});
+  }catch(e){
+    render('<div class="page-title">Notificaciones</div><p style="color:var(--txd)">'+e.message+'</p>');
+  }
+}
+
+function notificationFormPayload(){
+  return {
+    enabled: !!document.getElementById('nsEnabled')?.checked,
+    recipient_emails: document.getElementById('nsRecipients')?.value || '',
+    notify_employee_limit_warning: !!document.getElementById('nsEmployeeWarning')?.checked,
+    notify_employee_daily_blocked: !!document.getElementById('nsEmployeeBlocked')?.checked,
+    notify_machine_offline: !!document.getElementById('nsMachineOffline')?.checked,
+    notify_machine_backend_down: false,
+    employee_limit_warning_lead: parseInt(document.getElementById('nsEmployeeWarningLead')?.value || '1', 10) || 1
+  };
+}
+
+function setNotificationsMsg(msg,isError){
+  const el=document.getElementById('notificationsMsg');
+  if(!el) return;
+  if(!msg){
+    el.style.display='none';
+    el.textContent='';
+    return;
+  }
+  el.style.display='block';
+  el.textContent=msg;
+  el.style.background=isError?'var(--bgd)':'var(--bgs)';
+  el.style.color=isError?'var(--txd)':'var(--txs)';
+  el.style.borderColor=isError?'rgba(240,149,149,.28)':'rgba(192,221,151,.22)';
+}
+
+function renderNotifications(settings,msg='',isError=false){
+  const smtpReady=!!settings.smtp_ready;
+  const recipients=escHtml(settings.recipient_emails||'');
+  const employeeWarningLead=Math.min(Math.max(parseInt(settings.employee_limit_warning_lead||1,10)||1,1),10);
+  render(`
+    <div class="topbar">
+      <div class="page-title">Notificaciones</div>
+      <div style="display:flex;gap:8px;margin-left:auto">
+        <button class="btn btn-ghost btn-sm" onclick="sendNotificationTest()" ${smtpReady?'':'disabled title="Configurá SMTP en backend/.env para enviar pruebas"'}>Enviar prueba</button>
+        <button class="btn btn-primary btn-sm" onclick="saveNotificationSettingsForm()">Guardar</button>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+          <div style="min-width:260px">
+            <div style="font-size:13px;color:var(--txi);font-weight:600">Configuración operativa</div>
+            <div style="font-size:13px;color:var(--tx2);margin-top:6px;line-height:1.5">
+            Desde este formulario administrás destinatarios, eventos y la prueba manual de envío. Las plantillas de email quedan en la configuración interna del backend.
+            </div>
+          </div>
+        <div><span class="badge ${smtpReady?'bs':'bd'}">${smtpReady?'SMTP listo':'SMTP pendiente'}</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <label class="pw-inline" style="font-weight:600;margin-bottom:16px">
+        <input type="checkbox" id="nsEnabled" ${settings.enabled!==false?'checked':''}>
+        <span>Activar notificaciones automáticas por email</span>
+      </label>
+
+      <div class="field">
+        <label>Destinatarios</label>
+        <textarea id="nsRecipients" rows="4" placeholder="alertas@empresa.com, soporte@empresa.com" style="width:100%;padding:10px 12px;border-radius:var(--r);border:1px solid var(--br);background:var(--bg2);color:var(--tx);font:inherit;resize:vertical">${recipients}</textarea>
+        <div style="font-size:12px;color:var(--tx3);margin-top:6px">
+          Podés separar direcciones con coma, punto y coma o salto de línea. Estas direcciones reciben alertas operativas; las advertencias de límite diario se envían al empleado y a los supervisores activos de su área.
+        </div>
+      </div>
+
+      <div class="section-lbl" style="margin:18px 0 10px">Eventos</div>
+      <div style="display:grid;gap:10px">
+        <label style="display:flex;gap:10px;align-items:flex-start;padding:12px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2);cursor:pointer">
+          <input type="checkbox" id="nsEmployeeWarning" ${settings.notify_employee_limit_warning===true?'checked':''} style="margin-top:2px">
+          <div>
+            <div style="font-weight:600">Advertencia previa de límite diario</div>
+            <div style="font-size:12px;color:var(--tx3);margin-top:4px">Avisa al empleado y, si existe, a los supervisores activos de su misma área cuando queda cerca del límite diario.</div>
+          </div>
+        </label>
+        <div class="field">
+          <label>Umbral de advertencia</label>
+          <input id="nsEmployeeWarningLead" type="number" min="1" max="10" value="${employeeWarningLead}">
+          <div style="font-size:12px;color:var(--tx3);margin-top:6px">
+            Se envía cuando faltan esta cantidad de cafés para llegar al límite. Ejemplo: <code>1</code> dispara <code>4/5</code>, <code>2</code> dispara <code>3/5</code>.
+          </div>
+        </div>
+        <label style="display:flex;gap:10px;align-items:flex-start;padding:12px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2);cursor:pointer">
+          <input type="checkbox" id="nsEmployeeBlocked" ${settings.notify_employee_daily_blocked!==false?'checked':''} style="margin-top:2px">
+          <div>
+            <div style="font-weight:600">Empleado bloqueado por límite diario</div>
+            <div style="font-size:12px;color:var(--tx3);margin-top:4px">Se envía un correo cuando un empleado intenta consumir y ya alcanzó su límite diario.</div>
+          </div>
+        </label>
+        <label style="display:flex;gap:10px;align-items:flex-start;padding:12px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2);cursor:pointer">
+          <input type="checkbox" id="nsMachineOffline" ${settings.notify_machine_offline!==false?'checked':''} style="margin-top:2px">
+          <div>
+            <div style="font-weight:600">Máquina offline</div>
+            <div style="font-size:12px;color:var(--tx3);margin-top:4px">Avisa cuando una máquina deja de reportar heartbeat dentro de la ventana esperada.</div>
+          </div>
+        </label>
+      </div>
+
+      <div id="notificationsMsg" class="err-banner" style="display:none;margin-top:16px"></div>
+    </div>
+  `);
+  setNotificationsMsg(msg,isError);
+}
+
+async function saveNotificationSettingsForm(){
+  setNotificationsMsg('',false);
+  try{
+    const d=await api('PUT','/api/notification-settings',notificationFormPayload());
+    renderNotifications(d.settings||notificationFormPayload(),'Configuración guardada.',false);
+  }catch(e){
+    setNotificationsMsg(e.message,true);
+  }
+}
+
+async function sendNotificationTest(){
+  setNotificationsMsg('',false);
+  try{
+    const d=await api('POST','/api/notification-settings/test',notificationFormPayload());
+    const recipients=(d.result?.recipients||[]).join(', ');
+    setNotificationsMsg(`Prueba enviada a ${recipients}.`,false);
+  }catch(e){
+    setNotificationsMsg(e.message,true);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  SISTEMA
+// ══════════════════════════════════════════════════════
+async function loadSystemSettings(){
+  render('<div class="page-title">Sistema</div><div class="empty">Cargando...</div>');
+  try{
+    const d=await api('GET','/api/system-settings');
+    renderSystemSettings(d.settings||{});
+  }catch(e){
+    render('<div class="page-title">Sistema</div><p style="color:var(--txd)">'+e.message+'</p>');
+  }
+}
+
+function setSystemSettingsMsg(msg,isError){
+  const el=document.getElementById('systemSettingsMsg');
+  if(!el) return;
+  if(!msg){
+    el.style.display='none';
+    el.textContent='';
+    return;
+  }
+  el.style.display='block';
+  el.textContent=msg;
+  el.style.background=isError?'var(--bgd)':'var(--bgs)';
+  el.style.color=isError?'var(--txd)':'var(--txs)';
+  el.style.borderColor=isError?'rgba(240,149,149,.28)':'rgba(192,221,151,.22)';
+}
+
+function syncSystemTimezonePreset(){
+  const select=document.getElementById('sysTimezonePreset');
+  const input=document.getElementById('sysTimezone');
+  if(!select||!input) return;
+  const current=input.value.trim();
+  const options=[...select.options].map(o=>o.value);
+  select.value=options.includes(current)?current:'__manual__';
+}
+
+function updateSystemTimezonePreview(){
+  const input=document.getElementById('sysTimezone');
+  const out=document.getElementById('systemTimezonePreview');
+  if(!input||!out) return;
+  const tz=input.value.trim();
+  if(!tz){
+    out.innerHTML='<span style="color:var(--tx3)">Ingresá una zona horaria IANA, por ejemplo <code>America/Argentina/Buenos_Aires</code>.</span>';
+    return;
+  }
+  try{
+    const now=new Intl.DateTimeFormat('es-AR',{
+      timeZone:tz,
+      dateStyle:'full',
+      timeStyle:'medium'
+    }).format(new Date());
+    out.innerHTML='Hora operativa actual: <strong>'+escHtml(now)+'</strong>';
+  }catch(_){
+    out.innerHTML='<span style="color:var(--txd)">Zona horaria inválida. Usá un identificador IANA como <code>America/Santiago</code> o <code>America/Mexico_City</code>.</span>';
+  }
+}
+
+function handleSystemTimezonePreset(){
+  const select=document.getElementById('sysTimezonePreset');
+  const input=document.getElementById('sysTimezone');
+  if(!select||!input) return;
+  if(select.value && select.value!=='__manual__') input.value=select.value;
+  updateSystemTimezonePreview();
+}
+
+function renderSystemSettings(settings,msg='',isError=false){
+  const options=Array.isArray(settings.timezone_options)?settings.timezone_options:[];
+  const currentTz=settings.business_timezone||'America/Argentina/Buenos_Aires';
+  const presetValues=options.map(opt=>opt.value);
+  const presetValue=presetValues.includes(currentTz)?currentTz:'__manual__';
+  const optionHtml=options.map(opt=>`<option value="${escHtml(opt.value)}" ${opt.value===presetValue?'selected':''}>${escHtml(opt.label)} — ${escHtml(opt.value)}</option>`).join('');
+  render(`
+    <div class="topbar">
+      <div class="page-title">Sistema</div>
+      <div style="display:flex;gap:8px;margin-left:auto">
+        <button class="btn btn-primary btn-sm" onclick="saveSystemSettingsForm()">Guardar</button>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+      <div style="font-size:13px;color:var(--txi);font-weight:600">Zona horaria operativa</div>
+      <div style="font-size:13px;color:var(--tx2);margin-top:6px;line-height:1.5">
+        Define el día operativo del sistema. Afecta límites diarios, reportes mensuales, alertas por email y el reset offline del firmware.
+      </div>
+    </div>
+    <div class="card">
+      <div class="field-row">
+        <div class="field">
+          <label>Zona sugerida</label>
+          <select id="sysTimezonePreset" onchange="handleSystemTimezonePreset()">
+            ${optionHtml}
+            <option value="__manual__" ${presetValue==='__manual__'?'selected':''}>Otra (ingreso manual)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Zona horaria IANA</label>
+          <input id="sysTimezone" value="${escHtml(currentTz)}" placeholder="America/Argentina/Buenos_Aires" oninput="syncSystemTimezonePreset();updateSystemTimezonePreview()">
+        </div>
+      </div>
+      <div id="systemTimezonePreview" style="font-size:13px;color:var(--tx2);margin-top:4px;margin-bottom:14px"></div>
+      <div style="font-size:12px;color:var(--tx3);line-height:1.6">
+        Usá identificadores IANA reales. Ejemplos: <code>America/Argentina/Buenos_Aires</code>, <code>America/Santiago</code>, <code>America/Lima</code>, <code>America/Mexico_City</code>.
+      </div>
+      <div id="systemSettingsMsg" class="err-banner" style="display:none;margin-top:16px"></div>
+    </div>
+  `);
+  updateSystemTimezonePreview();
+  setSystemSettingsMsg(msg,isError);
+}
+
+async function saveSystemSettingsForm(){
+  setSystemSettingsMsg('',false);
+  try{
+    const d=await api('PUT','/api/system-settings',{business_timezone:document.getElementById('sysTimezone')?.value||''});
+    renderSystemSettings(d.settings||{},'Configuración guardada.',false);
+  }catch(e){
+    setSystemSettingsMsg(e.message,true);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  AUDITORÍA
+// ══════════════════════════════════════════════════════
+const AUDIT_ENTITY_LABELS={
+  machine:'Máquina',
+  pending_machine:'Pendiente',
+  employee:'Empleado',
+  nfc_card:'TAG NFC',
+  admin_user:'Usuario panel',
+  notification_settings:'Notificaciones',
+  system_settings:'Sistema'
+};
+
+const AUDIT_ACTION_LABELS={
+  'machine.approve_pending':'Aprobar pendiente',
+  'machine.reject_pending':'Rechazar pendiente',
+  'machine.create':'Alta de máquina',
+  'machine.update':'Edición de máquina',
+  'machine.command_queue':'Comando remoto',
+  'machine.block':'Bloqueo de máquina',
+  'machine.unblock':'Desbloqueo de máquina',
+  'machine.deactivate':'Baja de máquina',
+  'employee.create':'Alta de empleado',
+  'employee.update':'Edición de empleado',
+  'employee.deactivate':'Baja de empleado',
+  'nfc_card.create':'Alta de TAG',
+  'nfc_card.update':'Edición de TAG',
+  'nfc_card.deactivate':'Baja de TAG',
+  'admin_user.create':'Alta de usuario',
+  'admin_user.update':'Edición de usuario',
+  'admin_user.deactivate':'Baja de usuario',
+  'notification_settings.update':'Config. notificaciones',
+  'notification_settings.test':'Prueba de notificaciones',
+  'system_settings.update':'Config. sistema',
+  'auth.change_password':'Cambio de contraseña'
+};
+
+function auditFiltersPayload(){
+  return {
+    entity_type: document.getElementById('auditEntity')?.value || '',
+    action: document.getElementById('auditAction')?.value || '',
+    q: (document.getElementById('auditSearch')?.value || '').trim(),
+    limit: parseInt(document.getElementById('auditLimit')?.value || '100', 10) || 100
+  };
+}
+
+function auditQueryString(filters){
+  const params=new URLSearchParams();
+  if(filters.entity_type) params.set('entity_type',filters.entity_type);
+  if(filters.action) params.set('action',filters.action);
+  if(filters.q) params.set('q',filters.q);
+  if(filters.limit) params.set('limit',String(filters.limit));
+  const qs=params.toString();
+  return qs ? '?'+qs : '';
+}
+
+function formatAuditDate(iso){
+  if(!iso) return '—';
+  const d=new Date(iso);
+  if(Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString('es-AR',{
+    year:'numeric',
+    month:'2-digit',
+    day:'2-digit',
+    hour:'2-digit',
+    minute:'2-digit',
+    second:'2-digit'
+  });
+}
+
+function renderAuditLogs(logs, filters){
+  const entityOptions=Object.entries(AUDIT_ENTITY_LABELS)
+    .map(([value,label])=>`<option value="${value}" ${filters.entity_type===value?'selected':''}>${label}</option>`)
+    .join('');
+  const actionOptions=Object.entries(AUDIT_ACTION_LABELS)
+    .map(([value,label])=>`<option value="${value}" ${filters.action===value?'selected':''}>${label}</option>`)
+    .join('');
+  const rows=(logs||[]).map(item=>{
+    const actor=escHtml(item.actor_username||'Sistema');
+    const role=escHtml(item.actor_role||'—');
+    const entityType=escHtml(AUDIT_ENTITY_LABELS[item.entity_type]||item.entity_type||'—');
+    const action=escHtml(AUDIT_ACTION_LABELS[item.action]||item.action||'—');
+    const entityLabel=escHtml(item.entity_label||item.entity_id||'—');
+    const summary=escHtml(item.summary||'—');
+    const createdAt=escHtml(formatAuditDate(item.created_at));
+    const details=item.details&&Object.keys(item.details).length
+      ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--tx2)">Ver detalle técnico</summary><pre style="margin-top:8px;background:var(--bg2);border:1px solid var(--br);border-radius:12px;padding:10px;overflow:auto;font-size:11px;line-height:1.5;color:var(--tx2)">${escHtml(JSON.stringify(item.details,null,2))}</pre></details>`
+      : '<span style="font-size:12px;color:var(--tx3)">Sin detalle adicional.</span>';
+    return `
+      <tr>
+        <td style="white-space:nowrap;vertical-align:top">
+          <div style="font-weight:600">${createdAt}</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:4px">${escHtml(timeSince(item.created_at))}</div>
+        </td>
+        <td style="vertical-align:top">
+          <div style="font-weight:600">${actor}</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:4px">${role}</div>
+        </td>
+        <td style="vertical-align:top">
+          <div style="font-weight:600">${action}</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:4px">${entityType} · ${entityLabel}</div>
+        </td>
+        <td style="vertical-align:top;min-width:320px">
+          <div>${summary}</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:6px">
+            IP: ${escHtml(item.actor_ip||'—')} · ${escHtml(item.actor_user_agent||'—')}
+          </div>
+          <div style="margin-top:8px">${details}</div>
+        </td>
+      </tr>
+    `;
+  }).join('');
+  render(`
+    <div class="topbar">
+      <div class="page-title">Auditoría</div>
+      <div style="display:flex;gap:8px;margin-left:auto">
+        <button class="btn btn-ghost btn-sm" onclick="loadAuditLogs()">Actualizar</button>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+      <div style="font-size:13px;color:var(--txi);font-weight:600">Trazabilidad administrativa</div>
+      <div style="font-size:13px;color:var(--tx2);margin-top:6px;line-height:1.5">
+        Registra altas, ediciones, bloqueos, comandos remotos y cambios sensibles del panel con actor, fecha y detalle técnico saneado.
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;align-items:end">
+        <div class="field" style="margin:0">
+          <label>Entidad</label>
+          <select id="auditEntity">
+            <option value="">Todas</option>
+            ${entityOptions}
+          </select>
+        </div>
+        <div class="field" style="margin:0">
+          <label>Acción</label>
+          <select id="auditAction">
+            <option value="">Todas</option>
+            ${actionOptions}
+          </select>
+        </div>
+        <div class="field" style="margin:0">
+          <label>Buscar</label>
+          <input id="auditSearch" value="${escHtml(filters.q||'')}" placeholder="actor, resumen, entidad">
+        </div>
+        <div class="field" style="margin:0">
+          <label>Máximo</label>
+          <select id="auditLimit">
+            <option value="50" ${String(filters.limit)==='50'?'selected':''}>50</option>
+            <option value="100" ${String(filters.limit||100)==='100'?'selected':''}>100</option>
+            <option value="200" ${String(filters.limit)==='200'?'selected':''}>200</option>
+            <option value="500" ${String(filters.limit)==='500'?'selected':''}>500</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+        <button class="btn btn-ghost btn-sm" onclick="resetAuditFilters()">Limpiar</button>
+        <button class="btn btn-primary btn-sm" onclick="applyAuditFilters()">Aplicar filtros</button>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Eventos recientes</div>
+        <div style="font-size:12px;color:var(--tx3)">${logs.length} evento(s)</div>
+      </div>
+      ${rows ? `
+        <table>
+          <thead><tr><th>Fecha</th><th>Actor</th><th>Acción</th><th>Resumen</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      ` : '<div class="empty">No hay eventos que coincidan con esos filtros.</div>'}
+    </div>
+  `);
+}
+
+async function loadAuditLogs(customFilters){
+  const filters=customFilters||{entity_type:'',action:'',q:'',limit:100};
+  render('<div class="page-title">Auditoría</div><div class="empty">Cargando...</div>');
+  try{
+    const d=await api('GET','/api/audit-logs'+auditQueryString(filters));
+    renderAuditLogs(d.logs||[],filters);
+  }catch(e){
+    render('<div class="page-title">Auditoría</div><p style="color:var(--txd)">'+e.message+'</p>');
+  }
+}
+
+function applyAuditFilters(){
+  loadAuditLogs(auditFiltersPayload());
+}
+
+function resetAuditFilters(){
+  loadAuditLogs({entity_type:'',action:'',q:'',limit:100});
 }
 
 
@@ -256,15 +720,24 @@ label{font-size:12px;color:var(--tx2);display:block;margin-bottom:4px;}
 .field{margin-bottom:14px;}
 .field-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
 .field-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+.pw-inline{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--tx2);margin-top:8px;user-select:none;cursor:pointer;}
+.pw-inline input{width:auto;margin:0;padding:0;accent-color:#185FA5;}
 
 /* BUTTONS */
 .btn{padding:8px 16px;border-radius:var(--r);font-size:13px;font-family:var(--f);cursor:pointer;font-weight:500;border:none;transition:opacity .15s;}
 .btn:hover{opacity:.85;}
+.btn:disabled{opacity:.45;cursor:not-allowed;}
 .btn-primary{background:#185FA5;color:#fff;}
 .btn-danger {background:#A32D2D;color:#fff;}
 .btn-ghost  {background:var(--bg2);color:var(--tx);border:1px solid var(--brm);}
 .btn-sm{padding:5px 12px;font-size:12px;}
 .btn-xs{padding:3px 8px;font-size:11px;}
+.scan-panel-status{display:none;background:var(--bg2);border:1px solid var(--br);border-radius:var(--r);padding:10px 12px;font-size:12px;color:var(--tx2);line-height:1.45;margin-bottom:10px;}
+.scan-panel-list{display:none;max-height:220px;overflow:auto;margin-bottom:12px;padding-right:2px;}
+.scan-panel-btn{width:100%;text-align:left;padding:10px 12px;background:#fff;color:var(--tx);border:1px solid var(--br);border-radius:14px;font-size:13px;cursor:pointer;margin-bottom:8px;transition:transform .12s ease,border-color .12s ease,box-shadow .12s ease,background .12s ease;}
+.scan-panel-btn strong{display:block;font-size:13px;font-weight:700;}
+.scan-panel-meta{display:block;font-size:11px;color:var(--tx3);margin-top:4px;}
+.scan-panel-btn.is-active{border-color:var(--pri);background:var(--soft);box-shadow:0 0 0 3px rgba(24,95,165,.1);transform:translateY(-1px);}
 
 /* CARDS / TABLES */
 .card{background:var(--bg);border:1px solid var(--br);border-radius:var(--rl);padding:20px;margin-bottom:16px;}
@@ -316,7 +789,14 @@ tr:hover td{background:var(--bg2);}
   <div class="login-sub">Panel de administración</div>
   <div class="login-err" id="loginErr"></div>
   <div class="field"><label>Usuario</label><input type="text" id="loginUser" value="admin" autocomplete="username"></div>
-  <div class="field"><label>Contraseña</label><input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password"></div>
+  <div class="field">
+    <label>Contraseña</label>
+    <input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password">
+    <label class="pw-inline">
+      <input type="checkbox" id="showLoginPass" onchange="toggleLoginPassword()">
+      <span>Mostrar contraseña</span>
+    </label>
+  </div>
   <div class="field" style="margin-bottom:6px">
     <label>URL del backend</label>
     <input type="text" id="loginUrl" placeholder="http://192.168.1.100:3000">
@@ -336,7 +816,12 @@ tr:hover td{background:var(--bg2);}
   <div class="nav-item"     onclick="nav('employees')"  id="n-employees"><span class="nav-icon">◉</span>Empleados</div>
   <div class="nav-item"     onclick="nav('reports')"    id="n-reports"><span class="nav-icon">◎</span>Reportes</div>
   <div class="nav-item"     onclick="nav('live')"       id="n-live"><span class="nav-icon">●</span>Feed en vivo</div>
-  <div class="nav-item"     onclick="nav('unknown')"    id="n-unknown"><span class="nav-icon">⚑</span>Tarjetas <span id="unknownBadge" style="display:none;background:#E24B4A;color:#fff;border-radius:100px;font-size:10px;padding:1px 6px;margin-left:4px">0</span></div>
+  <div class="nav-item"     onclick="nav('unknown')"    id="n-unknown"><span class="nav-icon">⚑</span>NFCs sin asignar <span id="unknownBadge" style="display:none;background:#E24B4A;color:#fff;border-radius:100px;font-size:10px;padding:1px 6px;margin-left:4px">0</span></div>
+  <div class="nav-item"     onclick="nav('nfc')"       id="n-nfc"><span class="nav-icon">📶</span>TAGs NFC</div>
+  
+  <div class="nav-item"     onclick="nav('notifications')" id="n-notifications" style="display:none"><span class="nav-icon">✉</span>Notificaciones</div>
+  <div class="nav-item"     onclick="nav('system')" id="n-system" style="display:none"><span class="nav-icon">⌘</span>Sistema</div>
+  <div class="nav-item"     onclick="nav('audit')" id="n-audit" style="display:none"><span class="nav-icon">⎘</span>Auditoría</div>
   <div class="nav-item"     onclick="nav('users')"      id="n-users" style="display:none"><span class="nav-icon">◐</span>Usuarios</div>
   <div id="userInfo" style="padding:8px 18px 0;font-size:12px;color:var(--tx3)"></div>
   <div class="sidebar-bottom">
@@ -357,10 +842,26 @@ tr:hover td{background:var(--bg2);}
 // ══════════════════════════════════════════════════════
 //  Estado
 // ══════════════════════════════════════════════════════
-let BASE = localStorage.getItem('cc_url2') || 'http://localhost:3000';
+const CURRENT_ORIGIN = /^https?:\/\//.test(window.location.origin) ? window.location.origin : '';
+let BASE = CURRENT_ORIGIN || localStorage.getItem('cc_url2') || 'http://localhost:3000';
 let TOKEN = localStorage.getItem('cc_token') || '';
 let WS = null;
 let currentPage = 'dashboard';
+let CURRENT_ROLE = null;
+let pendingPollTimer = null;
+let remoteWifiMachineName = '';
+let remoteWifiMachineState = null;
+let remoteWifiScanPollTimer = null;
+let remoteWifiScanCommandId = null;
+
+function isManagerRole(){
+  return CURRENT_ROLE==='admin' || CURRENT_ROLE==='gerente';
+}
+
+function canAccessPage(page){
+  if(isManagerRole()) return true;
+  return ['dashboard','reports','live'].includes(page);
+}
 
 // ── Tema ─────────────────────────────────────────────
 function toggleTheme(){
@@ -385,6 +886,13 @@ if(TOKEN) showApp();
 // ══════════════════════════════════════════════════════
 //  AUTH
 // ══════════════════════════════════════════════════════
+function toggleLoginPassword(){
+  const input=document.getElementById('loginPass');
+  const toggle=document.getElementById('showLoginPass');
+  if(!input||!toggle) return;
+  input.type=toggle.checked?'text':'password';
+}
+
 async function doLogin(){
   BASE = document.getElementById('loginUrl').value.trim().replace(/\/$/,'');
   localStorage.setItem('cc_url2', BASE);
@@ -409,6 +917,8 @@ document.getElementById('loginPass').addEventListener('keydown',e=>{ if(e.key===
 function doLogout(){
   TOKEN=''; localStorage.removeItem('cc_token');
   if(WS){WS.close();WS=null;}
+  if(pendingPollTimer){clearInterval(pendingPollTimer);pendingPollTimer=null;}
+  CURRENT_ROLE=null;
   document.getElementById('appScreen').style.display='none';
   document.getElementById('loginScreen').style.display='flex';
 }
@@ -416,21 +926,28 @@ function doLogout(){
 function showApp(){
   try{
     const payload = JSON.parse(atob(TOKEN.split('.')[1]));
+    CURRENT_ROLE = payload.role || null;
     const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor'}[payload.role]||payload.role;
     const ui = document.getElementById('userInfo');
     if(ui) ui.innerHTML = '<strong>'+payload.username+'</strong><br>'+roleLabel;
-    // Solo gerente/admin ve la sección usuarios
+    const manager = isManagerRole();
+    ['n-machines','n-employees','n-unknown','n-nfc','n-notifications','n-system','n-audit'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.style.display=manager?'flex':'none';
+    });
     const nu = document.getElementById('n-users');
-    if(nu && (payload.role==='gerente'||payload.role==='admin')) nu.style.display='flex';
-    // Supervisor: ocultar máquinas/empleados si es necesario (ver permisos)
+    if(nu) nu.style.display=manager?'flex':'none';
   }catch(_){}
   document.getElementById('loginScreen').style.display='none';
   document.getElementById('appScreen').style.display='block';
   connectWS();
   nav('dashboard');
-  checkPending();
-  setInterval(checkPending, 30000);
-  loadUnknownBadge();
+  if(pendingPollTimer){clearInterval(pendingPollTimer);pendingPollTimer=null;}
+  if(isManagerRole()){
+    checkPending();
+    pendingPollTimer=setInterval(checkPending, 30000);
+    loadUnknownBadge();
+  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -451,19 +968,30 @@ async function api(method, path, body){
 // ══════════════════════════════════════════════════════
 function connectWS(){
   if(WS){WS.close();WS=null;}
-  const url=BASE.replace(/^http/,'ws')+'/ws';
+  if(!TOKEN){setWS('off');return;}
+  const url=BASE.replace(/^http/,'ws')+'/ws?token='+encodeURIComponent(TOKEN);
   try{WS=new WebSocket(url);}catch(e){setWS('err');return;}
   WS.onopen=()=>setWS('ok');
-  WS.onclose=()=>{setWS('off');setTimeout(connectWS,5000);};
+  WS.onclose=(ev)=>{
+    setWS('off');
+    if(ev && ev.code===4001){
+      TOKEN=''; localStorage.removeItem('cc_token');
+      CURRENT_ROLE=null;
+      document.getElementById('appScreen').style.display='none';
+      document.getElementById('loginScreen').style.display='flex';
+      return;
+    }
+    if(TOKEN) setTimeout(connectWS,5000);
+  };
   WS.onerror=()=>setWS('err');
   WS.onmessage=(e)=>{
     try{
       const msg=JSON.parse(e.data);
       if(currentPage==='dashboard') loadDashboard();
       if(currentPage==='live') prependLive(msg);
-      if(currentPage==='machines'||(msg.event==='machine_blocked'||msg.event==='machine_unblocked'||msg.event==='machine_pending'||msg.event==='machine_approved')) loadMachines();
-      if(msg.event==='machine_pending') showPendingBadge();
-      if(msg.event==='card_unknown') handleUnknownCard(msg);
+      if(isManagerRole() && (currentPage==='machines'||(msg.event==='machine_blocked'||msg.event==='machine_unblocked'||msg.event==='machine_pending'||msg.event==='machine_approved'))) loadMachines();
+      if(isManagerRole() && msg.event==='machine_pending') showPendingBadge();
+      if(isManagerRole() && msg.event==='card_unknown') handleUnknownCard(msg);
     }catch(_){}
   };
 }
@@ -479,12 +1007,261 @@ function setWS(s){
 //  NAV
 // ══════════════════════════════════════════════════════
 function nav(page){
+  if(!canAccessPage(page)) page='dashboard';
   currentPage=page;
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('on'));
   const ni=document.getElementById('n-'+page);
   if(ni) ni.classList.add('on');
-  const pages={dashboard:loadDashboard,machines:loadMachines,employees:loadEmployees,reports:loadReports,live:loadLive,unknown:loadUnknown,users:loadUsers};
+  const pages={
+    dashboard:loadDashboard,
+    machines:loadMachines,
+    employees:loadEmployees,
+    reports:loadReports,
+    live:loadLive,
+    unknown:loadUnknown,
+    users:loadUsers,
+    nfc:loadNfcTags,
+    notifications:loadNotifications,
+    system:loadSystemSettings,
+    audit:loadAuditLogs
+  };
   if(pages[page]) pages[page]();
+}
+
+// ══════════════════════════════════════════════════════
+//  VISTA GLOBAL DE TAGs NFC
+// ══════════════════════════════════════════════════════
+async function loadNfcTags(){
+  render('<div class="page-title">TAGs NFC</div><div class="empty">Cargando...</div>');
+  try{
+    const d = await api('GET','/api/nfc-cards');
+    renderNfcTags(d.cards||[]);
+  }catch(e){
+    render('<div class="page-title">TAGs NFC</div><p style="color:var(--txd)">'+e.message+'</p>');
+  }
+}
+
+function renderNfcTags(cards){
+  // Filtros visuales
+  render(`
+    <div class="topbar">
+      <div class="page-title">TAGs NFC</div>
+      <button class="btn btn-primary btn-sm" onclick="openAddNfcTag()">+ Nuevo TAG NFC</button>
+    </div>
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+      <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+        <div style="display:flex;flex-direction:column;gap:3px">
+          <label style="font-size:11px;color:var(--tx3)">Buscar</label>
+          <input id="nfcSearch" placeholder="UID, etiqueta o empleado" style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)" oninput="applyNfcFilters()">
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px">
+          <label style="font-size:11px;color:var(--tx3)">Estado</label>
+          <select id="nfcState" onchange="applyNfcFilters()" style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)"><option value="">Todos</option><option value="active">Activos</option><option value="lost">Perdidos</option><option value="inactive">De baja</option></select>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="resetNfcFilters()" style="align-self:flex-end">Limpiar filtros</button>
+      </div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>UID</th><th>Etiqueta</th><th>Empleado</th><th>Estado</th><th>Alta</th><th></th></tr></thead>
+        <tbody id="nfcTbody"></tbody>
+      </table>
+    </div>
+  `);
+  window._allNfcCards = cards;
+  applyNfcFilters();
+}
+
+function applyNfcFilters(){
+  const q=(document.getElementById('nfcSearch')?.value||'').toLowerCase().trim();
+  const state=document.getElementById('nfcState')?.value||'';
+  const filtered=(window._allNfcCards||[]).filter(c=>{
+    if(q && !(`${c.uid} ${c.label||''} ${c.employee_name||''}`.toLowerCase().includes(q))) return false;
+    if(state && nfcCardStatus(c)!==state) return false;
+    return true;
+  });
+  const rows = filtered.map(c => [
+    '<tr>',
+      `<td style="font-family:monospace;font-size:12px">${c.uid}</td>`,
+      `<td>${c.label ? c.label.replace(/</g,'&lt;').replace(/>/g,'&gt;') : '—'}</td>`,
+      `<td>${c.employee_name ? c.employee_name.replace(/</g,'&lt;').replace(/>/g,'&gt;') : '—'}</td>`,
+      `<td>${renderNfcCardBadge(c)}</td>`,
+      `<td style="font-size:11px;color:var(--tx3)">${c.created_at ? new Date(c.created_at).toLocaleDateString('es-AR') : ''}</td>`,
+      `<td style="white-space:nowrap">${renderNfcTagActions(c)}</td>`,
+    '</tr>'
+  ].join('')).join('');
+  const tbody = document.getElementById('nfcTbody');
+  if (tbody) tbody.innerHTML = rows || '<tr><td colspan="6" class="empty">Sin TAGs NFC</td></tr>';
+}
+
+function resetNfcFilters(){
+  document.getElementById('nfcSearch').value='';
+  document.getElementById('nfcState').value='';
+  applyNfcFilters();
+}
+
+function getNfcCard(cardId){
+  return (window._allNfcCards||[]).find(c=>c.id===cardId) || null;
+}
+
+function nfcCardStatus(card){
+  const raw=String(card?.status||'').toLowerCase().trim();
+  if(['active','inactive','lost'].includes(raw)) return raw;
+  return card?.active ? 'active' : 'inactive';
+}
+
+function nfcCardStateMeta(card){
+  const status=nfcCardStatus(card);
+  if(status==='lost') return {cls:'bw',label:'Perdido'};
+  if(status==='inactive') return {cls:'bd',label:'De baja'};
+  return {cls:'bs',label:'Activo'};
+}
+
+function renderNfcCardBadge(card){
+  const meta=nfcCardStateMeta(card);
+  return `<span class="badge ${meta.cls}">${meta.label}</span>`;
+}
+
+function renderNfcTagActions(card){
+  const status=nfcCardStatus(card);
+  const label=(card.label||'').replace(/'/g,'&#39;');
+  const uid=(card.uid||'').replace(/'/g,'&#39;');
+  const actions=[
+    `<button class="btn btn-ghost btn-xs" onclick="renameNfcTag(${card.id},'${label}')">Renombrar</button>`,
+    `<button class="btn btn-ghost btn-xs" onclick="reassignNfcTag(${card.id},'${uid}')">Reasignar</button>`
+  ];
+  if(status==='active'){
+    actions.push(`<button class="btn btn-ghost btn-xs" style="color:var(--txw)" onclick="markNfcTagLost(${card.id})">Marcar perdido</button>`);
+    actions.push(`<button class="btn btn-ghost btn-xs" style="color:var(--txd)" onclick="deactivateNfcTag(${card.id})">Dar de baja</button>`);
+  }else if(status==='lost'){
+    actions.push(`<button class="btn btn-ghost btn-xs" onclick="reactivateNfcTag(${card.id})">Reactivar</button>`);
+    actions.push(`<button class="btn btn-ghost btn-xs" style="color:var(--txd)" onclick="deactivateNfcTag(${card.id})">Dar de baja</button>`);
+  }else{
+    actions.push(`<button class="btn btn-ghost btn-xs" onclick="reactivateNfcTag(${card.id})">Reactivar</button>`);
+  }
+  return actions.join('');
+}
+
+async function refreshEmployeesCache(){
+  const d=await api('GET','/api/employees');
+  allEmployees=d.employees||[];
+  return allEmployees;
+}
+
+async function openAddNfcTag(){
+  try{
+    const employees=await refreshEmployeesCache();
+    if(!employees.length){
+      alert('Primero tenés que crear al menos un empleado.');
+      return;
+    }
+    const opts=employees.map(e=>`<option value="${e.id}">${(e.name||'').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</option>`).join('');
+    openModal('Registrar TAG NFC',`
+      <div class="field">
+        <label>Empleado *</label>
+        <select id="nfcEmpId">${opts}</select>
+      </div>
+      <div class="field">
+        <label>UID del TAG NFC (hexadecimal) *</label>
+        <input id="nfcUid" placeholder="A1B2C3D4" style="font-family:monospace;text-transform:uppercase">
+      </div>
+      <div class="field">
+        <label>Etiqueta (opcional)</label>
+        <input id="nfcLabel" placeholder="TAG principal / Llavero">
+      </div>
+      <div class="err-banner" id="nfcAddErr"></div>
+    `,'saveNfcTag()');
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function saveNfcTag(){
+  const empId=parseInt(document.getElementById('nfcEmpId')?.value||'0',10);
+  const uid=(document.getElementById('nfcUid')?.value||'').toUpperCase().trim();
+  const label=(document.getElementById('nfcLabel')?.value||'').trim();
+  if(!empId){showModalErr('nfcAddErr','Seleccioná un empleado');return;}
+  if(!uid){showModalErr('nfcAddErr','El UID es requerido');return;}
+  try{
+    await api('POST',`/api/employees/${empId}/cards`,{uid,label:label||'TAG NFC'});
+    await refreshEmployeesCache();
+    closeModal();
+    loadNfcTags();
+  }catch(e){showModalErr('nfcAddErr',e.message);}
+}
+
+async function renameNfcTag(cardId,currentLabel){
+  const card=getNfcCard(cardId);
+  if(!card){alert('No se encontró el TAG NFC seleccionado.');return;}
+  const newLabel=prompt('Nueva etiqueta para el TAG NFC:',String(currentLabel||''));
+  if(newLabel===null) return;
+  try{
+    await api('PATCH',`/api/employees/${card.employee_id}/cards/${cardId}`,{label:newLabel.trim()||'TAG NFC'});
+    await refreshEmployeesCache();
+    loadNfcTags();
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function reassignNfcTag(cardId,uid){
+  const card=getNfcCard(cardId);
+  if(!card){alert('No se encontró el TAG NFC seleccionado.');return;}
+  try{
+    const employees=await refreshEmployeesCache();
+    const opts=employees.map(e=>`<option value="${e.id}" ${e.id===card.employee_id?'selected':''}>${(e.name||'').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</option>`).join('');
+    openModal('Reasignar TAG NFC',`
+      <p style="font-size:13px;color:var(--tx2);margin-bottom:12px">UID: <code style="font-family:monospace;background:var(--bg2);padding:2px 6px;border-radius:4px">${uid}</code></p>
+      <div class="field">
+        <label>Nuevo empleado *</label>
+        <select id="reassignNfcEmpId">${opts}</select>
+      </div>
+      <div class="err-banner" id="reassignNfcErr"></div>
+    `,`saveNfcReassign(${cardId})`);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function saveNfcReassign(cardId){
+  const card=getNfcCard(cardId);
+  if(!card){showModalErr('reassignNfcErr','No se encontró el TAG NFC seleccionado');return;}
+  const newEmpId=parseInt(document.getElementById('reassignNfcEmpId')?.value||'0',10);
+  if(!newEmpId){showModalErr('reassignNfcErr','Seleccioná un empleado');return;}
+  try{
+    await api('PATCH',`/api/employees/${card.employee_id}/cards/${cardId}`,{employee_id:newEmpId,status:'active'});
+    await refreshEmployeesCache();
+    closeModal();
+    loadNfcTags();
+  }catch(e){showModalErr('reassignNfcErr',e.message);}
+}
+
+async function markNfcTagLost(cardId){
+  const card=getNfcCard(cardId);
+  if(!card){alert('No se encontró el TAG NFC seleccionado.');return;}
+  const label=card.label ? ` (${card.label})` : '';
+  if(!confirm(`¿Marcar como perdido el TAG NFC ${card.uid}${label}? Dejará de autorizar consumos hasta que lo reactives o reasignes.`)) return;
+  try{
+    await api('PATCH',`/api/employees/${card.employee_id}/cards/${cardId}`,{status:'lost'});
+    await refreshEmployeesCache();
+    loadNfcTags();
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function deactivateNfcTag(cardId){
+  const card=getNfcCard(cardId);
+  if(!card){alert('No se encontró el TAG NFC seleccionado.');return;}
+  const label=card.label ? ` (${card.label})` : '';
+  if(!confirm(`¿Dar de baja el TAG NFC ${card.uid}${label}? Quedará desactivado pero conservará su historial.`)) return;
+  try{
+    await api('DELETE',`/api/employees/${card.employee_id}/cards/${cardId}`);
+    await refreshEmployeesCache();
+    loadNfcTags();
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function reactivateNfcTag(cardId){
+  const card=getNfcCard(cardId);
+  if(!card){alert('No se encontró el TAG NFC seleccionado.');return;}
+  try{
+    await api('PATCH',`/api/employees/${card.employee_id}/cards/${cardId}`,{status:'active'});
+    await refreshEmployeesCache();
+    loadNfcTags();
+  }catch(e){alert('Error: '+e.message);}
 }
 
 function render(html){document.getElementById('mainContent').innerHTML=html;}
@@ -538,7 +1315,7 @@ function renderDashboard(today,monthly,machinesData){
   }).join('');
 
   const html=`
-  <div class="topbar"><div class="page-title">Dashboard</div><div style="font-size:12px;color:var(--tx3)">${new Date().toLocaleString('es-AR')}</div></div>
+  <div class="topbar"><div class="page-title">Dashboard</div><div style="font-size:12px;color:var(--tx3)">Día operativo ${escHtml(today.business_date||'—')} · ${escHtml(today.business_timezone||'—')}</div></div>
   <div class="metrics">${metricsHtml}</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
     <div class="card">
@@ -635,7 +1412,7 @@ function applyMachineFilters(){
   const st=document.getElementById('mfStatus')?.value||'';
   const act=document.getElementById('mfActivity')?.value||'';
   const filtered=allMachines.filter(m=>{
-    if(q && !`${m.name} ${m.location||''}`.toLowerCase().includes(q)) return false;
+    if(q && !`${m.name} ${m.location||''} ${m.wifi_ssid||''} ${m.wifi_ip||''} ${m.backend_error||''}`.toLowerCase().includes(q)) return false;
     if(st){const s=m.blocked?'blocked':m.active?'active':'inactive'; if(s!==st) return false;}
     if(act==='today' && !(m.taps_today>0)) return false;
     if(act==='none' && (m.taps_month>0)) return false;
@@ -646,9 +1423,13 @@ function applyMachineFilters(){
     const stBg=m.blocked?'bd':m.active?'bs':'bw';
     const stLbl=m.blocked?'Bloqueada':m.active?'Activa':'Inactiva';
     const onlineDot=`<span style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${m.online?'#22c55e':'#94a3b8'};display:inline-block" title="${m.online?'Online — activa en los últimos 3 min':'Offline'}"></span>`;
+    const backend=machineBackendBadge(m);
+    const networkLine=machineNetworkSummary(m);
+    const lastSeen=m.last_seen?timeSince(m.last_seen):'Nunca';
+    const backendError=m.backend_error?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.backend_error)}</div>`:'';
     return `<tr>
-      <td><div style="display:flex;align-items:center;gap:6px">${onlineDot}<div><strong>${m.name}</strong><div style="font-size:11px;color:var(--tx3)">${m.location||'—'}</div></div></div></td>
-      <td><span class="badge ${stBg}">${stLbl}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:3px">${m.blocked_reason||''}</div>`:''}</td>
+      <td><div style="display:flex;align-items:flex-start;gap:6px">${onlineDot}<div><strong>${escHtml(m.name)}</strong><div style="font-size:11px;color:var(--tx3)">${escHtml(m.location||'—')}</div><div style="font-size:11px;color:var(--tx3);margin-top:3px">${networkLine}</div></div></div></td>
+      <td><span class="badge ${stBg}">${stLbl}</span><span class="badge ${backend.cls}" style="margin-left:6px">${backend.label}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.blocked_reason||'')}</div>`:''}<div style="font-size:11px;color:var(--tx3);margin-top:4px">Último contacto ${lastSeen}</div>${backendError}</td>
       <td>${m.taps_today||0}</td>
       <td>${m.taps_month||0}</td>
       <td>$${Math.round((m.cost_month_cents||0)/100).toLocaleString('es-AR')}</td>
@@ -657,6 +1438,8 @@ function applyMachineFilters(){
         ${m.blocked
           ?`<button class="btn btn-ghost btn-xs" onclick="unblockMachine(${m.id},'${m.name}')">Desbloquear</button>`
           :`<button class="btn btn-xs" style="background:var(--bgd);color:var(--txd)" onclick="blockMachine(${m.id},'${m.name}')">Bloquear</button>`}
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openRemoteWifi(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>WiFi</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="restartMachine(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>Reiniciar</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="machineDetail(${m.id},'${m.name}')">Ver</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px;color:var(--txd)" onclick="deleteMachine(${m.id},'${m.name}')">Eliminar</button>
       </td>
@@ -692,19 +1475,209 @@ async function unblockMachine(id,name){
   catch(e){alert('Error: '+e.message);}
 }
 
+async function restartMachine(id,name,online){
+  if(!online){alert('La máquina está offline. El reinicio remoto solo se envía a equipos online.');return;}
+  if(!confirm(`¿Enviar reinicio remoto a "${name}"? La máquina reiniciará cuando reciba el comando.`)) return;
+  try{
+    await api('POST',`/api/machines/${id}/commands`,{type:'reboot'});
+    alert(`Reinicio remoto enviado a "${name}".`);
+    loadMachines();
+  }catch(e){alert('Error: '+e.message);}
+}
+
+function openRemoteWifi(id,name,online){
+  if(!online){alert('La máquina está offline. El cambio remoto de WiFi solo se envía a equipos online.');return;}
+  stopRemoteWifiScanPoll();
+  remoteWifiMachineName = name;
+  remoteWifiMachineState = allMachines.find(m=>m.id===id) || null;
+  const currentSsid=(remoteWifiMachineState?.wifi_ssid||'').replace(/"/g,'&quot;');
+  const currentUrl=(remoteWifiMachineState?.backend_url||'').replace(/"/g,'&quot;');
+  openModal(`Actualizar WiFi: ${name}`,`
+    <div class="field-row">
+      <div class="field"><label>SSID *</label><input id="mwSsid" placeholder="Nombre de la red WiFi" autocomplete="off" value="${currentSsid}"></div>
+      <div class="field"><label>Nueva contraseña</label><input id="mwPass" type="password" placeholder="Dejar vacío para conservar la actual" autocomplete="new-password"></div>
+    </div>
+    <label class="pw-inline"><input type="checkbox" id="mwShowPass"> Mostrar contraseña</label>
+    <div class="field">
+      <label>URL backend (opcional)</label>
+      <input id="mwUrl" placeholder="Dejar vacío para conservar la URL actual" value="${currentUrl}">
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <button type="button" class="btn btn-ghost btn-sm" id="mwScanBtn">Escanear redes</button>
+      <div style="font-size:12px;color:var(--tx3)">Usa la propia máquina para listar redes visibles en su entorno.</div>
+    </div>
+    <div id="mwScanStatus" class="scan-panel-status"></div>
+    <div id="mwScanList" class="scan-panel-list"></div>
+    <div style="font-size:12px;color:var(--tx2);margin-top:-6px;margin-bottom:14px;line-height:1.45">
+      La máquina guardará la nueva configuración, confirmará el comando y se reiniciará. Si dejás vacía la contraseña, conserva la actual. Si dejás vacía la URL, mantiene la actual.
+    </div>
+    <div class="err-banner" id="mwErr"></div>
+  `,`submitRemoteWifi(${id})`);
+  const chk=document.getElementById('mwShowPass');
+  if(chk){
+    chk.addEventListener('change',()=>{
+      const input=document.getElementById('mwPass');
+      if(input) input.type=chk.checked?'text':'password';
+    });
+  }
+  const scanBtn=document.getElementById('mwScanBtn');
+  if(scanBtn){
+    scanBtn.addEventListener('click',()=>scanRemoteWifi(id));
+  }
+}
+
+async function submitRemoteWifi(id){
+  const ssid=document.getElementById('mwSsid')?.value.trim()||'';
+  const pass=document.getElementById('mwPass')?.value||'';
+  const url=document.getElementById('mwUrl')?.value.trim()||'';
+  const preservePassword=pass==='';
+  if(!ssid){showModalErr('mwErr','El SSID es requerido');return;}
+  if(url && !/^https?:\/\//i.test(url)){showModalErr('mwErr','La URL debe comenzar con http:// o https://');return;}
+  try{
+    await api('POST',`/api/machines/${id}/commands`,{
+      type:'wifi_update',
+      payload:{ssid,pass,url,preserve_password:preservePassword}
+    });
+    closeModal();
+    alert(`Cambio remoto de WiFi enviado a "${remoteWifiMachineName}". La máquina se reiniciará cuando aplique la nueva configuración.`);
+    loadMachines();
+  }catch(e){showModalErr('mwErr',e.message);}
+}
+
+function stopRemoteWifiScanPoll(){
+  if(remoteWifiScanPollTimer){clearTimeout(remoteWifiScanPollTimer);remoteWifiScanPollTimer=null;}
+  remoteWifiScanCommandId=null;
+}
+
+function setRemoteWifiScanStatus(msg){
+  const el=document.getElementById('mwScanStatus');
+  if(!el) return;
+  if(!msg){el.style.display='none';el.textContent='';return;}
+  el.textContent=msg;
+  el.style.display='block';
+}
+
+function renderRemoteWifiNetworks(networks){
+  const list=document.getElementById('mwScanList');
+  if(!list) return;
+  const current=document.getElementById('mwSsid')?.value||'';
+  if(!Array.isArray(networks)||!networks.length){
+    list.style.display='none';
+    list.innerHTML='';
+    return;
+  }
+  list.innerHTML=networks.map(net=>{
+    const active=current===net.ssid;
+    return `<button type="button" class="scan-panel-btn ${active?'is-active':''}" data-ssid="${net.ssid.replace(/"/g,'&quot;')}">
+      <strong>${net.ssid}</strong>
+      <span class="scan-panel-meta">${net.secure?'Contraseña requerida':'Red abierta'} | Señal ${net.rssi} dBm</span>
+    </button>`;
+  }).join('');
+  list.style.display='block';
+  list.querySelectorAll('.scan-panel-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const ssid=btn.getAttribute('data-ssid')||'';
+      const input=document.getElementById('mwSsid');
+      if(input) input.value=ssid;
+      list.querySelectorAll('.scan-panel-btn').forEach(x=>x.classList.remove('is-active'));
+      btn.classList.add('is-active');
+      setRemoteWifiScanStatus(`Red seleccionada: ${ssid}`);
+      const pass=document.getElementById('mwPass');
+      if(pass) pass.focus();
+    });
+  });
+}
+
+async function pollRemoteWifiCommand(machineId,commandId,attempt=0){
+  try{
+    const d=await api('GET',`/api/machines/${machineId}/commands/${commandId}`);
+    const cmd=d.command;
+    if(!cmd){throw new Error('Sin estado de comando');}
+    if(cmd.status==='completed'){
+      const nets=cmd.result?.networks||[];
+      setRemoteWifiScanStatus(cmd.result?.message||`Escaneo completado (${nets.length} red${nets.length!==1?'es':''}).`);
+      renderRemoteWifiNetworks(nets);
+      const btn=document.getElementById('mwScanBtn');
+      if(btn) btn.disabled=false;
+      stopRemoteWifiScanPoll();
+      return;
+    }
+    if(cmd.status==='failed'){
+      setRemoteWifiScanStatus(cmd.result?.message||'No se pudo completar el escaneo remoto.');
+      renderRemoteWifiNetworks([]);
+      const btn=document.getElementById('mwScanBtn');
+      if(btn) btn.disabled=false;
+      stopRemoteWifiScanPoll();
+      return;
+    }
+    if(attempt>=20){
+      setRemoteWifiScanStatus('El escaneo está tardando más de lo esperado. Probá de nuevo en unos segundos.');
+      const btn=document.getElementById('mwScanBtn');
+      if(btn) btn.disabled=false;
+      stopRemoteWifiScanPoll();
+      return;
+    }
+    remoteWifiScanPollTimer=setTimeout(()=>pollRemoteWifiCommand(machineId,commandId,attempt+1),2000);
+  }catch(e){
+    setRemoteWifiScanStatus('No se pudo consultar el resultado del escaneo remoto.');
+    const btn=document.getElementById('mwScanBtn');
+    if(btn) btn.disabled=false;
+    stopRemoteWifiScanPoll();
+  }
+}
+
+async function scanRemoteWifi(machineId){
+  const btn=document.getElementById('mwScanBtn');
+  if(btn) btn.disabled=true;
+  renderRemoteWifiNetworks([]);
+  setRemoteWifiScanStatus('Pidiendo a la máquina que escanee redes visibles...');
+  stopRemoteWifiScanPoll();
+  try{
+    const d=await api('POST',`/api/machines/${machineId}/commands`,{type:'wifi_scan'});
+    remoteWifiScanCommandId=d.command?.id||null;
+    if(!remoteWifiScanCommandId) throw new Error('No se recibió ID de comando');
+    setRemoteWifiScanStatus('Escaneando redes desde la máquina...');
+    pollRemoteWifiCommand(machineId,remoteWifiScanCommandId,0);
+  }catch(e){
+    setRemoteWifiScanStatus(e.message||'No se pudo iniciar el escaneo remoto.');
+    if(btn) btn.disabled=false;
+    stopRemoteWifiScanPoll();
+  }
+}
+
 async function machineDetail(id,name){
   try{
-    const [rep,taps]=await Promise.all([
-      api('GET',`/api/reports/machines/${id}/employees`),
-      api('GET',`/api/machines/${id}/taps?limit=20`),
+    const stateFallback=allMachines.find(m=>m.id===id)?Promise.resolve({machines:allMachines}):api('GET','/api/machines');
+    const rangeQuery=reportQueryString();
+    const tapsQuery=reportQueryString({machine_id:id,limit:20});
+    const [rep,taps,machinesData]=await Promise.all([
+      api('GET',`/api/reports/machines/${id}/employees${rangeQuery}`),
+      api('GET',`/api/reports/recent-taps${tapsQuery}`),
+      stateFallback,
     ]);
-    const empRows=(rep.employees||[]).map(e=>`<tr><td>${e.employee_name}</td><td>${e.legajo||'—'}</td><td>${e.department||'—'}</td><td>${e.taps_count}</td><td>$${Math.round((e.spent_cents||0)/100).toLocaleString('es-AR')}</td></tr>`).join('');
-    const tapRows=(taps.taps||[]).map(t=>`<tr><td>${t.employee_name}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ OK':'✕ Rechazado'}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
+    const machineState=(machinesData.machines||[]).find(m=>m.id===id)||null;
+    const backend=machineState?machineBackendBadge(machineState):null;
+    const empRows=(rep.employees||[]).map(e=>`<tr><td>${e.employee_name}</td><td>${e.legajo||'—'}</td><td>${e.department||'—'}</td><td>${formatReportInt(e.taps_count)}</td><td>${formatReportMoney(e.spent_cents)}</td></tr>`).join('');
+    const tapRows=(taps.taps||[]).map(t=>`<tr><td>${t.employee_name||'—'}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ OK':'✕ Rechazado'}</td><td>${t.machine_name||name}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
+    const networkBlock=machineState?`
+      <div class="section-lbl" style="margin-bottom:8px">Estado de red</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;font-size:13px">
+        <div><span style="color:var(--tx3)">Conectividad:</span> ${machineState.online?'Online':'Offline'}</div>
+        <div><span style="color:var(--tx3)">Último contacto:</span> ${machineState.last_seen?timeSince(machineState.last_seen):'Nunca'}</div>
+        <div><span style="color:var(--tx3)">SSID:</span> ${escHtml(machineState.wifi_ssid||'—')}</div>
+        <div><span style="color:var(--tx3)">RSSI:</span> ${formatMachineRssi(machineState.wifi_rssi)}</div>
+        <div><span style="color:var(--tx3)">IP:</span> ${escHtml(machineState.wifi_ip||'—')}</div>
+        <div><span style="color:var(--tx3)">Backend:</span> <span class="badge ${backend.cls}">${backend.label}</span></div>
+        <div style="grid-column:1 / -1"><span style="color:var(--tx3)">URL backend:</span> ${escHtml(machineState.backend_url||'—')}</div>
+        ${machineState.backend_error?`<div style="grid-column:1 / -1"><span style="color:var(--tx3)">Último error:</span> ${escHtml(machineState.backend_error)}</div>`:''}
+      </div>
+    `:'';
     openModal(`Máquina: ${name}`,`
-      <div class="section-lbl" style="margin-bottom:8px">Top empleados (mes actual)</div>
+      ${networkBlock}
+      <div class="section-lbl" style="margin-bottom:8px">Top empleados (${escHtml(formatReportRangeLabel(reportState.from,reportState.to))})</div>
       <table style="margin-bottom:20px"><thead><tr><th>Empleado</th><th>Legajo</th><th>Área</th><th>Cafés</th><th>$</th></tr></thead><tbody>${empRows||'<tr><td colspan="5" class="empty">Sin datos</td></tr>'}</tbody></table>
-      <div class="section-lbl" style="margin-bottom:8px">Últimos 20 taps</div>
-      <table><thead><tr><th>Empleado</th><th>Resultado</th><th>Hora</th></tr></thead><tbody>${tapRows||'<tr><td colspan="3" class="empty">Sin taps</td></tr>'}</tbody></table>
+      <div class="section-lbl" style="margin-bottom:8px">Últimos 20 taps del rango</div>
+      <table><thead><tr><th>Empleado</th><th>Resultado</th><th>Máquina</th><th>Hora</th></tr></thead><tbody>${tapRows||'<tr><td colspan="4" class="empty">Sin taps</td></tr>'}</tbody></table>
     `,'',true);
   }catch(e){alert('Error: '+e.message);}
 }
@@ -737,8 +1710,7 @@ let allEmployees=[];
 async function loadEmployees(){
   render('<div class="page-title">Empleados</div><div class="empty">Cargando...</div>');
   try{
-    const d=await api('GET','/api/employees');
-    allEmployees=d.employees||[];
+    await refreshEmployeesCache();
     renderEmployees();
   }catch(e){render('<p style="color:var(--txd)">'+e.message+'</p>');}
 }
@@ -766,18 +1738,18 @@ function renderEmployees(){
         </select>
       </div>
       <div style="display:flex;flex-direction:column;gap:3px">
-        <label style="font-size:11px;color:var(--tx3)">Tarjetas NFC</label>
+        <label style="font-size:11px;color:var(--tx3)">TAGs NFC</label>
         <select id="efCards" onchange="applyEmployeeFilters()"
           style="font-size:12px;padding:5px 8px;border:1px solid var(--br);border-radius:var(--r);background:var(--bg2)">
           <option value="">Todas</option>
-          <option value="active">Con tarjeta activa</option>
-          <option value="none">Sin tarjeta activa</option>
+          <option value="active">Con TAG NFC activo</option>
+          <option value="none">Sin TAG NFC activo</option>
         </select>
       </div>
       <button class="btn btn-ghost btn-sm" onclick="resetEmployeeFilters()" style="align-self:flex-end">Limpiar filtros</button>
     </div>
     <table>
-      <thead><tr><th>Nombre</th><th>Legajo</th><th>DNI</th><th>Área</th><th>Límite</th><th>Tarjetas</th><th></th></tr></thead>
+      <thead><tr><th>Nombre</th><th>Legajo</th><th>DNI</th><th>Área</th><th>Límite</th><th>TAGs NFC</th><th></th></tr></thead>
       <tbody id="employeesTbody"></tbody>
     </table>
   </div>`);
@@ -808,12 +1780,12 @@ function applyEmployeeFilters(){
       <td>${e.legajo||'—'}</td>
       <td>${e.dni||'—'}</td>
       <td>${e.department||'—'}</td>
-      <td>${e.daily_limit} cafés/día</td>
-      <td>${activeCards} tarjeta${activeCards!==1?'s':''}</td>
+      <td>${employeeLimitCell(e)}</td>
+      <td>${activeCards} TAG NFC</td>
       <td style="white-space:nowrap">
         <button class="btn btn-ghost btn-xs" onclick="showEmployeeDetail(${e.id})">Ver</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openEditEmployee(${e.id})">Editar</button>
-        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openAddCard(${e.id},'${e.name}')">+ NFC</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openAddCard(${e.id},'${e.name}')">+ TAG NFC</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px;color:var(--txd)" onclick="deleteEmployee(${e.id},'${e.name}')">Eliminar</button>
       </td>
     </tr>`;
@@ -837,14 +1809,10 @@ async function showEmployeeDetail(id){
     const cardRows=(e.nfc_cards||[]).map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--br)">
       <div style="min-width:0">
         <strong style="font-size:12px;font-family:monospace">${c.uid}</strong>
-        <span style="font-size:11px;color:var(--tx3);margin-left:6px">${c.label}</span>
-        <span class="badge ${c.active?'bs':'bd'}" style="font-size:10px;margin-left:6px">${c.active?'Activa':'Inactiva'}</span>
+        <span style="font-size:11px;color:var(--tx3);margin-left:6px">${c.label||'—'}</span>
+        <span style="margin-left:6px">${renderNfcCardBadge(c)}</span>
       </div>
-      <div style="display:flex;gap:4px;flex-shrink:0">
-        <button class="btn btn-ghost btn-xs" onclick="toggleCard(${empId},${c.id},${c.active})">${c.active?'Desactivar':'Activar'}</button>
-        <button class="btn btn-ghost btn-xs" onclick="renameCard(${empId},${c.id},this)"  data-label="${c.label.replace(/"/g,'&quot;')}">Renombrar</button>
-        <button class="btn btn-ghost btn-xs" onclick="reassignCard(${c.id},'${c.uid}')">Reasignar</button>
-      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">${renderEmployeeCardActions(empId,c)}</div>
     </div>`).join('');
 
     openModal(e.name,`
@@ -852,12 +1820,13 @@ async function showEmployeeDetail(id){
         <div><span style="color:var(--tx3)">DNI:</span> ${e.dni||'—'}</div>
         <div><span style="color:var(--tx3)">Legajo:</span> ${e.legajo||'—'}</div>
         <div><span style="color:var(--tx3)">Área:</span> ${e.department||'—'}</div>
-        <div><span style="color:var(--tx3)">Límite:</span> ${e.daily_limit} cafés/día</div>
+        <div><span style="color:var(--tx3)">Política diaria:</span> ${employeeLimitPolicyText(e)}</div>
         <div><span style="color:var(--tx3)">Email:</span> ${e.email||'—'}</div>
         <div><span style="color:var(--tx3)">Teléfono:</span> ${e.phone||'—'}</div>
+        <div><span style="color:var(--tx3)">Advertencia email:</span> ${e.warning_enabled===false?'Desactivada':'Activa'}</div>
       </div>
-      <div class="section-lbl" style="margin-bottom:8px">Tarjetas NFC</div>
-      <div style="margin-bottom:20px">${cardRows||'<div class="empty">Sin tarjetas</div>'}</div>
+      <div class="section-lbl" style="margin-bottom:8px">TAGs NFC</div>
+      <div style="margin-bottom:20px">${cardRows||'<div class="empty">Sin TAGs NFC</div>'}</div>
       <div class="section-lbl" style="margin-bottom:8px">Consumo por máquina (mes actual)</div>
       <table style="margin-bottom:20px"><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés</th><th>$</th></tr></thead><tbody>${machRows||'<tr><td colspan="4" class="empty">Sin consumo este mes</td></tr>'}</tbody></table>
       <div class="section-lbl" style="margin-bottom:8px">Últimos 30 taps</div>
@@ -880,7 +1849,18 @@ function openAddEmployee(){
       <div class="field"><label>Email</label><input id="eEmail" type="email" placeholder="juan@empresa.com"></div>
       <div class="field"><label>Teléfono</label><input id="eTel" placeholder="+54 11 1234-5678"></div>
     </div>
-    <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="4" min="1" max="50"></div>
+    <div class="field-row">
+      <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="4" min="1" max="50"></div>
+      <div class="field">
+        <label>Modo de límite</label>
+        <select id="eLimMode">
+          <option value="enforce" selected>Bloquear al alcanzar el límite</option>
+          <option value="warn_only">Solo advertir y registrar</option>
+          <option value="off">Sin límite diario</option>
+        </select>
+      </div>
+    </div>
+    <label class="pw-inline" style="margin-top:-4px;margin-bottom:12px"><input type="checkbox" id="eWarn" checked> Avisar por email cuando quede cerca del límite</label>
     <div class="err-banner" id="eErr"></div>
   `,'saveEmployee()');
 }
@@ -891,7 +1871,10 @@ async function saveEmployee(){
   try{
     await api('POST','/api/employees',{
       name,department:v('eDep'),email:v('eEmail'),dni:v('eDni'),
-      legajo:v('eLeg'),phone:v('eTel'),daily_limit:parseInt(v('eLim'))||4
+      legajo:v('eLeg'),phone:v('eTel'),
+      daily_limit:parseInt(v('eLim'))||4,
+      daily_limit_mode:v('eLimMode')||'enforce',
+      warning_enabled:!!document.getElementById('eWarn')?.checked
     });
     closeModal();loadEmployees();
   }catch(e){showModalErr('eErr',e.message);}
@@ -914,7 +1897,18 @@ async function openEditEmployee(id){
         <div class="field"><label>Email</label><input id="eEmail" value="${e.email||''}"></div>
         <div class="field"><label>Teléfono</label><input id="eTel" value="${e.phone||''}"></div>
       </div>
-      <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="${e.daily_limit}" min="1" max="50"></div>
+      <div class="field-row">
+        <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="${e.daily_limit}" min="1" max="50"></div>
+        <div class="field">
+          <label>Modo de límite</label>
+          <select id="eLimMode">
+            <option value="enforce" ${e.daily_limit_mode==='enforce'||!e.daily_limit_mode?'selected':''}>Bloquear al alcanzar el límite</option>
+            <option value="warn_only" ${e.daily_limit_mode==='warn_only'?'selected':''}>Solo advertir y registrar</option>
+            <option value="off" ${e.daily_limit_mode==='off'?'selected':''}>Sin límite diario</option>
+          </select>
+        </div>
+      </div>
+      <label class="pw-inline" style="margin-top:-4px;margin-bottom:12px"><input type="checkbox" id="eWarn" ${e.warning_enabled===false?'':'checked'}> Avisar por email cuando quede cerca del límite</label>
       <div class="err-banner" id="eErr"></div>
     `,`updateEmployee(${id})`);
   }catch(e){alert('Error: '+e.message);}
@@ -924,23 +1918,26 @@ async function updateEmployee(id){
   try{
     await api('PATCH',`/api/employees/${id}`,{
       name:v('eN'),department:v('eDep'),email:v('eEmail'),dni:v('eDni'),
-      legajo:v('eLeg'),phone:v('eTel'),daily_limit:parseInt(v('eLim'))||4
+      legajo:v('eLeg'),phone:v('eTel'),
+      daily_limit:parseInt(v('eLim'))||4,
+      daily_limit_mode:v('eLimMode')||'enforce',
+      warning_enabled:!!document.getElementById('eWarn')?.checked
     });
     closeModal();loadEmployees();
   }catch(e){showModalErr('eErr',e.message);}
 }
 
 async function deleteEmployee(id,name){
-  if(!confirm(`¿Eliminar al empleado "${name}"? Se desactivará su cuenta y tarjetas.`)) return;
+  if(!confirm(`¿Eliminar al empleado "${name}"? Se desactivará su cuenta y TAGs NFC.`)) return;
   try{await api('DELETE',`/api/employees/${id}`);loadEmployees();}
   catch(e){alert('Error: '+e.message);}
 }
 
 function openAddCard(empId,empName){
-  openModal(`Registrar tarjeta NFC — ${empName}`,`
-    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">Ingresá el UID de la tarjeta. Podés leerlo con una app NFC en el celular (ej: NFC Tools) o con el lector RC522 del dispositivo.</p>
-    <div class="field"><label>UID de la tarjeta (hexadecimal) *</label><input id="cardUid" placeholder="A1B2C3D4" style="font-family:monospace;text-transform:uppercase"></div>
-    <div class="field"><label>Etiqueta (opcional)</label><input id="cardLabel" placeholder="Tarjeta principal / Llavero"></div>
+  openModal(`Registrar TAG NFC — ${empName}`,`
+    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">Ingresá el UID del TAG NFC. Podés leerlo con una app NFC en el celular (ej: NFC Tools) o con el lector RC522 del dispositivo.</p>
+    <div class="field"><label>UID del TAG NFC (hexadecimal) *</label><input id="cardUid" placeholder="A1B2C3D4" style="font-family:monospace;text-transform:uppercase"></div>
+    <div class="field"><label>Etiqueta (opcional)</label><input id="cardLabel" placeholder="TAG principal / Llavero"></div>
     <div class="err-banner" id="cardErr"></div>
   `,`saveCard(${empId})`);
 }
@@ -950,14 +1947,41 @@ async function saveCard(empId){
   const label=document.getElementById('cardLabel').value.trim();
   if(!uid){showModalErr('cardErr','El UID es requerido');return;}
   try{
-    await api('POST',`/api/employees/${empId}/cards`,{uid,label:label||'Tarjeta'});
+    await api('POST',`/api/employees/${empId}/cards`,{uid,label:label||'TAG NFC'});
     closeModal();loadEmployees();
   }catch(e){showModalErr('cardErr',e.message);}
 }
 
-async function toggleCard(empId,cardId,currentActive){
+function renderEmployeeCardActions(empId,card){
+  const status=nfcCardStatus(card);
+  const safeUid=(card.uid||'').replace(/'/g,'&#39;');
+  const safeLabel=(card.label||'').replace(/"/g,'&quot;');
+  const actions=[
+    `<button class="btn btn-ghost btn-xs" onclick="renameCard(${empId},${card.id},this)" data-label="${safeLabel}">Renombrar</button>`,
+    `<button class="btn btn-ghost btn-xs" onclick="reassignCard(${card.id},'${safeUid}')">Reasignar</button>`
+  ];
+  if(status==='active'){
+    actions.push(`<button class="btn btn-ghost btn-xs" style="color:var(--txw)" onclick="setEmployeeCardStatus(${empId},${card.id},'lost')">Marcar perdido</button>`);
+    actions.push(`<button class="btn btn-ghost btn-xs" style="color:var(--txd)" onclick="setEmployeeCardStatus(${empId},${card.id},'inactive')">Dar de baja</button>`);
+  }else if(status==='lost'){
+    actions.push(`<button class="btn btn-ghost btn-xs" onclick="setEmployeeCardStatus(${empId},${card.id},'active')">Reactivar</button>`);
+    actions.push(`<button class="btn btn-ghost btn-xs" style="color:var(--txd)" onclick="setEmployeeCardStatus(${empId},${card.id},'inactive')">Dar de baja</button>`);
+  }else{
+    actions.push(`<button class="btn btn-ghost btn-xs" onclick="setEmployeeCardStatus(${empId},${card.id},'active')">Reactivar</button>`);
+  }
+  return actions.join('');
+}
+
+async function setEmployeeCardStatus(empId,cardId,status){
+  const actionLabel=status==='lost'
+    ? 'marcar como perdido'
+    : status==='inactive'
+      ? 'dar de baja'
+      : 'reactivar';
+  if(status!=='active' && !confirm(`¿Querés ${actionLabel} este TAG NFC?`)) return;
   try{
-    await api('PATCH',`/api/employees/${empId}/cards/${cardId}`,{active:!currentActive});
+    await api('PATCH',`/api/employees/${empId}/cards/${cardId}`,{status});
+    await refreshEmployeesCache();
     showEmployeeDetail(empId);
   }catch(e){alert('Error: '+e.message);}
 }
@@ -967,7 +1991,7 @@ async function renameCard(empId,cardId,btn){
   const newLabel=prompt('Nueva etiqueta para la tarjeta:',currentLabel);
   if(newLabel===null) return; // cancelado
   try{
-    await api('PATCH',`/api/employees/${empId}/cards/${cardId}`,{label:newLabel.trim()||'Tarjeta'});
+    await api('PATCH',`/api/employees/${empId}/cards/${cardId}`,{label:newLabel.trim()||'TAG NFC'});
     showEmployeeDetail(empId);
   }catch(e){alert('Error: '+e.message);}
 }
@@ -988,7 +2012,7 @@ async function reassignCard(cardId,uid){
 async function saveReassignCard(cardId){
   const newEmpId=document.getElementById('reassignEmpId').value;
   try{
-    await api('PATCH',`/api/employees/0/cards/${cardId}`,{employee_id:parseInt(newEmpId)});
+    await api('PATCH',`/api/employees/0/cards/${cardId}`,{employee_id:parseInt(newEmpId),status:'active'});
     closeModal();loadEmployees();
   }catch(e){showModalErr('reassignErr',e.message);}
 }
@@ -996,62 +2020,1453 @@ async function saveReassignCard(cardId){
 // ══════════════════════════════════════════════════════
 //  REPORTES
 // ══════════════════════════════════════════════════════
-async function loadReports(){
+const REPORT_CHART_COLORS=['#4C8BF5','#2FBF71','#FFB020','#E24B4A','#8E6EF2','#00A7C4','#F66B3D','#4FCEB8','#7A869A','#D16BA5'];
+let reportState={from:'',to:'',overview:null,machines:[],employees:[],departments:[]};
+let reportEmployeeDetailState=null;
+let reportDepartmentDetailState=null;
+let reportTrendChart=null;
+let reportMachinesChart=null;
+let reportEmployeesChart=null;
+let reportDepartmentsChart=null;
+
+function formatDateInputLocal(value){
+  const d=value?new Date(value):new Date();
+  const year=d.getFullYear();
+  const month=String(d.getMonth()+1).padStart(2,'0');
+  const day=String(d.getDate()).padStart(2,'0');
+  return `${year}-${month}-${day}`;
+}
+
+function defaultReportRange(){
+  const now=new Date();
+  return {
+    from: formatDateInputLocal(new Date(now.getFullYear(),now.getMonth(),1)),
+    to: formatDateInputLocal(now)
+  };
+}
+
+function normalizeReportFilters(filters){
+  const defaults=defaultReportRange();
+  const current=filters||{};
+  return {
+    from: current.from||reportState.from||defaults.from,
+    to: current.to||reportState.to||defaults.to
+  };
+}
+
+function reportBuildQueryString(params){
+  const query=new URLSearchParams();
+  Object.entries(params||{}).forEach(([key,value])=>{
+    if(value===undefined||value===null||value==='') return;
+    query.set(key,String(value));
+  });
+  const qs=query.toString();
+  return qs?`?${qs}`:'';
+}
+
+function sanitizeDownloadName(value){
+  return String(value||'reporte')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^\w.-]+/g,'_')
+    .replace(/^_+|_+$/g,'')
+    .toLowerCase() || 'reporte';
+}
+
+function reportQueryString(extraParams={}){
+  const base=normalizeReportFilters({
+    from: document.getElementById('repFrom')?.value,
+    to: document.getElementById('repTo')?.value
+  });
+  return reportBuildQueryString({...base,...extraParams});
+}
+
+function formatReportMoney(cents){
+  return '$'+Math.round((Number(cents)||0)/100).toLocaleString('es-AR');
+}
+
+function formatReportInt(value){
+  return (Number(value)||0).toLocaleString('es-AR');
+}
+
+function formatReportRangeLabel(from,to){
+  if(!from||!to) return 'rango actual';
+  const fromText=new Date(from+'T00:00:00').toLocaleDateString('es-AR');
+  const toText=new Date(to+'T00:00:00').toLocaleDateString('es-AR');
+  return from===to ? fromText : `${fromText} a ${toText}`;
+}
+
+function reportSummaryCards(overview){
+  const s=overview?.summary||{};
+  return [
+    ['Cafés aprobados', formatReportInt(s.approved_taps)],
+    ['Intentos rechazados', formatReportInt(s.denied_taps)],
+    ['Eventos totales', formatReportInt(s.total_events)],
+    ['Importe expendido', formatReportMoney(s.spent_cents)],
+    ['Máquinas con ventas', formatReportInt(s.machines_with_sales)],
+    ['Empleados con consumo', formatReportInt(s.employees_with_sales)]
+  ].map(([label,value])=>`<div class="metric"><div class="mlbl">${label}</div><div class="mval">${value}</div></div>`).join('');
+}
+
+function exportCsv(filename, columns, rows){
+  const header=columns.map(col=>`"${String(col.label).replace(/"/g,'""')}"`).join(',');
+  const body=(rows||[]).map(row=>columns.map(col=>{
+    const value=typeof col.value==='function'?col.value(row):row[col.value];
+    return `"${String(value??'').replace(/"/g,'""')}"`;
+  }).join(',')).join('\r\n');
+  const csv='\uFEFF'+header+'\r\n'+body;
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a');
+  link.href=url;
+  link.download=filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function reportSummaryData(){
+  const s=reportState.overview?.summary||{};
+  return [
+    {metric:'Cafés aprobados',value:formatReportInt(s.approved_taps)},
+    {metric:'Intentos rechazados',value:formatReportInt(s.denied_taps)},
+    {metric:'Eventos totales',value:formatReportInt(s.total_events)},
+    {metric:'Importe expendido',value:formatReportMoney(s.spent_cents)},
+    {metric:'Máquinas con ventas',value:formatReportInt(s.machines_with_sales)},
+    {metric:'Empleados con consumo',value:formatReportInt(s.employees_with_sales)},
+    {metric:'Zona horaria operativa',value:reportState.overview?.business_timezone||'—'},
+    {metric:'Rango',value:formatReportRangeLabel(reportState.from,reportState.to)}
+  ];
+}
+
+function reportByDayRows(){
+  return (reportState.overview?.by_day||[]).map(row=>({
+    business_date: row.business_date,
+    approved_taps: formatReportInt(row.approved_taps),
+    denied_taps: formatReportInt(row.denied_taps),
+    spent_cents: formatReportMoney(row.spent_cents)
+  }));
+}
+
+function reportMachineRows(){
+  return reportState.machines.map(row=>({
+    name: row.name,
+    location: row.location||'—',
+    taps_count: formatReportInt(row.taps_count),
+    denied_taps: formatReportInt(row.denied_taps),
+    spent_cents: formatReportMoney(row.spent_cents),
+    employees_count: formatReportInt(row.employees_count),
+    last_tap_at: row.last_tap_at?new Date(row.last_tap_at).toLocaleString('es-AR'):'—'
+  }));
+}
+
+function reportEmployeeRows(){
+  return reportState.employees.map(row=>({
+    name: row.name,
+    legajo: row.legajo||'—',
+    department: row.department||'Sin área',
+    daily_limit_mode: reportLimitModeLabel(row.daily_limit_mode),
+    daily_limit: formatReportInt(row.daily_limit),
+    taps_count: formatReportInt(row.taps_count),
+    denied_taps: formatReportInt(row.denied_taps),
+    spent_cents: formatReportMoney(row.spent_cents),
+    machines_count: formatReportInt(row.machines_count),
+    last_tap_at: row.last_tap_at?new Date(row.last_tap_at).toLocaleString('es-AR'):'—'
+  }));
+}
+
+function reportDepartmentRows(){
+  return reportState.departments.map(row=>({
+    department: row.department||'Sin área',
+    employees_count: formatReportInt(row.employees_count),
+    machines_count: formatReportInt(row.machines_count),
+    taps_count: formatReportInt(row.taps_count),
+    denied_taps: formatReportInt(row.denied_taps),
+    spent_cents: formatReportMoney(row.spent_cents)
+  }));
+}
+
+function sanitizeSheetName(name){
+  return String(name||'Hoja').replace(/[\\/?*\[\]:]/g,' ').slice(0,31) || 'Hoja';
+}
+
+function reportLimitModeLabel(mode){
+  return ({
+    enforce:'Bloquear',
+    warn_only:'Solo advertir',
+    off:'Sin límite'
+  }[mode] || mode || '—');
+}
+
+function reportExportMeta(){
+  return {
+    rangeLabel: formatReportRangeLabel(reportState.from,reportState.to),
+    timezone: reportState.overview?.business_timezone || '—',
+    generatedAt: new Date().toLocaleString('es-AR')
+  };
+}
+
+function getReportSectionConfig(section){
+  const configs={
+    byday:{
+      title:'Evolución diaria',
+      sheetName:'Evolución diaria',
+      fileBase:'reportes_evolucion_diaria',
+      chartId:'repTrendChart',
+      columns:[
+        {label:'Fecha',value:'business_date',maxWidth:18},
+        {label:'Cafés aprobados',value:'approved_taps',type:'number',maxWidth:18},
+        {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+        {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18}
+      ],
+      rows:()=>reportState.overview?.by_day||[]
+    },
+    machines:{
+      title:'Máquinas',
+      sheetName:'Máquinas',
+      fileBase:'reportes_maquinas',
+      chartId:'repMachinesChart',
+      columns:[
+        {label:'Máquina',value:'name',maxWidth:24},
+        {label:'Ubicación',value:'location',maxWidth:28},
+        {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
+        {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+        {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18},
+        {label:'Empleados distintos',value:'employees_count',type:'number',maxWidth:18},
+        {label:'Último uso',value:'last_tap_at',type:'datetime',maxWidth:24}
+      ],
+      rows:()=>reportState.machines||[]
+    },
+    employees:{
+      title:'Empleados',
+      sheetName:'Empleados',
+      fileBase:'reportes_empleados',
+      chartId:'repEmployeesChart',
+      columns:[
+        {label:'Empleado',value:'name',maxWidth:24},
+        {label:'Legajo',value:'legajo',maxWidth:18},
+        {label:'Área',value:'department',maxWidth:24},
+        {label:'Modo límite',value:row=>reportLimitModeLabel(row.daily_limit_mode),maxWidth:18},
+        {label:'Límite diario',value:'daily_limit',type:'number',maxWidth:16},
+        {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
+        {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+        {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18},
+        {label:'Máquinas distintas',value:'machines_count',type:'number',maxWidth:18},
+        {label:'Último uso',value:'last_tap_at',type:'datetime',maxWidth:24}
+      ],
+      rows:()=>reportState.employees||[]
+    },
+    departments:{
+      title:'Departamentos',
+      sheetName:'Departamentos',
+      fileBase:'reportes_departamentos',
+      chartId:'repDepartmentsChart',
+      columns:[
+        {label:'Área',value:'department',maxWidth:24},
+        {label:'Empleados',value:'employees_count',type:'number',maxWidth:14},
+        {label:'Máquinas',value:'machines_count',type:'number',maxWidth:14},
+        {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
+        {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+        {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18}
+      ],
+      rows:()=>reportState.departments||[]
+    }
+  };
+  return configs[section]||null;
+}
+
+function reportSectionValue(row,column){
+  return typeof column.value==='function' ? column.value(row) : row?.[column.value];
+}
+
+function reportSectionDisplayValue(row,column){
+  const raw=reportSectionValue(row,column);
+  if(raw===null || raw===undefined || raw==='') return '';
+  if(column.type==='currency') return formatReportMoney(raw);
+  if(column.type==='number') return formatReportInt(raw);
+  if(column.type==='datetime'){
+    const dt=new Date(raw);
+    return Number.isNaN(dt.getTime()) ? String(raw) : dt.toLocaleString('es-AR');
+  }
+  return String(raw);
+}
+
+function reportSectionExcelValue(row,column){
+  const raw=reportSectionValue(row,column);
+  if(raw===null || raw===undefined || raw==='') return '';
+  if(column.type==='currency'){
+    const cents=Number(raw);
+    return Number.isFinite(cents) ? cents/100 : '';
+  }
+  if(column.type==='number'){
+    const num=Number(raw);
+    return Number.isFinite(num) ? num : '';
+  }
+  if(column.type==='datetime'){
+    const dt=new Date(raw);
+    return Number.isNaN(dt.getTime()) ? String(raw) : dt;
+  }
+  return raw;
+}
+
+function reportSectionColumnWidth(column, rows){
+  const width=(rows||[]).reduce((max,row)=>{
+    const display=reportSectionDisplayValue(row,column);
+    return Math.max(max, String(display).length);
+  }, column.label.length);
+  return Math.min(Math.max(width+2,12), column.maxWidth||36);
+}
+
+function reportSectionHighlights(section, rows){
+  const sum=(key)=>(rows||[]).reduce((acc,row)=>acc+(Number(row?.[key])||0),0);
+  const top=rows?.[0];
+  if(section==='machines'){
+    return [
+      ['Máquinas listadas', formatReportInt(rows.length)],
+      ['Cafés aprobados', formatReportInt(sum('taps_count'))],
+      ['Importe total', formatReportMoney(sum('spent_cents'))],
+      ['Líder del rango', top ? `${top.name} (${formatReportInt(top.taps_count)} cafés)` : '—']
+    ];
+  }
+  if(section==='employees'){
+    return [
+      ['Empleados listados', formatReportInt(rows.length)],
+      ['Cafés aprobados', formatReportInt(sum('taps_count'))],
+      ['Importe total', formatReportMoney(sum('spent_cents'))],
+      ['Mayor consumo', top ? `${top.name} (${formatReportInt(top.taps_count)} cafés)` : '—']
+    ];
+  }
+  if(section==='departments'){
+    return [
+      ['Áreas listadas', formatReportInt(rows.length)],
+      ['Cafés aprobados', formatReportInt(sum('taps_count'))],
+      ['Importe total', formatReportMoney(sum('spent_cents'))],
+      ['Área líder', top ? `${top.department||'Sin área'} (${formatReportInt(top.taps_count)} cafés)` : '—']
+    ];
+  }
+  return [
+    ['Días incluidos', formatReportInt(rows.length)],
+    ['Cafés aprobados', formatReportInt(sum('approved_taps'))],
+    ['Intentos rechazados', formatReportInt(sum('denied_taps'))],
+    ['Importe total', formatReportMoney(sum('spent_cents'))]
+  ];
+}
+
+function excelSectionColumns(columns, rows){
+  return columns.map(column=>({width:reportSectionColumnWidth(column,rows)}));
+}
+
+function styleExcelTitle(worksheet,title,columnCount){
+  const meta=reportExportMeta();
+  worksheet.mergeCells(1,1,1,columnCount);
+  worksheet.getCell(1,1).value=`CoffeeControl · ${title}`;
+  worksheet.getCell(1,1).font={name:'Segoe UI',size:17,bold:true,color:{argb:'FFFFFFFF'}};
+  worksheet.getCell(1,1).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF243241'}};
+  worksheet.getCell(1,1).alignment={vertical:'middle',horizontal:'left'};
+  worksheet.getRow(1).height=26;
+
+  worksheet.mergeCells(2,1,2,columnCount);
+  worksheet.getCell(2,1).value=`Rango: ${meta.rangeLabel}   |   Zona horaria: ${meta.timezone}   |   Generado: ${meta.generatedAt}`;
+  worksheet.getCell(2,1).font={name:'Segoe UI',size:10,color:{argb:'FF445366'}};
+  worksheet.getCell(2,1).fill={type:'pattern',pattern:'solid',fgColor:{argb:'FFF4F7FA'}};
+  worksheet.getCell(2,1).alignment={vertical:'middle',horizontal:'left'};
+  worksheet.getRow(2).height=20;
+}
+
+function styleExcelCard(worksheet, fromRow, fromCol, toRow, toCol, label, value, fill){
+  worksheet.mergeCells(fromRow,fromCol,toRow,toCol);
+  const cell=worksheet.getCell(fromRow,fromCol);
+  cell.value=`${label}\n${value}`;
+  cell.font={name:'Segoe UI',size:12,bold:true,color:{argb:'FF243241'}};
+  cell.alignment={vertical:'middle',horizontal:'center',wrapText:true};
+  cell.fill={type:'pattern',pattern:'solid',fgColor:{argb:fill}};
+  cell.border={
+    top:{style:'thin',color:{argb:'FFD6E0EA'}},
+    bottom:{style:'thin',color:{argb:'FFD6E0EA'}},
+    left:{style:'thin',color:{argb:'FFD6E0EA'}},
+    right:{style:'thin',color:{argb:'FFD6E0EA'}}
+  };
+}
+
+function addExcelChart(workbook,worksheet,chartId,topRow){
+  const base64=reportChartImage(chartId);
+  if(!base64 || typeof workbook.addImage!=='function') return topRow;
+  try{
+    const imageId=workbook.addImage({base64,extension:'png'});
+    worksheet.addImage(imageId,{
+      tl:{col:0.2,row:topRow-1},
+      ext:{width:720,height:240}
+    });
+    return topRow+13;
+  }catch(_){
+    return topRow;
+  }
+}
+
+function styleExcelTable(worksheet, headerRowIndex, columns, rows){
+  const headerRow=worksheet.getRow(headerRowIndex);
+  headerRow.eachCell(cell=>{
+    cell.font={name:'Segoe UI',size:10,bold:true,color:{argb:'FFFFFFFF'}};
+    cell.fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF1D7FBF'}};
+    cell.alignment={vertical:'middle',horizontal:'center'};
+    cell.border={
+      top:{style:'thin',color:{argb:'FFD6E0EA'}},
+      bottom:{style:'thin',color:{argb:'FFD6E0EA'}},
+      left:{style:'thin',color:{argb:'FFD6E0EA'}},
+      right:{style:'thin',color:{argb:'FFD6E0EA'}}
+    };
+  });
+  headerRow.height=22;
+
+  const dataRows=rows && rows.length ? rows.length : 1;
+  for(let offset=1; offset<=dataRows; offset++){
+    const row=worksheet.getRow(headerRowIndex+offset);
+    row.height=20;
+    row.eachCell(cell=>{
+      cell.font={name:'Segoe UI',size:10,color:{argb:'FF243241'}};
+      cell.alignment={vertical:'middle',horizontal:'left'};
+      cell.fill={type:'pattern',pattern:'solid',fgColor:{argb:offset%2===1 ? 'FFFFFFFF' : 'FFF7FAFD'}};
+      cell.border={
+        top:{style:'thin',color:{argb:'FFE3EBF2'}},
+        bottom:{style:'thin',color:{argb:'FFE3EBF2'}},
+        left:{style:'thin',color:{argb:'FFE3EBF2'}},
+        right:{style:'thin',color:{argb:'FFE3EBF2'}}
+      };
+    });
+  }
+
+  columns.forEach((column,index)=>{
+    const col=worksheet.getColumn(index+1);
+    if(column.type==='currency'){
+      col.numFmt='"$"#,##0.00';
+    }else if(column.type==='number'){
+      col.numFmt='0';
+    }else if(column.type==='datetime'){
+      col.numFmt='dd/mm/yyyy hh:mm';
+    }
+  });
+
+  worksheet.autoFilter={
+    from:{row:headerRowIndex,column:1},
+    to:{row:headerRowIndex,column:columns.length}
+  };
+  worksheet.views=[{state:'frozen',ySplit:headerRowIndex}];
+}
+
+function buildExcelOverviewSheet(workbook){
+  const worksheet=workbook.addWorksheet(sanitizeSheetName('Resumen'),{
+    views:[{showGridLines:false}]
+  });
+  worksheet.columns=[{width:22},{width:22},{width:22},{width:22},{width:22},{width:22}];
+  styleExcelTitle(worksheet,'Reportes avanzados',6);
+
+  const summary=reportState.overview?.summary||{};
+  const cards=[
+    ['Cafés aprobados', formatReportInt(summary.approved_taps)],
+    ['Intentos rechazados', formatReportInt(summary.denied_taps)],
+    ['Eventos totales', formatReportInt(summary.total_events)],
+    ['Importe expendido', formatReportMoney(summary.spent_cents)],
+    ['Máquinas con ventas', formatReportInt(summary.machines_with_sales)],
+    ['Empleados con consumo', formatReportInt(summary.employees_with_sales)]
+  ];
+  const fills=['FFE8F4FF','FFF5F7FF','FFEFFBF6','FFFFF6E8','FFF9F0FF','FFF2FBF7'];
+  const ranges=[
+    [4,1,5,2],
+    [4,3,5,4],
+    [4,5,5,6],
+    [7,1,8,2],
+    [7,3,8,4],
+    [7,5,8,6]
+  ];
+  cards.forEach((card,index)=>{
+    const range=ranges[index];
+    styleExcelCard(worksheet,range[0],range[1],range[2],range[3],card[0],card[1],fills[index]);
+  });
+
+  worksheet.getCell('A10').value='Contexto';
+  worksheet.getCell('A10').font={name:'Segoe UI',size:12,bold:true,color:{argb:'FF243241'}};
+  worksheet.getCell('A11').value='Rango';
+  worksheet.getCell('B11').value=reportExportMeta().rangeLabel;
+  worksheet.getCell('A12').value='Zona horaria';
+  worksheet.getCell('B12').value=reportExportMeta().timezone;
+  worksheet.getCell('A13').value='Generado';
+  worksheet.getCell('B13').value=reportExportMeta().generatedAt;
+  worksheet.getCell('D10').value='Destacados';
+  worksheet.getCell('D10').font={name:'Segoe UI',size:12,bold:true,color:{argb:'FF243241'}};
+  worksheet.getCell('D11').value='Máquina líder';
+  worksheet.getCell('E11').value=reportState.machines[0] ? `${reportState.machines[0].name} (${formatReportInt(reportState.machines[0].taps_count)} cafés)` : '—';
+  worksheet.getCell('D12').value='Empleado líder';
+  worksheet.getCell('E12').value=reportState.employees[0] ? `${reportState.employees[0].name} (${formatReportInt(reportState.employees[0].taps_count)} cafés)` : '—';
+  worksheet.getCell('D13').value='Área líder';
+  worksheet.getCell('E13').value=reportState.departments[0] ? `${reportState.departments[0].department||'Sin área'} (${formatReportInt(reportState.departments[0].taps_count)} cafés)` : '—';
+
+  ['A11','A12','A13','D11','D12','D13'].forEach(ref=>{
+    worksheet.getCell(ref).font={name:'Segoe UI',size:10,bold:true,color:{argb:'FF445366'}};
+  });
+
+  addExcelChart(workbook,worksheet,'repTrendChart',15);
+  return worksheet;
+}
+
+function buildExcelSectionSheet(workbook, section){
+  const config=getReportSectionConfig(section);
+  const rows=config.rows();
+  const worksheet=workbook.addWorksheet(sanitizeSheetName(config.sheetName),{
+    views:[{showGridLines:false}]
+  });
+  worksheet.columns=excelSectionColumns(config.columns,rows);
+  styleExcelTitle(worksheet,config.title,config.columns.length);
+
+  const highlights=reportSectionHighlights(section,rows);
+  const fillPalette=['FFE8F4FF','FFF5F7FF','FFEFFBF6','FFFFF6E8'];
+  const leftEnd=Math.max(Math.floor(config.columns.length/2),2);
+  const rightStart=Math.min(leftEnd+1,config.columns.length);
+  highlights.forEach((item,index)=>{
+    const startCol=index%2===0 ? 1 : rightStart;
+    const endCol=index%2===0 ? leftEnd : config.columns.length;
+    const startRow=index<2 ? 4 : 7;
+    styleExcelCard(worksheet,startRow,startCol,startRow+1,endCol,item[0],item[1],fillPalette[index]);
+  });
+
+  const nextRow=addExcelChart(workbook,worksheet,config.chartId,10);
+  const headerRowIndex=Math.max(nextRow+1,24);
+  const headerRow=worksheet.getRow(headerRowIndex);
+  config.columns.forEach((column,index)=>{
+    headerRow.getCell(index+1).value=column.label;
+  });
+
+  if(rows.length){
+    rows.forEach(row=>{
+      const values=config.columns.map(column=>reportSectionExcelValue(row,column));
+      worksheet.addRow(values);
+    });
+  }else{
+    const emptyRow=worksheet.addRow(['Sin datos']);
+    if(config.columns.length>1) worksheet.mergeCells(emptyRow.number,1,emptyRow.number,config.columns.length);
+  }
+
+  styleExcelTable(worksheet,headerRowIndex,config.columns,rows);
+}
+
+function buildDetailSummarySheet(workbook, title, cards, details){
+  const worksheet=workbook.addWorksheet(sanitizeSheetName('Resumen'),{
+    views:[{showGridLines:false}]
+  });
+  worksheet.columns=[{width:24},{width:24},{width:24},{width:24}];
+  styleExcelTitle(worksheet,title,4);
+
+  const fills=['FFE8F4FF','FFF5F7FF','FFEFFBF6','FFFFF6E8'];
+  const ranges=[
+    [4,1,5,2],
+    [4,3,5,4],
+    [7,1,8,2],
+    [7,3,8,4]
+  ];
+  cards.slice(0,4).forEach((card,index)=>{
+    const range=ranges[index];
+    styleExcelCard(worksheet,range[0],range[1],range[2],range[3],card[0],card[1],fills[index]);
+  });
+
+  worksheet.getCell('A10').value='Detalle';
+  worksheet.getCell('A10').font={name:'Segoe UI',size:12,bold:true,color:{argb:'FF243241'}};
+  details.forEach((item,index)=>{
+    const row=11+index;
+    worksheet.getCell(`A${row}`).value=item[0];
+    worksheet.getCell(`A${row}`).font={name:'Segoe UI',size:10,bold:true,color:{argb:'FF445366'}};
+    worksheet.getCell(`B${row}`).value=item[1];
+  });
+  return worksheet;
+}
+
+function buildDetailTableSheet(workbook, sheetName, title, columns, rows){
+  const worksheet=workbook.addWorksheet(sanitizeSheetName(sheetName),{
+    views:[{showGridLines:false}]
+  });
+  worksheet.columns=excelSectionColumns(columns,rows);
+  styleExcelTitle(worksheet,title,columns.length);
+  const headerRowIndex=4;
+  const headerRow=worksheet.getRow(headerRowIndex);
+  columns.forEach((column,index)=>{
+    headerRow.getCell(index+1).value=column.label;
+  });
+  if(rows.length){
+    rows.forEach(row=>{
+      worksheet.addRow(columns.map(column=>reportSectionExcelValue(row,column)));
+    });
+  }else{
+    const emptyRow=worksheet.addRow(['Sin datos']);
+    if(columns.length>1) worksheet.mergeCells(emptyRow.number,1,emptyRow.number,columns.length);
+  }
+  styleExcelTable(worksheet,headerRowIndex,columns,rows);
+}
+
+function buildEmployeeDetailExportOptions(detail){
+  const employee=detail.employee||{};
+  return {
+    title:`Empleado · ${detail.name}`,
+    fileBase:`reporte_empleado_${sanitizeDownloadName(detail.name)}_${reportState.from||'desde'}_${reportState.to||'hasta'}`,
+    cards:[
+      ['Cafés aprobados', formatReportInt(employee.taps_count)],
+      ['Intentos rechazados', formatReportInt(employee.denied_taps)],
+      ['Importe', formatReportMoney(employee.spent_cents)],
+      ['Máquinas usadas', formatReportInt(employee.machines_count)]
+    ],
+    details:[
+      ['Legajo', employee.legajo||'—'],
+      ['Área', employee.department||'Sin área'],
+      ['Política diaria', employeeLimitPolicyText(employee)],
+      ['Rango', formatReportRangeLabel(reportState.from,reportState.to)],
+      ['Zona horaria', reportState.overview?.business_timezone||'—']
+    ],
+    sections:[
+      {
+        title:'Consumo por máquina',
+        sheetName:'Máquinas',
+        columns:[
+          {label:'Máquina',value:'machine_name',maxWidth:24},
+          {label:'Ubicación',value:'location',maxWidth:28},
+          {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
+          {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+          {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18},
+          {label:'Último uso',value:'last_tap_at',type:'datetime',maxWidth:24}
+        ],
+        rows:detail.machines||[]
+      },
+      {
+        title:'Últimos taps del rango',
+        sheetName:'Taps',
+        columns:[
+          {label:'Máquina',value:'machine_name',maxWidth:24},
+          {label:'Resultado',value:row=>row.approved?'Aprobado':`Rechazado (${row.deny_reason||'sin motivo'})`,maxWidth:28},
+          {label:'Importe',value:'amount_cents',type:'currency',maxWidth:18},
+          {label:'Fecha/hora',value:'tapped_at',type:'datetime',maxWidth:24}
+        ],
+        rows:detail.taps||[]
+      }
+    ]
+  };
+}
+
+function buildDepartmentDetailExportOptions(detail){
+  const summary=detail.summary||{};
+  return {
+    title:`Área · ${detail.department}`,
+    fileBase:`reporte_area_${sanitizeDownloadName(detail.department)}_${reportState.from||'desde'}_${reportState.to||'hasta'}`,
+    cards:[
+      ['Cafés aprobados', formatReportInt(summary.taps_count)],
+      ['Intentos rechazados', formatReportInt(summary.denied_taps)],
+      ['Importe', formatReportMoney(summary.spent_cents)],
+      ['Empleados / Máquinas', `${formatReportInt(summary.employees_count)} / ${formatReportInt(summary.machines_count)}`]
+    ],
+    details:[
+      ['Área', detail.department],
+      ['Rango', formatReportRangeLabel(reportState.from,reportState.to)],
+      ['Zona horaria', reportState.overview?.business_timezone||'—'],
+      ['Generado', new Date().toLocaleString('es-AR')]
+    ],
+    sections:[
+      {
+        title:'Empleados del área',
+        sheetName:'Empleados',
+        columns:[
+          {label:'Empleado',value:'name',maxWidth:24},
+          {label:'Legajo',value:'legajo',maxWidth:18},
+          {label:'Modo límite',value:row=>reportLimitModeLabel(row.daily_limit_mode),maxWidth:18},
+          {label:'Límite diario',value:'daily_limit',type:'number',maxWidth:16},
+          {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
+          {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+          {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18},
+          {label:'Máquinas distintas',value:'machines_count',type:'number',maxWidth:18},
+          {label:'Último uso',value:'last_tap_at',type:'datetime',maxWidth:24}
+        ],
+        rows:detail.employees||[]
+      },
+      {
+        title:'Máquinas usadas por el área',
+        sheetName:'Máquinas',
+        columns:[
+          {label:'Máquina',value:'name',maxWidth:24},
+          {label:'Ubicación',value:'location',maxWidth:28},
+          {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
+          {label:'Intentos rechazados',value:'denied_taps',type:'number',maxWidth:18},
+          {label:'Importe',value:'spent_cents',type:'currency',maxWidth:18},
+          {label:'Empleados distintos',value:'employees_count',type:'number',maxWidth:18},
+          {label:'Último uso',value:'last_tap_at',type:'datetime',maxWidth:24}
+        ],
+        rows:detail.machines||[]
+      },
+      {
+        title:'Últimos taps del área',
+        sheetName:'Taps',
+        columns:[
+          {label:'Empleado',value:'employee_name',maxWidth:24},
+          {label:'Máquina',value:'machine_name',maxWidth:24},
+          {label:'Resultado',value:row=>row.approved?'Aprobado':`Rechazado (${row.deny_reason||'sin motivo'})`,maxWidth:28},
+          {label:'Importe',value:'amount_cents',type:'currency',maxWidth:18},
+          {label:'Fecha/hora',value:'tapped_at',type:'datetime',maxWidth:24}
+        ],
+        rows:detail.taps||[]
+      }
+    ]
+  };
+}
+
+async function exportGenericDetailExcel(options){
+  if(!window.ExcelJS){
+    alert('No se pudo cargar la librería Excel. Recargá el panel y reintentá.');
+    return;
+  }
+  try{
+    const workbook=new ExcelJS.Workbook();
+    workbook.creator='CoffeeControl';
+    workbook.created=new Date();
+    workbook.modified=new Date();
+    workbook.company='SmartQ';
+    buildDetailSummarySheet(workbook,options.title,options.cards,options.details);
+    (options.sections||[]).forEach(section=>{
+      buildDetailTableSheet(workbook,section.sheetName,section.title,section.columns,section.rows||[]);
+    });
+    const buffer=await workbook.xlsx.writeBuffer();
+    downloadBlob(
+      `${options.fileBase}.xlsx`,
+      buffer,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+  }catch(err){
+    alert(err.message||'No se pudo generar el Excel.');
+  }
+}
+
+function exportGenericDetailPdf(options){
+  const jsPdfCtor=window.jspdf?.jsPDF;
+  if(!jsPdfCtor){
+    alert('No se pudo cargar la librería PDF. Recargá el panel y reintentá.');
+    return;
+  }
+  const doc=new jsPdfCtor({orientation:'p',unit:'mm',format:'a4'});
+  const margin=14;
+  const pageWidth=doc.internal.pageSize.getWidth();
+  const pageHeight=doc.internal.pageSize.getHeight();
+  const contentWidth=pageWidth-(margin*2);
+
+  function ensureSpace(y,needed=18){
+    if(y+needed<=pageHeight-14) return y;
+    doc.addPage();
+    return 18;
+  }
+
+  let y=18;
+  doc.setFont('helvetica','bold');
+  doc.setFontSize(18);
+  doc.text(options.title,margin,y);
+  y+=7;
+  doc.setFont('helvetica','normal');
+  doc.setFontSize(10);
+  doc.text(`Rango: ${formatReportRangeLabel(reportState.from,reportState.to)}`,margin,y);
+  y+=5;
+  doc.text(`Zona horaria: ${reportState.overview?.business_timezone||'—'}`,margin,y);
+  y+=7;
+
+  doc.autoTable({
+    startY:y,
+    margin:{left:margin,right:margin},
+    head:[['Resumen','Valor']],
+    body:[...(options.cards||[]), ...(options.details||[])],
+    styles:{font:'helvetica',fontSize:9,cellPadding:2.4},
+    headStyles:{fillColor:[36,50,65],textColor:[255,255,255],fontStyle:'bold'},
+    theme:'grid'
+  });
+  y=(doc.lastAutoTable?.finalY||y)+8;
+
+  (options.sections||[]).forEach(section=>{
+    y=ensureSpace(y,20);
+    doc.setFont('helvetica','bold');
+    doc.setFontSize(13);
+    doc.text(section.title,margin,y);
+    y+=3;
+    doc.autoTable({
+      startY:y,
+      margin:{left:margin,right:margin},
+      head:[section.columns.map(column=>column.label)],
+      body:(section.rows&&section.rows.length)
+        ? section.rows.map(row=>section.columns.map(column=>String(reportSectionDisplayValue(row,column)??'')))
+        : [[`Sin datos para ${section.title.toLowerCase()}`]],
+      styles:{font:'helvetica',fontSize:8,cellPadding:2.2,overflow:'linebreak'},
+      headStyles:{fillColor:[29,127,191],textColor:[255,255,255],fontStyle:'bold'},
+      theme:'grid',
+      didParseCell:data=>{
+        if((!section.rows||!section.rows.length) && data.section==='body'){
+          data.cell.colSpan=section.columns.length;
+        }
+      }
+    });
+    y=(doc.lastAutoTable?.finalY||y)+8;
+  });
+
+  doc.save(`${options.fileBase}.pdf`);
+}
+
+function downloadBlob(filename, blob, mimeType='application/octet-stream'){
+  const finalBlob = blob instanceof Blob ? blob : new Blob([blob], { type: mimeType });
+  const url=URL.createObjectURL(finalBlob);
+  const link=document.createElement('a');
+  link.href=url;
+  link.download=filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function exportReportsExcel(){
+  if(!window.ExcelJS){
+    alert('No se pudo cargar la librería Excel. Recargá el panel y reintentá.');
+    return;
+  }
+  if(!reportState.overview){
+    alert('Primero cargá un rango de reportes para exportar.');
+    return;
+  }
+  try{
+    const workbook=new ExcelJS.Workbook();
+    workbook.creator='CoffeeControl';
+    workbook.created=new Date();
+    workbook.modified=new Date();
+    workbook.company='SmartQ';
+    workbook.calcProperties.fullCalcOnLoad=true;
+    buildExcelOverviewSheet(workbook);
+    ['byday','machines','employees','departments'].forEach(section=>buildExcelSectionSheet(workbook,section));
+    const buffer=await workbook.xlsx.writeBuffer();
+    downloadBlob(
+      `reportes_${reportState.from||'desde'}_${reportState.to||'hasta'}.xlsx`,
+      buffer,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+  }catch(err){
+    alert(err.message||'No se pudo generar el archivo Excel.');
+  }
+}
+
+function reportChartImage(id){
+  const canvas=document.getElementById(id);
+  if(!canvas || typeof canvas.toDataURL!=='function') return '';
+  try{
+    return canvas.toDataURL('image/png');
+  }catch(_){
+    return '';
+  }
+}
+
+function pdfTableHtml(columns, rows){
+  const header=columns.map(col=>`<th>${escHtml(col.label)}</th>`).join('');
+  const body=(rows||[]).map(row=>`<tr>${columns.map(col=>{
+    const value=typeof col.value==='function'?col.value(row):row[col.value];
+    return `<td>${escHtml(value)}</td>`;
+  }).join('')}</tr>`).join('');
+  return `<table><thead><tr>${header}</tr></thead><tbody>${body||`<tr><td colspan="${columns.length}">Sin datos</td></tr>`}</tbody></table>`;
+}
+
+function exportReportsPdf(){
+  const jsPdfCtor=window.jspdf?.jsPDF;
+  if(!jsPdfCtor){
+    alert('No se pudo cargar la librería PDF. Recargá el panel y reintentá.');
+    return;
+  }
+  const doc=new jsPdfCtor({orientation:'p',unit:'mm',format:'a4'});
+  const margin=14;
+  const pageWidth=doc.internal.pageSize.getWidth();
+  const pageHeight=doc.internal.pageSize.getHeight();
+  const contentWidth=pageWidth-(margin*2);
+  const summaryRows=reportSummaryData();
+
+  function ensureSpace(y,needed=18){
+    if(y+needed<=pageHeight-14) return y;
+    doc.addPage();
+    return 18;
+  }
+
+  function addSectionTitle(title,y){
+    y=ensureSpace(y,16);
+    doc.setFont('helvetica','bold');
+    doc.setFontSize(14);
+    doc.text(title,margin,y);
+    return y+4;
+  }
+
+  function addChart(canvasId,title,y){
+    const img=reportChartImage(canvasId);
+    if(!img) return y;
+    y=addSectionTitle(title,y);
+    const canvas=document.getElementById(canvasId);
+    const ratio=canvas&&canvas.width ? canvas.height/canvas.width : 0.5;
+    const imgHeight=Math.min(contentWidth*ratio,76);
+    y=ensureSpace(y,imgHeight+8);
+    doc.addImage(img,'PNG',margin,y,contentWidth,imgHeight,undefined,'FAST');
+    return y+imgHeight+8;
+  }
+
+  function addTable(title,columns,rows,y){
+    y=addSectionTitle(title,y);
+    doc.autoTable({
+      startY:y,
+      margin:{left:margin,right:margin},
+      head:[columns.map(col=>col.label)],
+      body:(rows&&rows.length)
+        ? rows.map(row=>columns.map(col=>String(typeof col.value==='function'?col.value(row):row[col.value]??'')))
+        : [[`Sin datos para ${title.toLowerCase()}`]],
+      styles:{font:'helvetica',fontSize:8,cellPadding:2.2,overflow:'linebreak'},
+      headStyles:{fillColor:[238,245,251],textColor:[36,50,65],fontStyle:'bold'},
+      theme:'grid',
+      didParseCell:data=>{
+        if((!rows||!rows.length) && data.section==='body'){
+          data.cell.colSpan=columns.length;
+        }
+      }
+    });
+    return (doc.lastAutoTable?.finalY||y)+8;
+  }
+
+  let y=18;
+  doc.setFont('helvetica','bold');
+  doc.setFontSize(18);
+  doc.text('Reportes CoffeeControl',margin,y);
+  y+=7;
+  doc.setFont('helvetica','normal');
+  doc.setFontSize(10);
+  doc.text(`Rango: ${formatReportRangeLabel(reportState.from,reportState.to)}`,margin,y);
+  y+=5;
+  doc.text(`Zona horaria: ${reportState.overview?.business_timezone||'—'}`,margin,y);
+  y+=5;
+  doc.text(`Generado: ${new Date().toLocaleString('es-AR')}`,margin,y);
+  y+=5;
+
+  y=addTable('Resumen operativo',[
+    {label:'Métrica',value:'metric'},
+    {label:'Valor',value:'value'}
+  ],summaryRows,y);
+
+  y=addChart('repTrendChart','Evolución diaria',y);
+  y=addTable('Detalle diario',[
+    {label:'Fecha',value:'business_date'},
+    {label:'Aprobados',value:'approved_taps'},
+    {label:'Rechazados',value:'denied_taps'},
+    {label:'Importe',value:'spent_cents'}
+  ],reportByDayRows(),y);
+
+  y=addChart('repMachinesChart','Máquinas',y);
+  y=addTable('Ranking de máquinas',[
+    {label:'Máquina',value:'name'},
+    {label:'Ubicación',value:'location'},
+    {label:'Cafés',value:'taps_count'},
+    {label:'Rechazados',value:'denied_taps'},
+    {label:'Importe',value:'spent_cents'},
+    {label:'Empleados',value:'employees_count'},
+    {label:'Último uso',value:'last_tap_at'}
+  ],reportMachineRows(),y);
+
+  y=addChart('repEmployeesChart','Empleados',y);
+  y=addTable('Ranking de empleados',[
+    {label:'Empleado',value:'name'},
+    {label:'Legajo',value:'legajo'},
+    {label:'Área',value:'department'},
+    {label:'Modo límite',value:'daily_limit_mode'},
+    {label:'Límite',value:'daily_limit'},
+    {label:'Cafés',value:'taps_count'},
+    {label:'Rechazados',value:'denied_taps'},
+    {label:'Importe',value:'spent_cents'},
+    {label:'Máquinas',value:'machines_count'},
+    {label:'Último uso',value:'last_tap_at'}
+  ],reportEmployeeRows(),y);
+
+  y=addChart('repDepartmentsChart','Departamentos',y);
+  addTable('Resumen por departamento',[
+    {label:'Área',value:'department'},
+    {label:'Empleados',value:'employees_count'},
+    {label:'Máquinas',value:'machines_count'},
+    {label:'Cafés',value:'taps_count'},
+    {label:'Rechazados',value:'denied_taps'},
+    {label:'Importe',value:'spent_cents'}
+  ],reportDepartmentRows(),y);
+
+  doc.save(`reportes_${reportState.from||'desde'}_${reportState.to||'hasta'}.pdf`);
+}
+
+function exportReportSectionCsv(section){
+  const config=getReportSectionConfig(section);
+  if(!config) return;
+  const range=`${reportState.from||'sin-desde'}_${reportState.to||'sin-hasta'}`;
+  return exportCsv(
+    `${config.fileBase}_${range}.csv`,
+    config.columns.map(column=>({
+      label:column.label,
+      value:row=>reportSectionDisplayValue(row,column)
+    })),
+    config.rows()
+  );
+}
+
+async function exportReportSectionExcel(section){
+  if(!window.ExcelJS){
+    alert('No se pudo cargar la librería Excel. Recargá el panel y reintentá.');
+    return;
+  }
+  const config=getReportSectionConfig(section);
+  if(!config) return;
+  const range=`${reportState.from||'sin-desde'}_${reportState.to||'sin-hasta'}`;
+  try{
+    const workbook=new ExcelJS.Workbook();
+    workbook.creator='CoffeeControl';
+    workbook.created=new Date();
+    workbook.modified=new Date();
+    workbook.company='SmartQ';
+    buildExcelSectionSheet(workbook,section);
+    const buffer=await workbook.xlsx.writeBuffer();
+    downloadBlob(
+      `${config.fileBase}_${range}.xlsx`,
+      buffer,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+  }catch(err){
+    alert(err.message||'No se pudo generar el Excel de esta sección.');
+  }
+}
+
+function exportReportSectionPdf(section){
+  const jsPdfCtor=window.jspdf?.jsPDF;
+  if(!jsPdfCtor){
+    alert('No se pudo cargar la librería PDF. Recargá el panel y reintentá.');
+    return;
+  }
+  const config=getReportSectionConfig(section);
+  if(!config) return;
+  const rows=config.rows();
+  const range=`${reportState.from||'sin-desde'}_${reportState.to||'sin-hasta'}`;
+  const doc=new jsPdfCtor({orientation:'p',unit:'mm',format:'a4'});
+  const margin=14;
+  const pageWidth=doc.internal.pageSize.getWidth();
+  const pageHeight=doc.internal.pageSize.getHeight();
+  const contentWidth=pageWidth-(margin*2);
+
+  function ensureSpace(y,needed=18){
+    if(y+needed<=pageHeight-14) return y;
+    doc.addPage();
+    return 18;
+  }
+
+  let y=18;
+  doc.setFont('helvetica','bold');
+  doc.setFontSize(18);
+  doc.text(`${config.title} · CoffeeControl`,margin,y);
+  y+=7;
+  doc.setFont('helvetica','normal');
+  doc.setFontSize(10);
+  doc.text(`Rango: ${formatReportRangeLabel(reportState.from,reportState.to)}`,margin,y);
+  y+=5;
+  doc.text(`Zona horaria: ${reportState.overview?.business_timezone||'—'}`,margin,y);
+  y+=5;
+  doc.text(`Generado: ${new Date().toLocaleString('es-AR')}`,margin,y);
+  y+=7;
+
+  const highlights=reportSectionHighlights(section,rows);
+  doc.autoTable({
+    startY:y,
+    margin:{left:margin,right:margin},
+    head:[['Resumen','Valor']],
+    body:highlights,
+    styles:{font:'helvetica',fontSize:9,cellPadding:2.4},
+    headStyles:{fillColor:[36,50,65],textColor:[255,255,255],fontStyle:'bold'},
+    theme:'grid'
+  });
+  y=(doc.lastAutoTable?.finalY||y)+8;
+
+  const img=reportChartImage(config.chartId);
+  if(img){
+    const chartCanvas=document.getElementById(config.chartId);
+    const ratio=chartCanvas&&chartCanvas.width ? chartCanvas.height/chartCanvas.width : 0.5;
+    const imgHeight=Math.min(contentWidth*ratio,76);
+    y=ensureSpace(y,imgHeight+10);
+    doc.addImage(img,'PNG',margin,y,contentWidth,imgHeight,undefined,'FAST');
+    y+=imgHeight+8;
+  }
+
+  y=ensureSpace(y,24);
+  doc.autoTable({
+    startY:y,
+    margin:{left:margin,right:margin},
+    head:[config.columns.map(column=>column.label)],
+    body:rows.length
+      ? rows.map(row=>config.columns.map(column=>String(reportSectionDisplayValue(row,column)??'')))
+      : [[`Sin datos para ${config.title.toLowerCase()}`]],
+    styles:{font:'helvetica',fontSize:8,cellPadding:2.2,overflow:'linebreak'},
+    headStyles:{fillColor:[29,127,191],textColor:[255,255,255],fontStyle:'bold'},
+    theme:'grid',
+    didParseCell:data=>{
+      if(!rows.length && data.section==='body'){
+        data.cell.colSpan=config.columns.length;
+      }
+    }
+  });
+
+  doc.save(`${config.fileBase}_${range}.pdf`);
+}
+
+async function exportReportSection(section, format='csv'){
+  if(format==='excel') return exportReportSectionExcel(section);
+  if(format==='pdf') return exportReportSectionPdf(section);
+  return exportReportSectionCsv(section);
+}
+
+function setReportPreset(preset){
+  const fromInput=document.getElementById('repFrom');
+  const toInput=document.getElementById('repTo');
+  if(!fromInput||!toInput) return;
+  const today=new Date();
+  let from=new Date(today.getFullYear(),today.getMonth(),1);
+  let to=new Date(today);
+  if(preset==='today'){
+    from=new Date(today);
+  }else if(preset==='7d'){
+    from=new Date(today);
+    from.setDate(from.getDate()-6);
+  }else if(preset==='30d'){
+    from=new Date(today);
+    from.setDate(from.getDate()-29);
+  }
+  fromInput.value=formatDateInputLocal(from);
+  toInput.value=formatDateInputLocal(to);
+  applyReportFilters();
+}
+
+function applyReportFilters(){
+  const from=document.getElementById('repFrom')?.value||'';
+  const to=document.getElementById('repTo')?.value||'';
+  if(!from||!to){
+    alert('Elegí una fecha desde y hasta.');
+    return;
+  }
+  loadReports({from,to});
+}
+
+function destroyReportCharts(){
+  [reportTrendChart,reportMachinesChart,reportEmployeesChart,reportDepartmentsChart].forEach(chart=>{ if(chart) chart.destroy(); });
+  reportTrendChart=null;
+  reportMachinesChart=null;
+  reportEmployeesChart=null;
+  reportDepartmentsChart=null;
+}
+
+function chartPalette(size){
+  return Array.from({length:size},(_,i)=>REPORT_CHART_COLORS[i%REPORT_CHART_COLORS.length]);
+}
+
+function renderReportCharts(){
+  destroyReportCharts();
+  const trendCanvas=document.getElementById('repTrendChart');
+  const machinesCanvas=document.getElementById('repMachinesChart');
+  const employeesCanvas=document.getElementById('repEmployeesChart');
+  const departmentsCanvas=document.getElementById('repDepartmentsChart');
+  if(trendCanvas&&Array.isArray(reportState.overview?.by_day)){
+    const labels=reportState.overview.by_day.map(row=>new Date(row.business_date+'T00:00:00').toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit'}));
+    const approved=reportState.overview.by_day.map(row=>Number(row.approved_taps)||0);
+    const denied=reportState.overview.by_day.map(row=>Number(row.denied_taps)||0);
+    reportTrendChart=new Chart(trendCanvas,{
+      type:'line',
+      data:{
+        labels,
+        datasets:[
+          {label:'Aprobados',data:approved,borderColor:'#2FBF71',backgroundColor:'rgba(47,191,113,.14)',fill:true,tension:.28},
+          {label:'Rechazados',data:denied,borderColor:'#E24B4A',backgroundColor:'rgba(226,75,74,.08)',fill:true,tension:.28}
+        ]
+      },
+      options:{
+        responsive:true,
+        maintainAspectRatio:false,
+        plugins:{legend:{position:'bottom'}},
+        scales:{x:{grid:{display:false}},y:{beginAtZero:true}}
+      }
+    });
+  }
+  if(machinesCanvas){
+    const items=reportState.machines.slice(0,8);
+    reportMachinesChart=new Chart(machinesCanvas,{
+      type:'bar',
+      data:{
+        labels:items.map(row=>row.name),
+        datasets:[{label:'Cafés',data:items.map(row=>Number(row.taps_count)||0),backgroundColor:chartPalette(items.length),borderRadius:6,borderSkipped:false}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true}}}
+    });
+  }
+  if(employeesCanvas){
+    const items=reportState.employees.slice(0,8);
+    reportEmployeesChart=new Chart(employeesCanvas,{
+      type:'bar',
+      data:{
+        labels:items.map(row=>row.name),
+        datasets:[{label:'Cafés',data:items.map(row=>Number(row.taps_count)||0),backgroundColor:chartPalette(items.length),borderRadius:6,borderSkipped:false}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true}}}
+    });
+  }
+  if(departmentsCanvas){
+    const items=reportState.departments.filter(row=>(Number(row.spent_cents)||0)>0).slice(0,8);
+    reportDepartmentsChart=new Chart(departmentsCanvas,{
+      type:'doughnut',
+      data:{
+        labels:items.map(row=>row.department),
+        datasets:[{data:items.map(row=>Number(row.spent_cents)||0),backgroundColor:chartPalette(items.length)}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}
+    });
+  }
+}
+
+async function loadReports(customFilters){
   render('<div class="page-title">Reportes</div><div class="empty">Cargando...</div>');
   try{
-    const [machines,emps]=await Promise.all([
-      api('GET','/api/reports/machines'),
-      api('GET','/api/employees'),
+    const filters=normalizeReportFilters(customFilters);
+    const query=reportBuildQueryString(filters);
+    const [overview,machines,employees,departments]=await Promise.all([
+      api('GET',`/api/reports/overview${query}`),
+      api('GET',`/api/reports/machines${query}`),
+      api('GET',`/api/reports/employees${query}`),
+      api('GET',`/api/reports/departments${query}`),
     ]);
-    renderReports(machines.machines||[],emps.employees||[]);
+    reportState={
+      from: overview.from||filters.from,
+      to: overview.to||filters.to,
+      overview,
+      machines: machines.machines||[],
+      employees: employees.employees||[],
+      departments: departments.departments||[]
+    };
+    renderReports();
   }catch(e){render('<p style="color:var(--txd)">'+e.message+'</p>');}
 }
 
-function renderReports(machines,emps){
-  const mRows=machines.map((m,i)=>`<tr>
-    <td><strong>${i+1}.</strong> ${m.name}</td>
-    <td>${m.location||'—'}</td>
-    <td>${m.taps_today||0}</td>
-    <td><strong>${m.taps_month||0}</strong></td>
-    <td><strong>$${Math.round((m.cost_month_cents||0)/100).toLocaleString('es-AR')}</strong></td>
+function renderReports(){
+  const overview=reportState.overview||{};
+  const summaryHtml=reportSummaryCards(overview);
+  const machineRows=reportState.machines.map((m,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${escHtml(m.name)}</td>
+    <td>${escHtml(m.location||'—')}</td>
+    <td>${formatReportInt(m.taps_count)}</td>
+    <td>${formatReportInt(m.denied_taps)}</td>
+    <td><strong>${formatReportMoney(m.spent_cents)}</strong></td>
+    <td>${formatReportInt(m.employees_count)}</td>
     <td style="font-size:11px;color:var(--tx3)">${m.last_tap_at?timeSince(m.last_tap_at):'Nunca'}</td>
-    <td><button class="btn btn-ghost btn-xs" onclick="machineDetail(${m.id},'${m.name}')">Detalle</button></td>
+    <td><button class="btn btn-ghost btn-xs" onclick='machineDetail(${m.id},${JSON.stringify(m.name)})'>Detalle</button></td>
   </tr>`).join('');
-
-  const empOptions=emps.map(e=>`<option value="${e.id}">${e.name} (${e.legajo||e.department||''})</option>`).join('');
-
+  const employeeRows=reportState.employees.map((e,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${escHtml(e.name)}</td>
+    <td>${escHtml(e.legajo||'—')}</td>
+    <td>${escHtml(e.department||'Sin área')}</td>
+    <td>${escHtml(reportLimitModeLabel(e.daily_limit_mode))}</td>
+    <td>${formatReportInt(e.daily_limit)}</td>
+    <td>${formatReportInt(e.taps_count)}</td>
+    <td>${formatReportInt(e.denied_taps)}</td>
+    <td><strong>${formatReportMoney(e.spent_cents)}</strong></td>
+    <td>${formatReportInt(e.machines_count)}</td>
+    <td><button class="btn btn-ghost btn-xs" onclick='employeeReportDetail(${e.id},${JSON.stringify(e.name)})'>Detalle</button></td>
+  </tr>`).join('');
+  const departmentRows=reportState.departments.map((d,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${escHtml(d.department||'Sin área')}</td>
+    <td>${formatReportInt(d.employees_count)}</td>
+    <td>${formatReportInt(d.machines_count)}</td>
+    <td>${formatReportInt(d.taps_count)}</td>
+    <td>${formatReportInt(d.denied_taps)}</td>
+    <td><strong>${formatReportMoney(d.spent_cents)}</strong></td>
+    <td><button class="btn btn-ghost btn-xs" onclick='departmentReportDetail(${JSON.stringify(d.department||'Sin área')})'>Detalle</button></td>
+  </tr>`).join('');
   render(`
-  <div class="page-title">Reportes</div>
-  <div class="card">
-    <div class="card-title">Ranking de máquinas — mes actual</div>
-    <table><thead><tr><th>Máquina</th><th>Ubicación</th><th>Hoy</th><th>Cafés mes</th><th>$ mes</th><th>Último uso</th><th></th></tr></thead>
-    <tbody>${mRows||'<tr><td colspan="7" class="empty">Sin datos</td></tr>'}</tbody></table>
-  </div>
-  <div class="card">
-    <div class="card-title">Consumo por empleado — ¿dónde consumió?</div>
-    <div style="display:flex;gap:10px;align-items:flex-end;margin-bottom:16px;flex-wrap:wrap">
-      <div style="flex:1;min-width:200px"><label>Empleado</label><select id="empSelect">${empOptions}</select></div>
-      <button class="btn btn-primary btn-sm" onclick="loadEmpMachines()">Consultar</button>
+    <div class="topbar">
+      <div class="page-title">Reportes</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-left:auto">
+        <button class="btn btn-ghost btn-sm" onclick="exportReportsExcel()">Descargar Excel</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportReportsPdf()">Descargar PDF</button>
+        <button class="btn btn-ghost btn-sm" onclick="setReportPreset('today')">Hoy</button>
+        <button class="btn btn-ghost btn-sm" onclick="setReportPreset('7d')">7 días</button>
+        <button class="btn btn-ghost btn-sm" onclick="setReportPreset('30d')">30 días</button>
+        <button class="btn btn-primary btn-sm" onclick="applyReportFilters()">Aplicar</button>
+      </div>
     </div>
-    <div id="empMachineResult"></div>
-  </div>`);
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+      <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+        <div class="field" style="margin:0;min-width:180px">
+          <label>Desde</label>
+          <input id="repFrom" type="date" value="${escHtml(reportState.from)}">
+        </div>
+        <div class="field" style="margin:0;min-width:180px">
+          <label>Hasta</label>
+          <input id="repTo" type="date" value="${escHtml(reportState.to)}">
+        </div>
+        <div style="font-size:13px;color:var(--tx2);margin-left:auto">
+          Rango operativo: <strong>${escHtml(formatReportRangeLabel(reportState.from,reportState.to))}</strong>
+        </div>
+      </div>
+    </div>
+    <div class="metrics">${summaryHtml}</div>
+    <div class="card">
+      <div class="card-title">Evolución diaria del rango</div>
+      <div style="height:280px"><canvas id="repTrendChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Máquinas</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('machines','excel')">Excel</button>
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('machines','pdf')">PDF</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:18px;align-items:start">
+        <div style="height:280px"><canvas id="repMachinesChart"></canvas></div>
+        <div style="overflow:auto">
+          <table><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés</th><th>Rech.</th><th>$</th><th>Empleados</th><th>Último uso</th><th></th></tr></thead>
+          <tbody>${machineRows||'<tr><td colspan="8" class="empty">Sin datos</td></tr>'}</tbody></table>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Empleados</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('employees','excel')">Excel</button>
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('employees','pdf')">PDF</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:18px;align-items:start">
+        <div style="height:280px"><canvas id="repEmployeesChart"></canvas></div>
+        <div style="overflow:auto">
+          <table><thead><tr><th>Empleado</th><th>Legajo</th><th>Área</th><th>Modo</th><th>Límite</th><th>Cafés</th><th>Rech.</th><th>$</th><th>Máqs.</th><th></th></tr></thead>
+          <tbody>${employeeRows||'<tr><td colspan="10" class="empty">Sin datos</td></tr>'}</tbody></table>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="card-title" style="margin:0">Departamentos</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('departments','excel')">Excel</button>
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('departments','pdf')">PDF</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:18px;align-items:start">
+        <div style="height:280px"><canvas id="repDepartmentsChart"></canvas></div>
+        <div style="overflow:auto">
+          <table><thead><tr><th>Área</th><th>Empleados</th><th>Máqs.</th><th>Cafés</th><th>Rech.</th><th>$</th><th></th></tr></thead>
+          <tbody>${departmentRows||'<tr><td colspan="7" class="empty">Sin datos</td></tr>'}</tbody></table>
+        </div>
+      </div>
+    </div>
+  `);
+  renderReportCharts();
 }
 
-async function loadEmpMachines(){
-  const id=document.getElementById('empSelect').value;
-  const el=document.getElementById('empMachineResult');
-  el.innerHTML='<div class="empty">Cargando...</div>';
+async function employeeReportDetail(id,name){
   try{
-    const d=await api('GET',`/api/reports/employees/${id}/machines`);
-    const rows=(d.machines||[]).map(m=>`<tr>
-      <td>${m.machine_name}</td><td>${m.location||'—'}</td>
-      <td>${m.taps_count}</td>
-      <td>$${Math.round((m.spent_cents||0)/100).toLocaleString('es-AR')}</td>
-    </tr>`).join('');
-    el.innerHTML=rows
-      ?`<table><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés (mes)</th><th>$ (mes)</th></tr></thead><tbody>${rows}</tbody></table>`
-      :'<div class="empty">Sin consumo este mes en ninguna máquina.</div>';
-  }catch(e){el.innerHTML='<div style="color:var(--txd)">'+e.message+'</div>';}
+    const employee=reportState.employees.find(item=>Number(item.id)===Number(id))||{};
+    const [machines,taps]=await Promise.all([
+      api('GET',`/api/reports/employees/${id}/machines${reportQueryString()}`),
+      api('GET',`/api/reports/recent-taps${reportQueryString({employee_id:id,limit:20})}`)
+    ]);
+    reportEmployeeDetailState={
+      id,
+      name,
+      employee,
+      machines:machines.machines||[],
+      taps:taps.taps||[]
+    };
+    const machineRows=reportEmployeeDetailState.machines.map(m=>`<tr><td>${escHtml(m.machine_name)}</td><td>${escHtml(m.location||'—')}</td><td>${formatReportInt(m.taps_count)}</td><td>${formatReportInt(m.denied_taps)}</td><td>${formatReportMoney(m.spent_cents)}</td><td style="font-size:11px;color:var(--tx3)">${m.last_tap_at?new Date(m.last_tap_at).toLocaleString('es-AR'):'—'}</td></tr>`).join('');
+    const tapRows=reportEmployeeDetailState.taps.map(t=>`<tr><td>${escHtml(t.machine_name||'—')}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ OK':`✕ ${escHtml(t.deny_reason||'Rechazado')}`}</td><td>${t.amount_cents?formatReportMoney(t.amount_cents):(t.approved?'OK':'—')}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
+    openModal(`Empleado: ${name}`,`
+      <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+        <button class="btn btn-ghost btn-sm" onclick="exportEmployeeDetailExcel()">Descargar Excel</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportEmployeeDetailPdf()">Descargar PDF</button>
+      </div>
+      <div class="metrics" style="margin-bottom:18px">
+        <div class="metric"><div class="mlbl">Área</div><div class="mval">${escHtml(employee.department||'Sin área')}</div></div>
+        <div class="metric"><div class="mlbl">Cafés</div><div class="mval">${formatReportInt(employee.taps_count)}</div></div>
+        <div class="metric"><div class="mlbl">Rechazados</div><div class="mval">${formatReportInt(employee.denied_taps)}</div></div>
+        <div class="metric"><div class="mlbl">Importe</div><div class="mval">${formatReportMoney(employee.spent_cents)}</div></div>
+      </div>
+      <div class="section-lbl" style="margin-bottom:8px">Consumo por máquina (${escHtml(formatReportRangeLabel(reportState.from,reportState.to))})</div>
+      <table style="margin-bottom:20px"><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés</th><th>Rech.</th><th>$</th><th>Último uso</th></tr></thead><tbody>${machineRows||'<tr><td colspan="6" class="empty">Sin datos</td></tr>'}</tbody></table>
+      <div class="section-lbl" style="margin-bottom:8px">Últimos 20 taps del rango</div>
+      <table><thead><tr><th>Máquina</th><th>Resultado</th><th>Importe</th><th>Hora</th></tr></thead><tbody>${tapRows||'<tr><td colspan="4" class="empty">Sin taps</td></tr>'}</tbody></table>
+    `,'',true);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function departmentReportDetail(department){
+  try{
+    const summary=reportState.departments.find(item=>(item.department||'Sin área')===department)||{department};
+    const [employees,machines,taps]=await Promise.all([
+      api('GET',`/api/reports/employees${reportQueryString({department})}`),
+      api('GET',`/api/reports/machines${reportQueryString({department})}`),
+      api('GET',`/api/reports/recent-taps${reportQueryString({department,limit:30})}`)
+    ]);
+    reportDepartmentDetailState={
+      department,
+      summary,
+      employees:employees.employees||[],
+      machines:machines.machines||[],
+      taps:taps.taps||[]
+    };
+    const employeeRows=reportDepartmentDetailState.employees.map(e=>`<tr><td>${escHtml(e.name)}</td><td>${escHtml(e.legajo||'—')}</td><td>${formatReportInt(e.taps_count)}</td><td>${formatReportInt(e.denied_taps)}</td><td>${formatReportMoney(e.spent_cents)}</td></tr>`).join('');
+    const machineRows=reportDepartmentDetailState.machines.map(m=>`<tr><td>${escHtml(m.name)}</td><td>${escHtml(m.location||'—')}</td><td>${formatReportInt(m.taps_count)}</td><td>${formatReportInt(m.denied_taps)}</td><td>${formatReportMoney(m.spent_cents)}</td></tr>`).join('');
+    const tapRows=reportDepartmentDetailState.taps.map(t=>`<tr><td>${escHtml(t.employee_name||'—')}</td><td>${escHtml(t.machine_name||'—')}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ OK':`✕ ${escHtml(t.deny_reason||'Rechazado')}`}</td><td>${t.amount_cents?formatReportMoney(t.amount_cents):(t.approved?'OK':'—')}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
+    openModal(`Área: ${department}`,`
+      <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+        <button class="btn btn-ghost btn-sm" onclick="exportDepartmentDetailExcel()">Descargar Excel</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportDepartmentDetailPdf()">Descargar PDF</button>
+      </div>
+      <div class="metrics" style="margin-bottom:18px">
+        <div class="metric"><div class="mlbl">Cafés</div><div class="mval">${formatReportInt(summary.taps_count)}</div></div>
+        <div class="metric"><div class="mlbl">Rechazados</div><div class="mval">${formatReportInt(summary.denied_taps)}</div></div>
+        <div class="metric"><div class="mlbl">Importe</div><div class="mval">${formatReportMoney(summary.spent_cents)}</div></div>
+        <div class="metric"><div class="mlbl">Empleados / Máquinas</div><div class="mval">${formatReportInt(summary.employees_count)} / ${formatReportInt(summary.machines_count)}</div></div>
+      </div>
+      <div class="section-lbl" style="margin-bottom:8px">Empleados del área (${escHtml(formatReportRangeLabel(reportState.from,reportState.to))})</div>
+      <table style="margin-bottom:20px"><thead><tr><th>Empleado</th><th>Legajo</th><th>Cafés</th><th>Rech.</th><th>$</th></tr></thead><tbody>${employeeRows||'<tr><td colspan="5" class="empty">Sin datos</td></tr>'}</tbody></table>
+      <div class="section-lbl" style="margin-bottom:8px">Máquinas usadas por el área</div>
+      <table style="margin-bottom:20px"><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés</th><th>Rech.</th><th>$</th></tr></thead><tbody>${machineRows||'<tr><td colspan="5" class="empty">Sin datos</td></tr>'}</tbody></table>
+      <div class="section-lbl" style="margin-bottom:8px">Últimos 30 taps del área</div>
+      <table><thead><tr><th>Empleado</th><th>Máquina</th><th>Resultado</th><th>Importe</th><th>Hora</th></tr></thead><tbody>${tapRows||'<tr><td colspan="5" class="empty">Sin taps</td></tr>'}</tbody></table>
+    `,'',true);
+  }catch(e){alert('Error: '+e.message);}
+}
+
+function exportEmployeeDetailExcel(){
+  if(!reportEmployeeDetailState){
+    alert('Abrí primero el detalle del empleado.');
+    return;
+  }
+  return exportGenericDetailExcel(buildEmployeeDetailExportOptions(reportEmployeeDetailState));
+}
+
+function exportEmployeeDetailPdf(){
+  if(!reportEmployeeDetailState){
+    alert('Abrí primero el detalle del empleado.');
+    return;
+  }
+  return exportGenericDetailPdf(buildEmployeeDetailExportOptions(reportEmployeeDetailState));
+}
+
+function exportDepartmentDetailExcel(){
+  if(!reportDepartmentDetailState){
+    alert('Abrí primero el detalle del área.');
+    return;
+  }
+  return exportGenericDetailExcel(buildDepartmentDetailExportOptions(reportDepartmentDetailState));
+}
+
+function exportDepartmentDetailPdf(){
+  if(!reportDepartmentDetailState){
+    alert('Abrí primero el detalle del área.');
+    return;
+  }
+  return exportGenericDetailPdf(buildDepartmentDetailExportOptions(reportDepartmentDetailState));
 }
 
 // ══════════════════════════════════════════════════════
@@ -1255,8 +3670,8 @@ async function loadUnknown(){
 
 function renderUnknownCards(){
   if(!unknownCards.length){
-    render(`<div class="topbar"><div class="page-title">Tarjetas desconocidas</div></div>
-    <div class="card"><div class="empty">Sin tarjetas desconocidas detectadas.<br><small style="color:var(--tx3)">Cuando alguien acerque una tarjeta sin asignar, aparecerá aquí en tiempo real.</small></div></div>`);
+    render(`<div class="topbar"><div class="page-title">NFCs sin asignar</div></div>
+    <div class="card"><div class="empty">Sin NFCs sin asignar detectados.<br><small style="color:var(--tx3)">Cuando alguien acerque un TAG NFC sin asignar, aparecerá aquí en tiempo real.</small></div></div>`);
     return;
   }
   const rows=unknownCards.map(c=>`<tr>
@@ -1269,9 +3684,9 @@ function renderUnknownCards(){
       <button class="btn btn-ghost btn-xs" style="color:var(--txd)" onclick="discardUnknownCard('${c.uid}')">Descartar</button>
     </td>
   </tr>`).join('');
-  render(`<div class="topbar"><div class="page-title">Tarjetas desconocidas</div></div>
+  render(`<div class="topbar"><div class="page-title">NFCs sin asignar</div></div>
   <div class="card">
-    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">Estas tarjetas fueron acercadas pero no tienen empleado asignado. Asignales un empleado para habilitarlas.</p>
+    <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">Estos TAGs NFC fueron acercados pero no tienen empleado asignado. Asignales un empleado para habilitarlos.</p>
     <table><thead><tr><th>UID</th><th>Máquina</th><th>Detectada</th><th>Acciones</th></tr></thead><tbody>${rows}</tbody></table>
   </div>`);
 }
@@ -1349,7 +3764,10 @@ function openModal(title,body,saveCall,readOnly){
       ${!readOnly&&saveCall?`<button class="btn btn-primary" onclick="${saveCall}">Guardar</button>`:''}
     </div>`;
 }
-function closeModal(){document.getElementById('modal').classList.remove('show');}
+function closeModal(){
+  stopRemoteWifiScanPoll();
+  document.getElementById('modal').classList.remove('show');
+}
 document.getElementById('modal').addEventListener('click',e=>{ if(e.target===document.getElementById('modal')) closeModal(); });
 function showModalErr(id,msg){const el=document.getElementById(id);if(el){el.textContent=msg;el.style.display='block';}}
 
@@ -1357,13 +3775,76 @@ function showModalErr(id,msg){const el=document.getElementById(id);if(el){el.tex
 //  Helpers
 // ══════════════════════════════════════════════════════
 function v(id){const el=document.getElementById(id);return el?el.value.trim()||null:null;}
-function empStatus(e){const r=parseInt(e.taps_today)/parseInt(e.daily_limit);return r>=1?'blocked':r>=.75?'warning':'ok';}
+function employeeLimitModeLabel(mode){
+  return {
+    enforce:'Bloquea al alcanzar el límite',
+    warn_only:'Solo advertir y registrar',
+    off:'Sin límite diario'
+  }[mode||'enforce']||'Bloquea al alcanzar el límite';
+}
+function employeeLimitPolicyText(e){
+  const limit=parseInt(e.daily_limit||0,10)||0;
+  const mode=e.daily_limit_mode||'enforce';
+  if(mode==='off') return `Sin límite diario (referencia ${limit} cafés)`;
+  if(mode==='warn_only') return `${limit} cafés/día · solo advertencia`;
+  return `${limit} cafés/día · bloqueo activo`;
+}
+function employeeLimitCell(e){
+  return `<div>${parseInt(e.daily_limit||0,10)||0} cafés/día</div><div style="font-size:11px;color:var(--tx3)">${employeeLimitModeLabel(e.daily_limit_mode)}</div>`;
+}
+function empStatus(e){
+  const taps=parseInt(e.taps_today||0,10)||0;
+  const limit=parseInt(e.daily_limit||0,10)||0;
+  const mode=e.daily_limit_mode||'enforce';
+  if(mode==='off'||!limit) return 'ok';
+  if(mode==='enforce'&&taps>=limit) return 'blocked';
+  return taps>=Math.max(limit-1,1)?'warning':'ok';
+}
 function stBadge(s){return{blocked:'<span class="badge bd">Bloqueado</span>',warning:'<span class="badge bw">Advertencia</span>',ok:'<span class="badge bs">Normal</span>'}[s];}
 function timeSince(iso){
   const d=new Date(iso);const now=new Date();const m=Math.floor((now-d)/60000);
   if(m<1) return 'Ahora';if(m<60) return `Hace ${m} min`;
   const h=Math.floor(m/60);if(h<24) return `Hace ${h}h`;
   return d.toLocaleDateString('es-AR');
+}
+
+function escHtml(value){
+  return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function numericRssi(value){
+  const n=Number(value);
+  return Number.isFinite(n)?n:null;
+}
+
+function rssiDescriptor(value){
+  const r=numericRssi(value);
+  if(r===null) return 'sin dato';
+  if(r>=-60) return 'excelente';
+  if(r>=-68) return 'muy buena';
+  if(r>=-75) return 'buena';
+  if(r>=-82) return 'justa';
+  return 'débil';
+}
+
+function formatMachineRssi(value){
+  const r=numericRssi(value);
+  if(r===null) return 'Sin dato';
+  return `${r} dBm (${rssiDescriptor(r)})`;
+}
+
+function machineBackendBadge(machine){
+  if(machine?.backend_ok===true) return {cls:'bs',label:'Backend OK'};
+  if(machine?.online) return {cls:'bw',label:'Backend sin respuesta'};
+  return {cls:'bw',label:'Sin telemetría'};
+}
+
+function machineNetworkSummary(machine){
+  const parts=[];
+  if(machine?.wifi_ssid) parts.push(escHtml(machine.wifi_ssid));
+  if(machine?.wifi_ip) parts.push(`IP ${escHtml(machine.wifi_ip)}`);
+  if(numericRssi(machine?.wifi_rssi)!==null) parts.push(formatMachineRssi(machine.wifi_rssi));
+  return parts.length?parts.join(' · '):'Sin telemetría de red reportada';
 }
 </script>
 </body>

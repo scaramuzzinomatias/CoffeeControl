@@ -102,8 +102,11 @@ RC522 (SPI):              MDB (bit-banging, IRAM_ATTR):
 
 LED externo  → GPIO10     Botón BOOT/Reset → GPIO9 (integrado)
 
-⚠ NO USAR: GPIO2 (strapping), GPIO8 (strapping+LED onboard),
+⚠ NO USAR para periféricos externos: GPIO2 (strapping), GPIO8 (strapping + LED onboard azul),
            GPIO18/19 (USB D−/D+), GPIO12-17 (flash interno)
+
+Nota:
+- La realimentación visual del botón BOOT usa el LED onboard azul en `GPIO8` y funciona con el firmware ya corriendo, sin depender del arranque.
 ```
 
 > **Por qué bit-banging para MDB:** El ESP32-C3 soporta hasta 8 bits por UART en hardware; MDB requiere 9 bits por trama. Se usa `MDB9bit.h` portado con `IRAM_ATTR`.
@@ -130,6 +133,18 @@ createdb coffeecontrol
 psql $DATABASE_URL -f sql/schema.sql
 psql $DATABASE_URL -f sql/migration_v2.sql
 psql $DATABASE_URL -f sql/migration_v3.sql
+psql $DATABASE_URL -f sql/migration_v4.sql
+psql $DATABASE_URL -f sql/migration_v5.sql
+psql $DATABASE_URL -f sql/migration_v6.sql
+psql $DATABASE_URL -f sql/migration_v7.sql
+psql $DATABASE_URL -f sql/migration_v8.sql
+psql $DATABASE_URL -f sql/migration_v9.sql
+psql $DATABASE_URL -f sql/migration_v10.sql
+psql $DATABASE_URL -f sql/migration_v11.sql
+psql $DATABASE_URL -f sql/migration_v12.sql
+psql $DATABASE_URL -f sql/migration_v13.sql
+psql $DATABASE_URL -f sql/migration_v14.sql
+psql $DATABASE_URL -f sql/migration_v15.sql
 ```
 
 Configurar variables de entorno (crear `.env` en `backend/`):
@@ -137,7 +152,7 @@ Configurar variables de entorno (crear `.env` en `backend/`):
 ```env
 DATABASE_URL=postgresql://usuario:contraseña@127.0.0.1:5432/coffeecontrol
 JWT_SECRET=cambia_esto_por_un_secreto_largo
-REGISTRATION_SECRET=coffeecontrol-secret
+REGISTRATION_SECRET=coffeecontrol-registro-2024
 PORT=3000
 ```
 
@@ -149,14 +164,14 @@ node src/server.js
 
 El backend escucha en `0.0.0.0:3000` (accesible desde la LAN).
 
-### Usuario admin por defecto
+### Usuarios seed por defecto
 
 ```
-Usuario: admin
-Contraseña: coffeecontrol
+admin / coffeecontrol
+supervisor1 / coffeecontrol2024   (solo lectura operativa)
 ```
 
-> Cambiar la contraseña desde el panel en Configuración → Usuarios.
+> Cambiar estas contraseñas desde el panel en Configuración → Usuarios.
 
 ---
 
@@ -177,12 +192,21 @@ Para flashear en modo manual: mantener **BOOT** → presionar **EN** → soltar 
 ### Primera configuración de WiFi (captive portal)
 
 1. Encender el ESP32-C3 (sin configuración previa)
-2. Conectarse al WiFi **`CoffeeControl-Setup`** (contraseña: `coffeecontrol`) desde el celular
-3. El portal se abre automáticamente → ingresar SSID + contraseña + URL del backend
-4. Guardar → el ESP reinicia y aparece como **pendiente** en el panel admin
-5. Aprobar desde el panel (asignar nombre y ubicación)
+2. Conectarse al WiFi **`CoffeeControl-Setup`** desde el celular (red abierta, sin contraseña)
+3. El portal se abre automáticamente
+4. Ingresar SSID manualmente o tocar **Escanear redes** para elegir una red visible
+5. Si hace falta, usar **Mostrar contraseña** para validar la clave WiFi
+6. En instalaciones `local`, ingresar la URL del backend
+7. Opcional: tocar **Probar conexión** para validar WiFi + `/health` del backend antes de guardar
+8. Guardar → el ESP reinicia y aparece como **pendiente** en el panel admin
+9. Aprobar desde el panel (asignar nombre y ubicación)
 
-**Reset de configuración:** mantener presionado el botón BOOT (GPIO9) durante 5 segundos al encender.
+**Acceso manual al portal con botón BOOT (GPIO9):**
+- Mantener 5 segundos con el firmware ya iniciado y soltar → abre el AP `CoffeeControl-Setup`
+- No borra SSID, contraseña ni URL guardadas; solo habilita el portal para editar y volver a guardar
+- Feedback visual:
+  - mientras mantenés BOOT, el LED onboard titila lento
+  - al llegar a 5s, hace 3 destellos rápidos y queda listo para abrir el portal al soltar
 
 ---
 
@@ -195,16 +219,137 @@ Abrir `http://<ip-servidor>:3000` en el navegador.
 | Sección | Descripción |
 |---|---|
 | **Dashboard** | Métricas del día, consumo mensual, % sobre límite, máquinas online/offline, alertas |
-| **Máquinas** | Lista con estado online (punto verde/gris), bloquear/desbloquear, aprobar nuevas |
-| **Empleados** | CRUD completo, asignar tarjetas NFC, establecer límite diario, historial de consumo |
-| **Reportes** | Rankings por máquina y por empleado, consumo mensual |
+| **Máquinas** | Lista con estado online, detalle de red (SSID/IP/RSSI/backend), reinicio remoto, cambio de WiFi, escaneo remoto de redes, bloquear/desbloquear y aprobar nuevas |
+| **Empleados** | CRUD completo, asignar tarjetas NFC, definir política diaria (`bloquear`, `solo advertir`, `sin límite`) e historial de consumo |
+| **TAGs NFC** | Vista global con estados `Activo`, `Perdido`, `De baja` y acciones de recuperación |
+| **Reportes** | Rango de fechas, resumen operativo, cortes por máquina/empleado/área, gráficos y exportación Excel/PDF |
 | **Feed en vivo** | Stream de taps en tiempo real via WebSocket, con filtros por estado/máquina/empleado |
 | **Tarjetas desconocidas** | UIDs sin empleado asignado — botón Asignar directamente desde el panel |
 | **Usuarios** | Gestión de usuarios del panel con roles gerente/supervisor |
+| **Sistema** | Zona horaria operativa global (`business_timezone`) |
+| **Alertas por email** | Máquina offline, empleado bloqueado y advertencia preventiva de límite (si SMTP está configurado) |
+| **Auditoría** | Bitácora administrativa con actor, acción, objeto y detalle técnico saneado |
 
 ### Indicador online/offline de máquinas
 
 Cada máquina muestra un punto **verde** (activa en los últimos 3 minutos) o **gris** (offline). El firmware hace heartbeat cada 60 segundos actualizando `last_seen` en la base de datos.
+
+### Reportes avanzados
+
+La pantalla `Reportes` ahora trabaja con rango `desde / hasta` y muestra:
+
+- resumen del rango: aprobados, rechazados, total de eventos, importe expendido, máquinas con ventas y empleados con consumo
+- evolución diaria del rango
+- ranking por máquina con detalle de empleados del período
+- ranking por empleado con detalle de máquinas del período
+- resumen por departamento / área
+- exportación global a Excel (`.xlsx`) y PDF desde la cabecera de la pantalla
+- detalle exportable por empleado y por área, pensado para reuniones de gestión
+
+Los gráficos usan `Chart.js` y respetan la `business_timezone` configurada en `Sistema`.
+
+### Estado de red por máquina
+
+La vista **Máquinas** también muestra telemetría de red enviada por el ESP32-C3:
+
+- SSID WiFi actual
+- IP local actual
+- RSSI aproximado
+- URL backend configurada
+- Estado del backend (`OK` o sin respuesta)
+- Último error de conexión reportado por la máquina
+
+Desde esa misma vista ahora también se puede:
+
+- enviar **reinicio remoto**
+- abrir modal de **cambio de WiFi**
+- pedir **escaneo remoto de redes** visibles en el entorno real de esa máquina
+
+### Zona horaria operativa
+
+El sistema ahora maneja una `business_timezone` global configurable desde `Panel admin > Sistema`.
+
+Esa zona horaria define:
+
+- el día operativo para límites diarios y advertencias
+- el mes operativo para reportes y rankings
+- la fecha que descarga el ESP32-C3 para autenticación offline
+- el `next_reset_at` que usa el firmware para resetear contadores sin depender de una medianoche local inferida
+
+Valor por defecto:
+
+- `America/Argentina/Buenos_Aires`
+
+La configuración usa identificadores IANA reales, por ejemplo:
+
+- `America/Santiago`
+- `America/Lima`
+- `America/Mexico_City`
+
+### Notificaciones automáticas por email
+
+El backend ya puede enviar emails automáticos para estos eventos:
+
+- advertencia preventiva de límite diario al empleado y supervisores activos de su área
+- empleado bloqueado por límite diario
+- máquina offline por falta de heartbeat
+
+El estado `backend sin respuesta` se mantiene como diagnóstico en la vista de máquinas, pero ya no genera email.
+
+La operación diaria ahora se configura desde `Panel admin > Notificaciones`:
+
+- activar o desactivar la capa de alertas
+- definir destinatarios
+- elegir qué eventos envían mail
+- definir el umbral del aviso preventivo (`faltan N cafés`)
+- lanzar una prueba manual de envío
+
+Las credenciales SMTP siguen en `backend/.env`. Para activarlo hay que completar estas variables:
+
+- `ALERT_EMAIL_TO`
+- `ALERT_EMAIL_FROM`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_SECURE`
+- `SMTP_USER`
+- `SMTP_PASS`
+
+### Política diaria por empleado
+
+Cada empleado ahora puede trabajar en uno de estos modos:
+
+- `Bloquear al alcanzar el límite`: comportamiento clásico; al llegar al tope diario, no se aprueban más taps.
+- `Solo advertir y registrar`: el consumo sigue permitido, pero queda marcado y puede disparar aviso preventivo.
+- `Sin límite diario`: el límite queda solo como dato informativo.
+
+Además, cada empleado puede activar o desactivar la advertencia por email cuando queda cerca del límite diario. Si esa advertencia está activa y el evento también está habilitado en `Notificaciones`, el sistema envía el aviso a:
+
+- el email del propio empleado
+- los usuarios `supervisor` activos con email cargado en la misma `department`
+
+El umbral de esa advertencia se configura globalmente desde `Notificaciones` como “faltan N cafés”. Las plantillas de email quedan fuera del panel y se ajustan desde [notificationTemplates.js](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/backend/src/config/notificationTemplates.js), para no exponer variables sensibles a usuarios funcionales.
+
+En modo offline, el ESP32-C3 descarga y respeta esta misma política al autenticar tarjetas desde caché local.
+
+### Estados de TAG NFC
+
+Los TAGs NFC ahora tienen un estado operativo explícito:
+
+- `Activo`: autoriza consumo normalmente
+- `Perdido`: se bloquea por seguridad, conserva historial y puede reactivarse o reasignarse
+- `De baja`: queda desactivado, conserva historial y puede reactivarse más adelante
+
+Desde el panel se puede:
+
+- `Marcar perdido`
+- `Dar de baja`
+- `Reactivar`
+- `Reasignar`
+
+Si un TAG perdido o dado de baja se intenta usar, el backend lo rechaza con:
+
+- `card_lost`
+- `card_inactive`
 
 ---
 
@@ -237,7 +382,7 @@ POST /api/machines/:id/block    { reason }
 POST /api/machines/:id/unblock
 
 GET  /api/employees
-POST /api/employees             { name, department, email, dni, legajo, phone, daily_limit }
+POST /api/employees             { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled }
 PATCH /api/employees/:id
 DELETE /api/employees/:id       ← desactiva empleado + sus tarjetas NFC (transacción)
 POST  /api/employees/:id/cards  { uid, label }
@@ -247,6 +392,13 @@ GET  /api/reports/employees/:id/machines
 
 GET  /api/admin-users           (solo gerente)
 POST /api/admin-users
+
+GET  /api/notification-settings
+PUT  /api/notification-settings
+POST /api/notification-settings/test
+
+GET  /api/system-settings
+PUT  /api/system-settings       { business_timezone }
 ```
 
 ### WebSocket — `ws://host/ws`
@@ -263,6 +415,12 @@ Eventos emitidos al dashboard:
 | `machine_approved` | Máquina aprobada por el admin |
 | `machine_blocked` | Máquina bloqueada |
 
+Acceso:
+
+- el handshake del WebSocket del panel ahora exige JWT válido
+- `coffeecontrol-admin.html` conecta usando la sesión del login
+- `coffeecontrol.html` solo funciona si ya existe un token válido en `localStorage`
+
 ---
 
 ## Roles de usuario
@@ -276,8 +434,9 @@ Eventos emitidos al dashboard:
 
 ## Próximas funcionalidades
 
-- [ ] Notificaciones por email/WhatsApp al bloquear empleado o superar límite
-- [ ] Exportar reportes a Excel/PDF
+- [x] Notificaciones por email configurables desde el panel
+- [x] Auditoría administrativa desde el panel
+- [x] Exportar reportes a Excel/PDF
 - [ ] OTA (Over The Air) — actualización de firmware desde el panel
 - [ ] Multi-tenant para modo SaaS (campo `tenant_id`, schema por empresa)
 - [ ] Mapa de máquinas con estado en tiempo real

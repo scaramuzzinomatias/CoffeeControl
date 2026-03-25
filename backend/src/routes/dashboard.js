@@ -3,6 +3,14 @@
 
 const express = require('express');
 const pool    = require('../db/pool');
+const alerts  = require('../services/alerts');
+const systemSettings = require('../services/systemSettings');
+const { requireManager } = require('../middleware/roleAccess');
+const { statusFromUsage } = require('../lib/dailyLimit');
+const {
+    buildBusinessDayRangeSql,
+    buildBusinessMonthRangeSql
+} = require('../lib/businessTime');
 
 const router = express.Router();
 
@@ -10,24 +18,39 @@ const router = express.Router();
 // Resumen del día: métricas + ranking + alertas
 router.get('/today', async (req, res) => {
     try {
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
+        const warningLead = await alerts.getEmployeeLimitWarningLead();
         const result = await pool.query(
             `SELECT
-                employee_id,
-                employee_name,
-                department,
-                daily_limit,
-                taps_today,
-                spent_today_cents,
-                CASE
-                    WHEN taps_today >= daily_limit THEN 'blocked'
-                    WHEN taps_today >= daily_limit * 0.75 THEN 'warning'
-                    ELSE 'ok'
-                END AS status
-             FROM daily_consumption
+                e.id AS employee_id,
+                e.name AS employee_name,
+                e.department,
+                e.daily_limit,
+                e.daily_limit_mode,
+                e.warning_enabled,
+                COUNT(t.id) FILTER (WHERE t.approved = true) AS taps_today,
+                COUNT(t.id) FILTER (WHERE t.approved = true AND t.over_limit = true) AS taps_over_limit,
+                COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_today_cents
+             FROM employees e
+             LEFT JOIN taps t
+                ON t.employee_id = e.id
+               AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
+             WHERE e.active = true
+             GROUP BY e.id, e.name, e.department, e.daily_limit, e.daily_limit_mode, e.warning_enabled
              ORDER BY taps_today DESC`
+            ,
+            [timeZone, businessDate]
         );
 
-        const employees = result.rows;
+        const employees = result.rows.map(row => ({
+            ...row,
+            status: statusFromUsage({
+                dailyLimit: row.daily_limit,
+                mode: row.daily_limit_mode,
+                tapsToday: row.taps_today,
+                warningLead
+            })
+        }));
 
         const totalTaps  = employees.reduce((s, e) => s + parseInt(e.taps_today), 0);
         const totalCents = employees.reduce((s, e) => s + parseInt(e.spent_today_cents), 0);
@@ -35,6 +58,8 @@ router.get('/today', async (req, res) => {
         const warnings   = employees.filter(e => e.status === 'warning').length;
 
         res.json({
+            business_date: businessDate,
+            business_timezone: timeZone,
             summary: {
                 total_taps_today:   totalTaps,
                 total_spent_cents:  totalCents,
@@ -54,22 +79,31 @@ router.get('/today', async (req, res) => {
 // Resumen del mes actual
 router.get('/monthly', async (req, res) => {
     try {
+        const { timeZone, monthStart } = await systemSettings.getBusinessTimeContext();
         const result = await pool.query(
             `SELECT
-                employee_id,
-                employee_name,
-                department,
-                taps_total,
-                spent_cents
-             FROM monthly_summary
-             WHERE month = DATE_TRUNC('month', NOW())
+                e.id AS employee_id,
+                e.name AS employee_name,
+                e.department,
+                COUNT(t.id) FILTER (WHERE t.approved = true) AS taps_total,
+                COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents
+             FROM employees e
+             LEFT JOIN taps t
+                ON t.employee_id = e.id
+               AND t.approved = true
+               AND ${buildBusinessMonthRangeSql('t.tapped_at', 1, 2)}
+             WHERE e.active = true
+             GROUP BY e.id, e.name, e.department
              ORDER BY taps_total DESC`
+            ,
+            [timeZone, monthStart]
         );
 
         const totalCents = result.rows.reduce((s, e) => s + parseInt(e.spent_cents), 0);
 
         res.json({
-            month:         new Date().toISOString().slice(0, 7),
+            month: monthStart.slice(0, 7),
+            business_timezone: timeZone,
             total_spent_cents: totalCents,
             employees:     result.rows
         });
@@ -84,6 +118,7 @@ router.get('/monthly', async (req, res) => {
 // Últimos 50 taps del día (para el log en tiempo real)
 router.get('/feed', async (req, res) => {
     try {
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
         const result = await pool.query(
             `SELECT
                 t.id,
@@ -98,9 +133,11 @@ router.get('/feed', async (req, res) => {
              FROM taps t
              LEFT JOIN employees e ON e.id = t.employee_id
              JOIN machines  m ON m.id = t.machine_id
-             WHERE t.tapped_at >= CURRENT_DATE
+             WHERE ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
              ORDER BY t.tapped_at DESC
              LIMIT 50`
+            ,
+            [timeZone, businessDate]
         );
 
         res.json({ taps: result.rows });
@@ -113,7 +150,7 @@ router.get('/feed', async (req, res) => {
 
 // ── GET /api/dashboard/uid-history/:uid ─────────────
 // Historial de intentos de acceso de un UID específico
-router.get('/uid-history/:uid', async (req, res) => {
+router.get('/uid-history/:uid', requireManager, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT t.tapped_at, m.name AS machine, t.approved, t.deny_reason
@@ -133,7 +170,7 @@ router.get('/uid-history/:uid', async (req, res) => {
 
 // ── GET /api/dashboard/unknown-uids ──────────────────
 // UIDs que tapearon como desconocidos y aún no tienen tarjeta registrada
-router.get('/unknown-uids', async (req, res) => {
+router.get('/unknown-uids', requireManager, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT DISTINCT ON (t.nfc_uid)

@@ -10,6 +10,7 @@ node_modules/
 
 # Env files con credenciales reales
 backend/.env
+backend/*.log
 
 # OS
 .DS_Store

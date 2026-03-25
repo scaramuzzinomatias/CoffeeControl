@@ -13,10 +13,10 @@ CREATE TABLE IF NOT EXISTS admin_users (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Usuario por defecto: admin / coffeecontrol2024
--- (hash bcrypt de "coffeecontrol2024", cost=10)
+-- Usuario seed por defecto: admin / coffeecontrol
+-- (hash bcrypt de "coffeecontrol", cost=10)
 INSERT INTO admin_users (username, password_hash, role) VALUES
-    ('admin', '$2b$10$K7L1OJ45/4Y2nIvhRVpCe.FSmYVWTMaQ7nZ4oJmZkRLgsBHH4Y5oS', 'admin')
+    ('admin', '$2a$10$V.a1qNi2zNRRT2pIKSqkMe5ao6C9C4gK7JZzHP14NP8WKaCyNjtay', 'admin')
 ON CONFLICT (username) DO NOTHING;
 
 -- Agregar campos faltantes a employees
@@ -87,10 +87,11 @@ GROUP BY e.id, e.name, e.department, e.legajo, m.id, m.name, m.location;
 
 ALTER TABLE admin_users
     ADD COLUMN IF NOT EXISTS department VARCHAR(60),  -- null = acceso a todos los departamentos
-    ADD COLUMN IF NOT EXISTS full_name  VARCHAR(100);
+    ADD COLUMN IF NOT EXISTS full_name  VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS email      VARCHAR(120);
 
--- Insertar supervisor de ejemplo
--- contraseña: supervisor123
+-- Insertar supervisor seed de ejemplo
+-- credenciales: supervisor1 / coffeecontrol2024
 INSERT INTO admin_users (username, password_hash, role, full_name, department) VALUES
-    ('supervisor1', '$2b$10$K7L1OJ45/4Y2nIvhRVpCe.FSmYVWTMaQ7nZ4oJmZkRLgsBHH4Y5oS', 'supervisor', 'Supervisor IT', 'IT')
+    ('supervisor1', '$2a$10$meCz6uJjpI8rS/7fR/KaFeYsf21.ZIRpIme80r7z300bk10X/T6Am', 'supervisor', 'Supervisor IT', 'IT')
 ON CONFLICT (username) DO NOTHING;

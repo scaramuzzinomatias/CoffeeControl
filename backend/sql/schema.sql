@@ -9,8 +9,11 @@ CREATE TABLE employees (
     department  VARCHAR(60),
     email       VARCHAR(120) UNIQUE,
     daily_limit INT NOT NULL DEFAULT 4,   -- cafés por día
+    daily_limit_mode VARCHAR(16) NOT NULL DEFAULT 'enforce',
+    warning_enabled BOOLEAN NOT NULL DEFAULT true,
     active      BOOLEAN NOT NULL DEFAULT true,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (daily_limit_mode IN ('enforce', 'warn_only', 'off'))
 );
 
 -- Tarjetas NFC (un empleado puede tener más de una)
@@ -19,8 +22,10 @@ CREATE TABLE nfc_cards (
     uid         VARCHAR(20) UNIQUE NOT NULL,  -- UID hex del chip, ej: "A3F2C1D0"
     employee_id INT NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
     label       VARCHAR(60),                  -- "Tarjeta principal", "Llavero", etc.
+    status      VARCHAR(16) NOT NULL DEFAULT 'active',
     active      BOOLEAN NOT NULL DEFAULT true,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (status IN ('active', 'inactive', 'lost'))
 );
 
 -- Expendedoras
@@ -29,8 +34,67 @@ CREATE TABLE machines (
     name        VARCHAR(60) NOT NULL,         -- "Máquina A — Piso 1"
     location    VARCHAR(100),
     secret      VARCHAR(64) NOT NULL,         -- X-Machine-Secret del firmware
+    wifi_ssid   VARCHAR(64),
+    backend_url VARCHAR(255),
+    wifi_rssi   INT,
+    wifi_ip     VARCHAR(45),
+    backend_ok  BOOLEAN,
+    backend_error VARCHAR(255),
     active      BOOLEAN NOT NULL DEFAULT true,
     created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE alert_events (
+    alert_key        VARCHAR(160) PRIMARY KEY,
+    alert_type       VARCHAR(40) NOT NULL,
+    status           VARCHAR(16) NOT NULL DEFAULT 'open',
+    machine_id       INT REFERENCES machines(id) ON DELETE SET NULL,
+    employee_id      INT REFERENCES employees(id) ON DELETE SET NULL,
+    first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_notified_at TIMESTAMPTZ,
+    resolved_at      TIMESTAMPTZ,
+    payload          JSONB,
+    CHECK (status IN ('open', 'resolved'))
+);
+
+CREATE TABLE notification_settings (
+    id                                SMALLINT PRIMARY KEY DEFAULT 1,
+    enabled                           BOOLEAN NOT NULL DEFAULT true,
+    recipient_emails                  TEXT NOT NULL DEFAULT '',
+    notify_employee_limit_warning     BOOLEAN NOT NULL DEFAULT false,
+    notify_employee_daily_blocked     BOOLEAN NOT NULL DEFAULT true,
+    notify_machine_offline            BOOLEAN NOT NULL DEFAULT true,
+    notify_machine_backend_down       BOOLEAN NOT NULL DEFAULT true,
+    employee_limit_warning_lead       SMALLINT NOT NULL DEFAULT 1,
+    created_at                        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (employee_limit_warning_lead BETWEEN 1 AND 10),
+    CHECK (id = 1)
+);
+
+CREATE TABLE system_settings (
+    id                SMALLINT PRIMARY KEY DEFAULT 1,
+    business_timezone VARCHAR(80) NOT NULL DEFAULT 'America/Argentina/Buenos_Aires',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (id = 1)
+);
+
+CREATE TABLE audit_logs (
+    id               BIGSERIAL PRIMARY KEY,
+    actor_user_id    INT REFERENCES admin_users(id) ON DELETE SET NULL,
+    actor_username   VARCHAR(60),
+    actor_role       VARCHAR(20),
+    actor_ip         VARCHAR(80),
+    actor_user_agent VARCHAR(255),
+    action           VARCHAR(80) NOT NULL,
+    entity_type      VARCHAR(40) NOT NULL,
+    entity_id        VARCHAR(80),
+    entity_label     VARCHAR(160),
+    summary          VARCHAR(255) NOT NULL,
+    details          JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Registro de taps (cada vez que alguien acerca la tarjeta)
@@ -43,6 +107,7 @@ CREATE TABLE taps (
     deny_reason VARCHAR(40),                  -- 'limit_reached' | 'card_unknown' | 'inactive'
     item_id     INT,                          -- ID del producto (viene del VEND REQUEST MDB)
     amount_cents INT,                         -- monto en centavos
+    over_limit  BOOLEAN NOT NULL DEFAULT false,
     confirmed   BOOLEAN,                      -- NULL = pendiente, true = dispensado OK, false = falla mecánica
     tapped_at   TIMESTAMPTZ DEFAULT NOW()
 );
@@ -54,34 +119,52 @@ CREATE INDEX idx_nfc_uid            ON nfc_cards (uid);
 
 -- ── Vista: consumo de hoy por empleado ───────────────
 CREATE VIEW daily_consumption AS
+WITH cfg AS (
+    SELECT COALESCE((SELECT business_timezone FROM system_settings WHERE id = 1), 'America/Argentina/Buenos_Aires') AS business_timezone
+),
+bounds AS (
+    SELECT
+        business_timezone,
+        (((CURRENT_TIMESTAMP AT TIME ZONE business_timezone)::date)::timestamp AT TIME ZONE business_timezone) AS day_start,
+        ((((CURRENT_TIMESTAMP AT TIME ZONE business_timezone)::date + INTERVAL '1 day')::timestamp) AT TIME ZONE business_timezone) AS day_end
+    FROM cfg
+)
 SELECT
     e.id          AS employee_id,
     e.name        AS employee_name,
     e.department,
     e.daily_limit,
+    e.daily_limit_mode,
+    e.warning_enabled,
     COUNT(t.id) FILTER (WHERE t.approved = true)  AS taps_today,
+    COUNT(t.id) FILTER (WHERE t.approved = true AND t.over_limit = true) AS taps_over_limit,
     COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_today_cents
 FROM employees e
+CROSS JOIN bounds b
 LEFT JOIN taps t
     ON t.employee_id = e.id
-    AND t.tapped_at >= CURRENT_DATE
-    AND t.tapped_at <  CURRENT_DATE + INTERVAL '1 day'
+    AND t.tapped_at >= b.day_start
+    AND t.tapped_at <  b.day_end
 WHERE e.active = true
-GROUP BY e.id, e.name, e.department, e.daily_limit;
+GROUP BY e.id, e.name, e.department, e.daily_limit, e.daily_limit_mode, e.warning_enabled;
 
 -- ── Vista: resumen mensual ────────────────────────────
 CREATE VIEW monthly_summary AS
+WITH cfg AS (
+    SELECT COALESCE((SELECT business_timezone FROM system_settings WHERE id = 1), 'America/Argentina/Buenos_Aires') AS business_timezone
+)
 SELECT
     e.id          AS employee_id,
     e.name        AS employee_name,
     e.department,
-    DATE_TRUNC('month', t.tapped_at) AS month,
+    DATE_TRUNC('month', t.tapped_at AT TIME ZONE cfg.business_timezone) AS month,
     COUNT(t.id) FILTER (WHERE t.approved = true)  AS taps_total,
     COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents
 FROM employees e
+CROSS JOIN cfg
 LEFT JOIN taps t ON t.employee_id = e.id AND t.approved = true
 WHERE e.active = true
-GROUP BY e.id, e.name, e.department, DATE_TRUNC('month', t.tapped_at);
+GROUP BY e.id, e.name, e.department, DATE_TRUNC('month', t.tapped_at AT TIME ZONE cfg.business_timezone);
 
 -- ── Datos de ejemplo ──────────────────────────────────
 INSERT INTO machines (name, location, secret) VALUES
@@ -110,3 +193,7 @@ INSERT INTO nfc_cards (uid, employee_id, label) VALUES
     ('F6A7B8C9', 6, 'Tarjeta principal'),
     ('A7B8C9D0', 7, 'Tarjeta principal'),
     ('B8C9D0E1', 8, 'Tarjeta principal');
+
+INSERT INTO system_settings (id, business_timezone) VALUES
+    (1, 'America/Argentina/Buenos_Aires')
+ON CONFLICT (id) DO NOTHING;

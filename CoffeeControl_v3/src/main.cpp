@@ -24,13 +24,13 @@
  *   GPIO5  = I²C SDA (DS3231)   ← pines recomendados por datasheet
  *   GPIO6  = I²C SCL (DS3231)   ← Wire.begin(5, 6)
  *   GPIO10 = LED externo (activo HIGH)
- *   GPIO9  = BOOT button (pull-up interno, LOW = presionado, reset config)
+ *   GPIO9  = BOOT button (pull-up interno, LOW = presionado, abre portal en runtime)
  *   GPIO20 = MDB TX (bit-banging, salida al bus)
  *   GPIO21 = MDB RX (bit-banging, entrada del bus)
  *
  * Pines que NO conectar nada:
  *   GPIO2  = strapping (debe estar HIGH al boot)
- *   GPIO8  = LED onboard + strapping (debe estar HIGH al boot)
+ *   GPIO8  = LED onboard azul + strapping (usar solo post-boot, debe estar HIGH al boot)
  *   GPIO18/19 = USB D-/D+ (programación)
  */
 
@@ -57,6 +57,7 @@
 #define PIN_I2C_SDA    5   // pines recomendados por referencia oficial
 #define PIN_I2C_SCL    6
 #define PIN_LED       10
+#define PIN_LED_ONBOARD 8   // LED onboard azul del Super Mini (activo LOW, usar solo post-boot)
 #define PIN_BOOT_BTN   9   // BOOT button: pull-up interno, LOW = presionado
 #define PIN_MDB_TX    20   // GPIO20/21: UART0 nativo (no hay beneficio de HW
 #define PIN_MDB_RX    21   // para MDB 9-bit — ESP32-C3 max 8-bit en hardware)
@@ -71,7 +72,7 @@
 #define AP_SSID        "CoffeeControl-Setup"
 #define AP_IP_STR      "192.168.4.1"
 #define DNS_PORT       53
-#define RESET_HOLD_MS  5000  // mantener pulsado 5s para borrar config
+#define PORTAL_BUTTON_HOLD_MS  5000   // mantener 5s → abrir portal sin borrar config
 
 // ── MDB constantes ────────────────────────────────────
 #define MDB_ADDR_CASHLESS  0x10
@@ -103,6 +104,7 @@
 #define NFC_COOLDOWN_MS    2500
 #define HTTP_TIMEOUT_MS    4000
 #define SESSION_TIMEOUT_MS 12000
+#define COMMAND_POLL_MS    15000
 
 // ── Offline ───────────────────────────────────────────
 #define MAX_CARDS          1500   // límite práctico (~100KB ArduinoJson doc)
@@ -115,6 +117,11 @@
 #define LOCAL_AUTH_OVERLIMIT 1
 #define LOCAL_AUTH_UNKNOWN   2
 
+// Modos de límite diario cacheados offline
+#define LIMIT_MODE_ENFORCE   0
+#define LIMIT_MODE_WARN_ONLY 1
+#define LIMIT_MODE_OFF       2
+
 // ── Estado MDB ────────────────────────────────────────
 enum MDBState { INACTIVE, MDB_DISABLED, ENABLED, SESSION_IDLE, VEND_PENDING };
 
@@ -122,6 +129,7 @@ enum MDBState { INACTIVE, MDB_DISABLED, ENABLED, SESSION_IDLE, VEND_PENDING };
 struct __attribute__((packed)) CardEntry {
     char    uid[9];    // "0A30FC80\0"
     uint8_t limit;     // daily_limit
+    uint8_t mode;      // enforce / warn_only / off
     uint8_t used;      // used_today (en memoria)
 };
 
@@ -160,6 +168,7 @@ String wifiSSID    = "";
 String wifiPass    = "";
 String backendBase = BACKEND_URL;
 String macAddress  = "";
+String backendLastError = "";
 bool   portalMode    = false;
 bool   wifiReady     = false;
 bool   backendReady  = false;   // true si /health respondio OK
@@ -170,6 +179,7 @@ CardEntry cards[MAX_CARDS];
 int       cardCount  = 0;
 bool      cardsDirty = false;
 char      savedDate[11] = "";   // "YYYY-MM-DD" para detectar cambio de día
+uint32_t  nextResetTs = 0;      // Unix timestamp UTC del próximo reset de contadores
 
 // ── Offline: cola de eventos ──────────────────────────
 QueueEntry queueBuf[MAX_QUEUE];
@@ -187,6 +197,49 @@ void ledBlink(int n, int ms) {
 }
 void ledToggle() { digitalWrite(PIN_LED, !digitalRead(PIN_LED)); }
 
+void bootFeedbackPinsInit() {
+    pinMode(PIN_LED_ONBOARD, OUTPUT);
+    digitalWrite(PIN_LED_ONBOARD, HIGH);
+}
+
+void bootFeedbackOff() { digitalWrite(PIN_LED_ONBOARD, HIGH); }
+void bootFeedbackOn()  { digitalWrite(PIN_LED_ONBOARD, LOW);  }
+
+void bootFeedbackBlink(int n, int onMs, int offMs) {
+    for (int i = 0; i < n; i++) {
+        bootFeedbackOn(); delay(onMs);
+        bootFeedbackOff(); delay(offMs);
+    }
+}
+
+String normalizeBackendUrl(String url) {
+    url.trim();
+    if (url.startsWith("Http://") || url.startsWith("HTTP://")) {
+        return "http://" + url.substring(7);
+    }
+    if (url.startsWith("Https://") || url.startsWith("HTTPS://")) {
+        return "https://" + url.substring(8);
+    }
+    return url;
+}
+
+bool hasHttpScheme(const String& url) {
+    return url.startsWith("http://") || url.startsWith("https://")
+        || url.startsWith("Http://") || url.startsWith("HTTP://")
+        || url.startsWith("Https://") || url.startsWith("HTTPS://");
+}
+
+void startPortal();
+
+uint8_t parseLimitMode(const String& raw) {
+    String mode = raw;
+    mode.trim();
+    mode.toLowerCase();
+    if (mode == "warn_only") return LIMIT_MODE_WARN_ONLY;
+    if (mode == "off")       return LIMIT_MODE_OFF;
+    return LIMIT_MODE_ENFORCE;
+}
+
 
 // ══════════════════════════════════════════════════════
 //  PREFERENCIAS (reemplaza EEPROM, almacén NVS)
@@ -195,15 +248,9 @@ void readConfig() {
     prefs.begin("cc", true);  // namespace "cc", read-only
     wifiSSID = prefs.getString("ssid", "");
     wifiPass = prefs.getString("pass", "");
-    String url = prefs.getString("url", "");
+    String url = normalizeBackendUrl(prefs.getString("url", ""));
     prefs.end();
     if (url.length() > 0) {
-        // Normalizar esquema a minúsculas (evitar "Http://" del portal)
-        if (url.startsWith("Http://") || url.startsWith("HTTP://")) {
-            url = "http://" + url.substring(7);
-        } else if (url.startsWith("Https://") || url.startsWith("HTTPS://")) {
-            url = "https://" + url.substring(8);
-        }
         backendBase = url;
     }
     Serial.printf("[CFG] SSID guardada:   %s\n", wifiSSID.c_str());
@@ -214,43 +261,59 @@ void saveConfig(const String& ssid, const String& pass, const String& url) {
     prefs.begin("cc", false);  // read-write
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
-    // Normalizar esquema a minúsculas antes de guardar
-    String urlNorm = url;
-    if (urlNorm.startsWith("Http://") || urlNorm.startsWith("HTTP://"))
-        urlNorm = "http://" + urlNorm.substring(7);
-    else if (urlNorm.startsWith("Https://") || urlNorm.startsWith("HTTPS://"))
-        urlNorm = "https://" + urlNorm.substring(8);
+    String urlNorm = normalizeBackendUrl(url);
     prefs.putString("url", urlNorm.length() > 0 ? urlNorm : String(BACKEND_URL));
     prefs.end();
     Serial.printf("[CFG] Config guardada — SSID: %s\n", ssid.c_str());
 }
 
-void clearConfig() {
-    prefs.begin("cc", false);
-    prefs.clear();
-    prefs.end();
-}
+void handleResetButtonRuntime() {
+    if (portalMode || digitalRead(PIN_BOOT_BTN) != LOW) return;
 
-void checkResetButton() {
-    // GPIO9 = BOOT button con pull-up interno, LOW = presionado
-    pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
-    delay(10);
+    delay(25);  // debounce simple
+    if (digitalRead(PIN_BOOT_BTN) != LOW) return;
 
-    if (digitalRead(PIN_BOOT_BTN) == LOW) {
-        Serial.print("[RESET] Boton presionado, mantener 5s para borrar config");
-        unsigned long t = millis();
-        int dots = 0;
-        while (digitalRead(PIN_BOOT_BTN) == LOW) {
-            if (millis() - t > RESET_HOLD_MS) {
-                clearConfig();
-                Serial.println("\n[RESET] Config borrada — reiniciando al portal");
-                ledBlink(10, 100);
-                ESP.restart();
-            }
-            if (millis() - t > (unsigned long)(dots * 500)) { Serial.print("."); dots++; }
-            delay(50);
+    Serial.println("[PORTAL] BOOT presionado — mantener 5s para abrir el portal sin borrar configuracion");
+
+    unsigned long t = millis();
+    unsigned long lastBlinkMs = millis();
+    bool slowBlinkState = false;
+    bool portalReadyShown = false;
+
+    bootFeedbackOff();
+
+    while (digitalRead(PIN_BOOT_BTN) == LOW) {
+        unsigned long now = millis();
+        unsigned long heldMs = now - t;
+
+        if (!portalReadyShown && now - lastBlinkMs >= 500) {
+            slowBlinkState = !slowBlinkState;
+            if (slowBlinkState) bootFeedbackOn();
+            else                bootFeedbackOff();
+            lastBlinkMs = now;
         }
-        Serial.println(" (soltado antes de tiempo)");
+
+        if (!portalReadyShown && heldMs >= PORTAL_BUTTON_HOLD_MS) {
+            portalReadyShown = true;
+            Serial.println("[PORTAL] Umbral listo — soltar ahora para abrir el portal de configuracion");
+            bootFeedbackBlink(3, 90, 90);
+            bootFeedbackOff();
+            slowBlinkState = false;
+            lastBlinkMs = millis();
+        }
+
+        delay(25);
+    }
+
+    bootFeedbackOff();
+    unsigned long heldMs = millis() - t;
+
+    if (heldMs >= PORTAL_BUTTON_HOLD_MS) {
+        Serial.println("[PORTAL] Activando AP de configuracion sin borrar credenciales guardadas");
+        ledBlink(3, 120);
+        startPortal();
+    } else {
+        Serial.println("[PORTAL] Cancelado — soltado antes del umbral");
     }
 }
 
@@ -279,6 +342,7 @@ void loadCards() {
     }
 
     strlcpy(savedDate, doc["date"] | "", sizeof(savedDate));
+    nextResetTs = (uint32_t)(doc["next_reset_at"] | 0);
     JsonArray arr = doc["cards"];
 
     cardCount = 0;
@@ -286,10 +350,12 @@ void loadCards() {
         if (cardCount >= MAX_CARDS) break;
         strlcpy(cards[cardCount].uid, c["uid"] | "", sizeof(cards[0].uid));
         cards[cardCount].limit = (uint8_t)(c["limit"] | 0);
+        cards[cardCount].mode  = (uint8_t)(c["mode"]  | LIMIT_MODE_ENFORCE);
         cards[cardCount].used  = (uint8_t)(c["used"]  | 0);
         cardCount++;
     }
-    Serial.printf("[CARDS] Cache cargado: %d tarjetas (fecha: %s)\n", cardCount, savedDate);
+    Serial.printf("[CARDS] Cache cargado: %d tarjetas (fecha: %s, next_reset_at=%lu)\n",
+                  cardCount, savedDate, (unsigned long)nextResetTs);
 }
 
 // Guarda cards.json en streaming para no allocar el doc completo
@@ -299,17 +365,45 @@ void saveCards() {
 
     f.print("{\"date\":\"");
     f.print(savedDate);
-    f.print("\",\"cards\":[");
+    f.print("\",\"next_reset_at\":");
+    f.print((unsigned long)nextResetTs);
+    f.print(",\"cards\":[");
     for (int i = 0; i < cardCount; i++) {
         if (i > 0) f.print(",");
-        f.printf("{\"uid\":\"%s\",\"limit\":%d,\"used\":%d}",
-                 cards[i].uid, cards[i].limit, cards[i].used);
+        f.printf("{\"uid\":\"%s\",\"limit\":%d,\"mode\":%d,\"used\":%d}",
+                 cards[i].uid, cards[i].limit, cards[i].mode, cards[i].used);
     }
     f.print("]}");
     f.close();
 
     cardsDirty = false;
     Serial.printf("[CARDS] Cache guardado: %d tarjetas\n", cardCount);
+}
+
+bool fillDateFromRtcOrNtp(char* out, size_t outSize) {
+    if (rtcAvailable) {
+        DateTime now = rtc.now();
+        snprintf(out, outSize, "%04d-%02d-%02d",
+                 now.year(), now.month(), now.day());
+        return true;
+    }
+
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return false;
+    snprintf(out, outSize, "%04d-%02d-%02d",
+             1900 + timeinfo.tm_year, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+    return true;
+}
+
+bool advanceDateByOneDay(const char* currentDate, char* out, size_t outSize) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (sscanf(currentDate, "%d-%d-%d", &year, &month, &day) != 3) return false;
+    DateTime current(year, month, day, 0, 0, 0);
+    DateTime next = current + TimeSpan(1, 0, 0, 0);
+    snprintf(out, outSize, "%04d-%02d-%02d", next.year(), next.month(), next.day());
+    return true;
 }
 
 
@@ -370,7 +464,9 @@ void saveQueue() {
 int localAuth(const String& uid) {
     for (int i = 0; i < cardCount; i++) {
         if (strncmp(cards[i].uid, uid.c_str(), 8) == 0) {
-            if (cards[i].limit > 0 && cards[i].used >= cards[i].limit) {
+            if (cards[i].mode == LIMIT_MODE_ENFORCE
+                && cards[i].limit > 0
+                && cards[i].used >= cards[i].limit) {
                 return LOCAL_AUTH_OVERLIMIT;
             }
             return LOCAL_AUTH_OK;
@@ -503,31 +599,29 @@ void downloadCards() {
         return;
     }
 
-    // Obtener fecha de hoy para el cache
-    if (rtcAvailable) {
-        DateTime now = rtc.now();
-        snprintf(savedDate, sizeof(savedDate), "%04d-%02d-%02d",
-                 now.year(), now.month(), now.day());
+    JsonArray arr;
+    if (doc["cards"].is<JsonArray>()) {
+        strlcpy(savedDate, doc["date"] | "", sizeof(savedDate));
+        nextResetTs = (uint32_t)(doc["next_reset_at"] | 0);
+        arr = doc["cards"].as<JsonArray>();
     } else {
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) {
-            snprintf(savedDate, sizeof(savedDate), "%04d-%02d-%02d",
-                     1900 + timeinfo.tm_year, timeinfo.tm_mon + 1, timeinfo.tm_mday);
-        }
+        fillDateFromRtcOrNtp(savedDate, sizeof(savedDate));
+        nextResetTs = 0;
+        arr = doc.as<JsonArray>();
     }
-
-    JsonArray arr = doc.as<JsonArray>();
     cardCount = 0;
     for (JsonObject c : arr) {
         if (cardCount >= MAX_CARDS) break;
         strlcpy(cards[cardCount].uid, c["uid"] | "", sizeof(cards[0].uid));
         cards[cardCount].limit = (uint8_t)(c["daily_limit"] | 0);
+        cards[cardCount].mode  = parseLimitMode(String((const char*)(c["daily_limit_mode"] | "enforce")));
         cards[cardCount].used  = (uint8_t)(c["used_today"]  | 0);
         cardCount++;
     }
 
     saveCards();
-    Serial.printf("[CARDS] Descarga OK: %d tarjetas (fecha: %s)\n", cardCount, savedDate);
+    Serial.printf("[CARDS] Descarga OK: %d tarjetas (fecha: %s, next_reset_at=%lu)\n",
+                  cardCount, savedDate, (unsigned long)nextResetTs);
 }
 
 
@@ -535,23 +629,33 @@ void downloadCards() {
 //  OFFLINE: reset diario de contadores de uso
 // ══════════════════════════════════════════════════════
 void checkMidnightReset() {
-    char today[11] = "";
+    if (nextResetTs > 0) {
+        uint32_t nowTs = getCurrentTs();
+        if (nowTs < nextResetTs) return;
 
-    if (rtcAvailable) {
-        DateTime now = rtc.now();
-        snprintf(today, sizeof(today), "%04d-%02d-%02d",
-                 now.year(), now.month(), now.day());
-    } else {
-        struct tm timeinfo;
-        if (!getLocalTime(&timeinfo)) return;
-        snprintf(today, sizeof(today), "%04d-%02d-%02d",
-                 1900 + timeinfo.tm_year, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+        char newDate[11] = "";
+        bool advanced = false;
+        while (nextResetTs > 0 && nowTs >= nextResetTs) {
+            char tmpDate[11] = "";
+            if (!advanceDateByOneDay(savedDate, tmpDate, sizeof(tmpDate))) break;
+            strlcpy(newDate, tmpDate, sizeof(newDate));
+            strlcpy(savedDate, tmpDate, sizeof(savedDate));
+            nextResetTs += 86400UL;
+            advanced = true;
+        }
+        if (!advanced) return;
+
+        Serial.printf("[RTC] Nuevo dia operativo — reseteando contadores (fecha=%s)\n", savedDate);
+        for (int i = 0; i < cardCount; i++) cards[i].used = 0;
+        cardsDirty = true;
+        return;
     }
 
+    char today[11] = "";
+    if (!fillDateFromRtcOrNtp(today, sizeof(today))) return;
     if (strlen(savedDate) == 0 || strcmp(today, savedDate) == 0) return;
 
-    // Día nuevo detectado → resetear contadores de uso
-    Serial.printf("[RTC] Nuevo dia: %s → %s — reseteando contadores\n", savedDate, today);
+    Serial.printf("[RTC] Nuevo dia local: %s → %s — reseteando contadores\n", savedDate, today);
     strlcpy(savedDate, today, sizeof(savedDate));
     for (int i = 0; i < cardCount; i++) cards[i].used = 0;
     cardsDirty = true;
@@ -561,87 +665,353 @@ void checkMidnightReset() {
 // ══════════════════════════════════════════════════════
 //  PORTAL WIFI CAUTIVO
 // ══════════════════════════════════════════════════════
+String jsonEscape(const String& value) {
+    String out;
+    out.reserve(value.length() + 8);
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value.charAt(i);
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            case '\r': break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+String htmlEscape(const String& value) {
+    String out;
+    out.reserve(value.length() + 8);
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value.charAt(i);
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '\"': out += "&quot;"; break;
+            case '\'': out += "&#39;"; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+String buildPortalReplyJson(bool ok, const String& stage, const String& message, const String& extra = "") {
+    String json = "{\"ok\":";
+    json += ok ? "true" : "false";
+    json += ",\"stage\":\"";
+    json += jsonEscape(stage);
+    json += "\",\"message\":\"";
+    json += jsonEscape(message);
+    json += "\"";
+    if (extra.length() > 0) {
+        json += ",\"extra\":\"";
+        json += jsonEscape(extra);
+        json += "\"";
+    }
+    json += "}";
+    return json;
+}
+
+String testPortalConnection(const String& rawSsid, const String& rawPass, const String& rawUrl) {
+    String ssid = rawSsid;
+    String pass = rawPass;
+    String url = rawUrl;
+    ssid.trim();
+    url = normalizeBackendUrl(url);
+
+    if (ssid.length() == 0) {
+        return buildPortalReplyJson(false, "validation", "El SSID es obligatorio.");
+    }
+
+    if (String(DEPLOYMENT_MODE) == "saas" || url.length() == 0) {
+        url = String(BACKEND_URL);
+    }
+
+    if (!hasHttpScheme(url)) {
+        return buildPortalReplyJson(false, "validation", "La URL debe comenzar con http:// o https://.");
+    }
+
+    WiFi.disconnect();
+    delay(150);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    unsigned long started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 12000) {
+        delay(250);
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect();
+        return buildPortalReplyJson(false, "wifi", "No se pudo conectar a esa red WiFi. Revisá SSID y contraseña.");
+    }
+
+    String ip = WiFi.localIP().toString();
+    String healthUrl = url + "/health";
+    WiFiClient client;
+    HTTPClient http;
+    bool backendOk = false;
+    int code = -1;
+
+    if (http.begin(client, healthUrl)) {
+        http.setTimeout(5000);
+        code = http.GET();
+        backendOk = (code == 200);
+        http.end();
+    }
+
+    WiFi.disconnect();
+    delay(150);
+
+    if (!backendOk) {
+        String detail = "WiFi OK (" + ip + "), pero el backend no respondió en /health.";
+        if (code > 0) {
+            detail += " HTTP ";
+            detail += String(code);
+            detail += ".";
+        }
+        return buildPortalReplyJson(false, "backend", detail, url);
+    }
+
+    return buildPortalReplyJson(true, "ok", "Conexión exitosa. WiFi y backend accesibles.", ip);
+}
+
+String buildWifiScanJson() {
+    const int MAX_RESULTS = 20;
+    String ssids[MAX_RESULTS];
+    int rssis[MAX_RESULTS];
+    bool secured[MAX_RESULTS];
+    int uniqueCount = 0;
+
+    int count = WiFi.scanNetworks(false, true);
+    if (count <= 0) {
+        WiFi.scanDelete();
+        return "[]";
+    }
+
+    for (int i = 0; i < count; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) {
+            continue;
+        }
+
+        int existing = -1;
+        for (int j = 0; j < uniqueCount; j++) {
+            if (ssids[j] == ssid) {
+                existing = j;
+                break;
+            }
+        }
+
+        int rssi = WiFi.RSSI(i);
+        bool secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+
+        if (existing >= 0) {
+            if (rssi > rssis[existing]) {
+                rssis[existing] = rssi;
+                secured[existing] = secure;
+            }
+            continue;
+        }
+
+        if (uniqueCount >= MAX_RESULTS) {
+            continue;
+        }
+
+        ssids[uniqueCount] = ssid;
+        rssis[uniqueCount] = rssi;
+        secured[uniqueCount] = secure;
+        uniqueCount++;
+    }
+
+    for (int i = 0; i < uniqueCount - 1; i++) {
+        for (int j = i + 1; j < uniqueCount; j++) {
+            if (rssis[j] > rssis[i]) {
+                String ssidTmp = ssids[i];
+                int rssiTmp = rssis[i];
+                bool secureTmp = secured[i];
+                ssids[i] = ssids[j];
+                rssis[i] = rssis[j];
+                secured[i] = secured[j];
+                ssids[j] = ssidTmp;
+                rssis[j] = rssiTmp;
+                secured[j] = secureTmp;
+            }
+        }
+    }
+
+    String json = "[";
+    for (int i = 0; i < uniqueCount; i++) {
+        if (i > 0) {
+            json += ",";
+        }
+        json += "{\"ssid\":\"";
+        json += jsonEscape(ssids[i]);
+        json += "\",\"rssi\":";
+        json += String(rssis[i]);
+        json += ",\"secure\":";
+        json += secured[i] ? "true" : "false";
+        json += "}";
+    }
+    json += "]";
+    WiFi.scanDelete();
+    return json;
+}
+
 String buildPortalHTML() {
+    String ssidValue = htmlEscape(wifiSSID);
+    String passValue = htmlEscape(wifiPass);
+    String urlValue = htmlEscape(backendBase);
     String html = F("<!DOCTYPE html><html lang='es'>"
         "<head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>CoffeeControl</title>"
         "<style>"
+        ":root{--bg:#FCFCFA;--bg2:#F5F7FA;--panel:#FFFFFF;--tx:#243241;--tx2:#5D6C79;--tx3:#7B8792;--br:#D6DFE7;--brm:#C5CFD8;--pri:#185FA5;--pri2:#114A82;--soft:#E8F1FB;--ok:#E8F3E2;--oktx:#315C1D;--err:#F9E6E5;--errtx:#8A2A2A;--shadow:0 18px 44px rgba(17,74,130,.16);}"
         "*{box-sizing:border-box;margin:0;padding:0;}"
-        "body{font-family:-apple-system,sans-serif;background:#f5f5f3;min-height:100vh;"
-              "display:flex;align-items:center;justify-content:center;padding:20px;}"
-        ".card{background:#fff;border-radius:12px;padding:28px;width:100%;max-width:360px;"
-              "border:1px solid rgba(0,0,0,.1);}"
-        "h1{font-size:18px;font-weight:500;margin-bottom:4px;}"
-        ".sub{font-size:13px;color:#888;margin-bottom:22px;}"
-        "label{font-size:12px;color:#666;display:block;margin-bottom:4px;}"
-        "input{width:100%;border:1px solid #ccc;border-radius:8px;padding:9px 10px;"
-              "font-size:14px;margin-bottom:14px;}"
-        "input:focus{outline:2px solid #185FA5;border-color:transparent;}"
-        ".info{font-size:11px;color:#aaa;margin-bottom:16px;padding:8px 10px;"
-              "background:#f9f9f7;border-radius:6px;font-family:monospace;}"
-        ".step{font-size:11px;color:#185FA5;margin-bottom:20px;padding:8px 10px;"
-              "background:#e6f1fb;border-radius:6px;}"
-        "button{width:100%;padding:11px;background:#185FA5;color:#fff;border:none;"
-               "border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;}"
-        ".ok{display:none;background:#eaf3de;color:#27500a;border-radius:8px;"
-            "padding:12px;font-size:13px;text-align:center;margin-top:14px;}"
-        ".err{display:none;background:#fcebeb;color:#791f1f;border-radius:8px;"
-             "padding:10px;font-size:13px;margin-bottom:12px;}"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at top left,#F7FAFD 0,#F7FAFD 34%,#EEF3F8 100%);color:var(--tx);min-height:100vh;padding:22px;}"
+        ".shell{width:100%;max-width:440px;margin:0 auto;}"
+        ".hero{background:linear-gradient(135deg,#FFFFFF 0,#F5F8FB 100%);border:1px solid rgba(24,95,165,.12);border-radius:22px;padding:20px 20px 16px;box-shadow:var(--shadow);margin-bottom:14px;}"
+        ".hero-top{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;}"
+        ".brand-lockup{width:100%;display:flex;justify-content:center;}"
+        ".brand-svg{display:block;width:100%;max-width:380px;height:auto;}"
+        ".eyebrow{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--pri);font-weight:700;margin-bottom:4px;}"
+        "h1{font-size:24px;line-height:1.05;font-weight:650;margin-bottom:5px;}"
+        ".sub{font-size:13px;color:var(--tx2);line-height:1.45;}"
+        ".hero-note{margin-top:10px;background:var(--soft);color:var(--pri2);border-radius:14px;padding:12px 14px;font-size:12px;line-height:1.45;border:1px solid rgba(24,95,165,.08);}"
+        ".card{background:var(--panel);border:1px solid var(--br);border-radius:22px;padding:22px 20px;box-shadow:var(--shadow);}"
+        ".section{margin-bottom:18px;}"
+        ".section:last-of-type{margin-bottom:16px;}"
+        ".section-title{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--tx3);margin-bottom:10px;}"
+        "label{font-size:12px;color:var(--tx2);display:block;margin-bottom:5px;font-weight:600;}"
+        "input{width:100%;border:1px solid var(--brm);border-radius:12px;padding:11px 12px;font-size:14px;color:var(--tx);background:var(--bg);margin-bottom:12px;}"
+        "input:focus{outline:2px solid rgba(24,95,165,.18);border-color:var(--pri);}"
+        ".hint{font-size:11px;color:var(--tx3);margin-top:-6px;margin-bottom:12px;line-height:1.45;}"
+        ".pw-row{display:flex;align-items:center;gap:7px;margin-top:-4px;margin-bottom:12px;font-size:12px;color:var(--tx2);}"
+        ".pw-row input{width:auto;margin:0;padding:0;accent-color:var(--pri);}"
+        ".ghost{width:100%;padding:11px 12px;background:var(--bg2);color:var(--tx);border:1px solid var(--brm);border-radius:12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:10px;}"
+        ".ghost:disabled{opacity:.68;cursor:wait;}"
+        ".scan-status{display:none;font-size:12px;color:var(--tx2);background:var(--bg2);border-radius:12px;padding:10px 12px;margin-bottom:10px;line-height:1.45;border:1px solid var(--br);}"
+        ".selected-net{display:none;align-items:flex-start;gap:10px;background:var(--soft);border:1px solid rgba(24,95,165,.14);border-radius:14px;padding:12px 13px;margin-bottom:10px;}"
+        ".selected-dot{width:10px;height:10px;border-radius:50%;background:var(--pri);margin-top:5px;flex-shrink:0;box-shadow:0 0 0 4px rgba(24,95,165,.12);}"
+        ".selected-kicker{font-size:11px;color:var(--pri2);text-transform:uppercase;letter-spacing:.08em;font-weight:700;}"
+        ".selected-name{font-size:14px;font-weight:700;color:var(--tx);margin-top:3px;word-break:break-word;}"
+        ".scan-list{display:none;max-height:220px;overflow:auto;margin-bottom:12px;padding-right:2px;}"
+        ".net-btn{width:100%;text-align:left;padding:12px 13px;background:#fff;color:var(--tx);border:1px solid var(--br);border-radius:14px;font-size:13px;cursor:pointer;margin-bottom:8px;transition:transform .12s ease,border-color .12s ease,box-shadow .12s ease,background .12s ease;}"
+        ".net-btn strong{display:block;font-size:13px;font-weight:700;}"
+        ".net-meta{display:block;font-size:11px;color:var(--tx3);margin-top:4px;}"
+        ".net-btn.is-active{border-color:var(--pri);background:var(--soft);box-shadow:0 0 0 3px rgba(24,95,165,.1);transform:translateY(-1px);}"
+        ".status{display:none;font-size:12px;color:var(--pri2);background:var(--soft);border-radius:14px;padding:11px 12px;margin-bottom:12px;line-height:1.45;border:1px solid rgba(24,95,165,.1);}"
+        ".info{font-size:11px;color:var(--tx3);margin-bottom:16px;padding:10px 12px;background:var(--bg2);border-radius:12px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;border:1px solid var(--br);line-height:1.45;}"
+        ".actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:6px;}"
+        "button{width:100%;padding:12px 13px;background:var(--pri);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:650;cursor:pointer;}"
+        ".ok{display:none;background:var(--ok);color:var(--oktx);border-radius:14px;padding:12px 13px;font-size:13px;text-align:center;margin-top:14px;line-height:1.45;}"
+        ".err{display:none;background:var(--err);color:var(--errtx);border-radius:14px;padding:11px 12px;font-size:13px;margin-bottom:12px;line-height:1.45;}"
+        "@media(max-width:420px){body{padding:16px;}.hero,.card{border-radius:18px;padding:18px 16px;}.actions{grid-template-columns:1fr;}}"
         "</style></head>"
-        "<body><div class='card'>"
-        "<h1>CoffeeControl</h1>"
-        "<div class='sub'>Configuracion de red</div>"
-        "<div class='step'>Ingresa los datos del WiFi de la empresa. "
-             "La maquina se conectara automaticamente.</div>"
+        "<body><div class='shell'>"
+        "<div class='hero'>"
+        "<div class='hero-top'>"
+        "<div class='brand-lockup'>"
+        "<svg class='brand-svg' width='1200' height='430' viewBox='0 0 1200 430' xmlns='http://www.w3.org/2000/svg' aria-label='SmartQ CoffeeControl'>"
+        "<g transform='translate(50,60)'>"
+        "<rect x='0' y='0' width='200' height='200' rx='50' fill='#1da1d8'/>"
+        "<text x='100' y='110' text-anchor='middle' dominant-baseline='middle' font-family='Arial, sans-serif' font-size='120' font-weight='bold' fill='white'>Q</text>"
+        "</g>"
+        "<text x='300' y='172' font-family='Arial, sans-serif' font-size='110' fill='#3a3f45'>Smart<tspan fill='#1da1d8'>Q</tspan></text>"
+        "<line x1='300' y1='202' x2='950' y2='202' stroke='#1da1d8' stroke-width='4'/>"
+        "<text x='300' y='262' font-family='Arial, sans-serif' font-size='50' fill='#6b6f75'>Vending m&#225;s inteligente</text>"
+        "<text x='50' y='340' font-family='Arial, sans-serif' font-size='32' font-weight='bold' fill='#1da1d8' letter-spacing='3'>PORTAL DE INSTALACI&#211;N</text>"
+        "<text x='50' y='398' font-family='Arial, sans-serif' font-size='68' font-weight='bold' fill='#243241'>CoffeeControl</text>"
+        "</svg>"
+        "</div>"
+        "</div>"
+        "<div class='hero-note'>Podes escanear redes visibles, validar la conexion antes de guardar y volver a este portal con BOOT sin borrar la configuracion actual.</div>"
+        "</div>"
+        "<div class='card'>"
         "<div class='err' id='err'></div>"
+        "<div class='status' id='status'></div>"
         "<form id='f'>"
+        "<div class='section'>"
+        "<div class='section-title'>Conexion WiFi</div>"
         "<label>Red WiFi (SSID) *</label>"
-        "<input type='text' name='ssid' placeholder='NombreDeLaRed' required autocomplete='off'>"
+        "<input type='text' name='ssid' id='ssidInput' placeholder='NombreDeLaRed' required autocomplete='off' value='");
+    html += ssidValue;
+    html += F("'>"
+        "<div class='hint'>Podes escribir el SSID manualmente o elegir una red detectada.</div>"
+        "<button type='button' class='ghost' id='scanBtn'>Escanear redes</button>"
+        "<div class='scan-status' id='scanStatus'></div>"
+        "<div class='selected-net' id='selectedNet'><div class='selected-dot'></div><div><div class='selected-kicker' id='selectedNetMode'>Red lista para guardar</div><div class='selected-name' id='selectedNetName'></div></div></div>"
+        "<div class='scan-list' id='scanList'></div>"
         "<label>Contrasena WiFi</label>"
-        "<input type='password' name='pass' autocomplete='off'>");
+        "<input type='password' name='pass' id='wifiPass' autocomplete='off' value='");
+    html += passValue;
+    html += F("'>"
+        "<label class='pw-row'><input type='checkbox' id='showPass'><span>Mostrar contrasena</span></label>"
+        "<div class='hint'>Las credenciales guardadas no se borran hasta que guardes nuevos cambios.</div>"
+        "</div>");
 
     if (String(DEPLOYMENT_MODE) != "saas") {
-        html += F("<label>URL del servidor *</label>"
-                  "<input type='text' name='url' placeholder='http://192.168.1.50:3000' "
-                  "required autocomplete='off'>"
-                  "<div style='font-size:11px;color:#aaa;margin-top:-10px;margin-bottom:14px'>"
-                  "Consultá al admin si no conoces la URL.</div>");
+        html += F("<div class='section'>"
+                  "<div class='section-title'>Servidor</div>"
+                  "<label>URL del servidor *</label>"
+                  "<input type='text' name='url' placeholder='http://192.168.1.50:3000' required autocomplete='off' value='");
+        html += urlValue;
+        html += F("'>"
+                  "<div class='hint'>Usa la direccion del backend donde corre CoffeeControl.</div>"
+                  "</div>");
     }
 
     html += F("<div class='info' id='mac'>Cargando ID...</div>"
-              "<button type='submit'>Guardar y conectar</button>"
+              "<div class='actions'>"
+              "<button type='button' class='ghost' id='testBtn'>Probar conexion</button>"
+              "<button type='submit' id='saveBtn'>Guardar y conectar</button>"
+              "</div>"
               "</form>"
-              "<div class='ok' id='ok'>Listo. La maquina se conectara en unos segundos "
-              "y aparecera en el panel de administracion.</div>"
+              "<div class='ok' id='ok'>Listo. La maquina se conectara en unos segundos y aparecera en el panel de administracion.</div>"
+              "</div>"
               "</div>"
               "<script>"
               "fetch('/info').then(r=>r.json()).then(d=>{"
-              "  document.getElementById('mac').textContent="
-              "    'ID: '+d.mac+' | FW: '+d.fw;"
+              "  document.getElementById('mac').textContent='ID: '+d.mac+' | FW: '+d.fw+' | Modo: '+d.mode;"
               "});"
-              "document.getElementById('f').onsubmit=function(e){"
-              "  e.preventDefault();"
-              "  const d=new FormData(this);"
-              "  const ssid=d.get('ssid');"
-              "  if(!ssid){"
-              "    document.getElementById('err').textContent='El SSID es requerido';"
-              "    document.getElementById('err').style.display='block';return;"
-              "  }"
-              "  fetch('/save',{method:'POST',"
-              "    headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-              "    body:'ssid='+encodeURIComponent(ssid)"
-              "        +'&pass='+encodeURIComponent(d.get('pass')||'')"
-              "        +'&url='+encodeURIComponent(d.get('url')||'')"
-              "  }).then(r=>{"
-              "    if(r.ok){"
-              "      document.getElementById('ok').style.display='block';"
-              "      document.getElementById('f').style.display='none';"
-              "    } else {"
-              "      document.getElementById('err').textContent='Error al guardar';"
-              "      document.getElementById('err').style.display='block';"
-              "    }"
-              "  });"
-              "};"
+              "const ssidInput=document.getElementById('ssidInput');"
+              "const scanBtn=document.getElementById('scanBtn');"
+              "const scanStatus=document.getElementById('scanStatus');"
+              "const scanList=document.getElementById('scanList');"
+              "const selectedNet=document.getElementById('selectedNet');"
+              "const selectedNetMode=document.getElementById('selectedNetMode');"
+              "const selectedNetName=document.getElementById('selectedNetName');"
+              "const form=document.getElementById('f');"
+              "const errBox=document.getElementById('err');"
+              "const okBox=document.getElementById('ok');"
+              "const statusBox=document.getElementById('status');"
+              "const testBtn=document.getElementById('testBtn');"
+              "const saveBtn=document.getElementById('saveBtn');"
+              "const urlInput=form.querySelector('[name=url]');"
+              "let selectedSSID='';"
+              "function clearAlerts(){errBox.style.display='none';okBox.style.display='none';}"
+              "function showError(text){statusBox.style.display='none';okBox.style.display='none';errBox.textContent=text;errBox.style.display='block';}"
+              "function showOk(text){errBox.style.display='none';statusBox.style.display='none';okBox.textContent=text;okBox.style.display='block';}"
+              "function showStatus(text){errBox.style.display='none';statusBox.textContent=text;statusBox.style.display='block';}"
+              "function setBusy(mode){const busy=!!mode;scanBtn.disabled=busy;testBtn.disabled=busy;saveBtn.disabled=busy;scanBtn.textContent=mode==='scan'?'Escaneando...':'Escanear redes';testBtn.textContent=mode==='test'?'Probando...':'Probar conexion';saveBtn.textContent=mode==='save'?'Guardando...':'Guardar y conectar';}"
+              "function readForm(){const d=new FormData(form);const ssid=(d.get('ssid')||'').trim();const pass=d.get('pass')||'';const url=urlInput?(d.get('url')||'').trim():'';return {ssid,pass,url};}"
+              "function validateForm(){const data=readForm();if(!data.ssid){showError('El SSID es requerido.');return null;}if(urlInput&&!data.url){showError('La URL del servidor es requerida.');return null;}if(urlInput&&!/^https?:\\/\\//i.test(data.url)){showError('La URL debe comenzar con http:// o https://.');return null;}return data;}"
+              "function showScanStatus(text){scanStatus.textContent=text;scanStatus.style.display='block';}"
+              "function markSelectedButton(){scanList.querySelectorAll('.net-btn').forEach(btn=>{btn.classList.toggle('is-active',selectedSSID&&btn.dataset.ssid===selectedSSID);});}"
+              "function updateSelectedNet(ssid,modeText){if(!ssid){selectedNet.style.display='none';selectedNetName.textContent='';return;}selectedNet.style.display='flex';selectedNetMode.textContent=modeText;selectedNetName.textContent=ssid;}"
+              "function syncTypedSSID(){const current=ssidInput.value.trim();if(!current){selectedSSID='';markSelectedButton();updateSelectedNet('','');return;}if(current!==selectedSSID){selectedSSID='';markSelectedButton();updateSelectedNet(current,'SSID manual listo para guardar');}}"
+              "function renderNetworks(items){scanList.innerHTML='';if(!items.length){scanList.style.display='none';showScanStatus('No se encontraron redes visibles. Podes cargar el SSID manualmente.');syncTypedSSID();return;}showScanStatus('Toca una red para seleccionarla claramente o escribe una red oculta manualmente.');scanList.style.display='block';items.forEach(net=>{const btn=document.createElement('button');btn.type='button';btn.className='net-btn';btn.dataset.ssid=net.ssid;const name=document.createElement('strong');name.textContent=net.ssid;const meta=document.createElement('span');meta.className='net-meta';meta.textContent=(net.secure?'Contrasena requerida':'Red abierta')+' | Senal '+net.rssi+' dBm';btn.appendChild(name);btn.appendChild(meta);btn.onclick=function(){selectedSSID=net.ssid;ssidInput.value=net.ssid;updateSelectedNet(net.ssid,'Red detectada seleccionada');markSelectedButton();document.getElementById('wifiPass').focus();};scanList.appendChild(btn);});if(selectedSSID){markSelectedButton();}else{syncTypedSSID();}}"
+              "function scanNetworks(){setBusy('scan');scanList.style.display='none';showScanStatus('Buscando redes WiFi cercanas...');fetch('/scan',{cache:'no-store'}).then(r=>{if(!r.ok) throw new Error('scan');return r.json();}).then(renderNetworks).catch(()=>{showScanStatus('No se pudo completar el escaneo. Podes cargar el SSID manualmente.');}).finally(()=>{setBusy('');});}"
+              "scanBtn.addEventListener('click',scanNetworks);"
+              "ssidInput.addEventListener('input',syncTypedSSID);"
+              "testBtn.addEventListener('click',function(){const data=validateForm();if(!data) return;clearAlerts();showStatus('Probando conexion WiFi y backend...');setBusy('test');fetch('/test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(data.ssid)+'&pass='+encodeURIComponent(data.pass)+'&url='+encodeURIComponent(data.url)}).then(async r=>{const payload=await r.json().catch(()=>null);if(!payload) throw new Error('json');if(payload.ok){let msg=payload.message;if(payload.extra){msg+=' '+payload.extra;}showOk(msg);}else{let msg=payload.message||'No se pudo completar la prueba.';if(payload.extra){msg+=' '+payload.extra;}showError(msg);}}).catch(()=>{showError('No se pudo ejecutar la prueba de conexion desde el portal.');}).finally(()=>{setBusy('');});});"
+              "document.getElementById('showPass').addEventListener('change',function(){document.getElementById('wifiPass').type=this.checked?'text':'password';});"
+              "document.getElementById('f').onsubmit=function(e){e.preventDefault();const data=validateForm();if(!data) return;clearAlerts();showStatus('Guardando configuracion y reiniciando la maquina...');setBusy('save');fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(data.ssid)+'&pass='+encodeURIComponent(data.pass)+'&url='+encodeURIComponent(data.url)}).then(async r=>{if(r.ok){showOk('Listo. La maquina se conectara en unos segundos y aparecera en el panel de administracion.');document.getElementById('status').style.display='none';form.style.display='none';}else{const text=await r.text().catch(()=>'Error al guardar');showError(text||'Error al guardar');}}).catch(()=>{showError('No se pudo guardar la configuracion desde el portal.');}).finally(()=>{if(form.style.display!=='none'){setBusy('');}});};"
+              "syncTypedSSID();"
               "</script></body></html>");
     return html;
 }
@@ -650,7 +1020,7 @@ void startPortal() {
     portalMode = true;
     Serial.println("[PORTAL] Iniciando AP y portal de configuracion...");
 
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID);
 
     IPAddress ip(192, 168, 4, 1);
@@ -672,6 +1042,22 @@ void startPortal() {
         portalServer.send(200, "application/json", json);
     });
 
+    portalServer.on("/scan", HTTP_GET, []() {
+        Serial.println("[PORTAL] Escaneando redes WiFi...");
+        String json = buildWifiScanJson();
+        portalServer.sendHeader("Cache-Control", "no-store");
+        portalServer.send(200, "application/json", json);
+    });
+
+    portalServer.on("/test", HTTP_POST, []() {
+        String ssid = portalServer.arg("ssid");
+        String pass = portalServer.arg("pass");
+        String url  = portalServer.arg("url");
+        String json = testPortalConnection(ssid, pass, url);
+        portalServer.sendHeader("Cache-Control", "no-store");
+        portalServer.send(200, "application/json", json);
+    });
+
     // Captive portal detection — iOS, Android, Windows
     auto redirect = []() {
         portalServer.sendHeader("Location", "http://" AP_IP_STR, true);
@@ -688,13 +1074,23 @@ void startPortal() {
         String ssid = portalServer.arg("ssid");
         String pass = portalServer.arg("pass");
         String url  = portalServer.arg("url");
+        ssid.trim();
+        url = normalizeBackendUrl(url);
 
         if (ssid.length() == 0) {
             portalServer.send(400, "text/plain", "ssid requerido");
             return;
         }
+        if (String(DEPLOYMENT_MODE) != "saas" && url.length() == 0) {
+            portalServer.send(400, "text/plain", "url requerida");
+            return;
+        }
         if (String(DEPLOYMENT_MODE) == "saas" || url.length() == 0) {
             url = String(BACKEND_URL);
+        }
+        if (!hasHttpScheme(url)) {
+            portalServer.send(400, "text/plain", "url invalida: debe comenzar con http:// o https://");
+            return;
         }
 
         saveConfig(ssid, pass, url);
@@ -757,6 +1153,7 @@ bool connectWiFi() {
 bool checkBackend() {
     if (WiFi.status() != WL_CONNECTED) {
         backendReady = false;
+        backendLastError = "WiFi desconectado";
         return false;
     }
     String url = backendBase + "/health";
@@ -766,6 +1163,7 @@ bool checkBackend() {
     if (!http.begin(client, url)) {
         Serial.println("[BACKEND] http.begin() fallo — URL invalida?");
         backendReady = false;
+        backendLastError = "URL backend invalida o inaccesible";
         return false;
     }
     http.setTimeout(HTTP_TIMEOUT_MS);
@@ -774,6 +1172,13 @@ bool checkBackend() {
     Serial.printf("[BACKEND] HTTP code: %d\n", code);
     bool ok = (code == 200);
     backendReady = ok;
+    if (ok) {
+        backendLastError = "";
+    } else if (code > 0) {
+        backendLastError = "HTTP " + String(code) + " en /health";
+    } else {
+        backendLastError = "Sin respuesta en /health";
+    }
     Serial.printf("[BACKEND] %s\n", ok ? "CONECTADO" : "SIN RESPUESTA");
     return ok;
 }
@@ -863,7 +1268,19 @@ void registerMachine() {
     http.addHeader("X-Registration-Secret", REGISTRATION_SECRET);
     http.setTimeout(HTTP_TIMEOUT_MS);
 
-    int code = http.POST("{\"mac\":\"" + macAddress + "\"}");
+    DynamicJsonDocument doc(512);
+    doc["mac"] = macAddress;
+    doc["wifi_ssid"] = wifiSSID;
+    doc["backend_url"] = backendBase;
+    doc["wifi_rssi"] = WiFi.RSSI();
+    doc["wifi_ip"] = WiFi.localIP().toString();
+    doc["backend_ok"] = backendReady;
+    if (backendLastError.length() > 0) doc["backend_error"] = backendLastError;
+    else                               doc["backend_error"] = nullptr;
+    String body;
+    serializeJson(doc, body);
+
+    int code = http.POST(body);
     http.end();
 
     if      (code == 200) Serial.println("[REG] OK — maquina APROBADA");
@@ -871,6 +1288,204 @@ void registerMachine() {
     else if (code == 401) Serial.println("[REG] ERROR 401 — REGISTRATION_SECRET incorrecto");
     else if (code <= 0)   Serial.printf("[REG] Sin respuesta (verificar URL: %s)\n", backendBase.c_str());
     else                  Serial.printf("[REG] HTTP %d\n", code);
+}
+
+bool canProcessRemoteCommand() {
+    return !pendingSession
+        && sessionUID.length() == 0
+        && mdbState != SESSION_IDLE
+        && mdbState != VEND_PENDING;
+}
+
+bool ackRemoteCommandJson(uint32_t commandId, const char* status, const String& resultJson) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    WiFiClient client;
+    HTTPClient http;
+    String url = backendBase + "/api/machine-control/commands/" + String(commandId) + "/ack";
+    if (!http.begin(client, url)) return false;
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Machine-Mac", macAddress);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    String body = "{\"status\":\"" + String(status) + "\",\"result\":" + resultJson + "}";
+    int code = http.POST(body);
+    http.end();
+
+    if (code == 200) return true;
+    Serial.printf("[REMOTE] ACK fallo para comando #%lu — HTTP %d\n",
+                  (unsigned long)commandId, code);
+    return false;
+}
+
+bool ackRemoteCommand(uint32_t commandId, const char* status, const String& message) {
+    DynamicJsonDocument resultDoc(192);
+    resultDoc["message"] = message;
+    String resultJson;
+    serializeJson(resultDoc, resultJson);
+    return ackRemoteCommandJson(commandId, status, resultJson);
+}
+
+bool handleRemoteWifiScan(uint32_t commandId) {
+    Serial.println("[REMOTE] Escaneando redes WiFi visibles...");
+
+    int found = WiFi.scanNetworks(false, true);
+    DynamicJsonDocument resultDoc(3072);
+    JsonArray networks = resultDoc.createNestedArray("networks");
+
+    if (found <= 0) {
+        resultDoc["message"] = "No se encontraron redes visibles.";
+        resultDoc["count"] = 0;
+        String resultJson;
+        serializeJson(resultDoc, resultJson);
+        return ackRemoteCommandJson(commandId, "completed", resultJson);
+    }
+
+    int added = 0;
+    for (int i = 0; i < found && added < 12; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) continue;
+
+        bool duplicated = false;
+        for (JsonObject existing : networks) {
+            if (ssid == String((const char*)existing["ssid"])) {
+                duplicated = true;
+                break;
+            }
+        }
+        if (duplicated) continue;
+
+        JsonObject net = networks.createNestedObject();
+        net["ssid"] = ssid;
+        net["rssi"] = WiFi.RSSI(i);
+        net["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        added++;
+    }
+
+    WiFi.scanDelete();
+    resultDoc["count"] = added;
+    resultDoc["message"] = String(added) + " red" + (added == 1 ? "" : "es") + " visible" + (added == 1 ? "" : "s") + " detectada" + (added == 1 ? "" : "s") + ".";
+
+    String resultJson;
+    serializeJson(resultDoc, resultJson);
+    return ackRemoteCommandJson(commandId, "completed", resultJson);
+}
+
+bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
+    const char* ssidValue = payload["ssid"] | "";
+    const char* passValue = payload["pass"] | "";
+    const char* urlValue  = payload["url"]  | "";
+    bool preservePassword = payload["preserve_password"] | false;
+
+    String nextSSID = String(ssidValue);
+    String nextPass = String(passValue);
+    String nextUrl  = String(urlValue);
+
+    nextSSID.trim();
+    nextUrl = normalizeBackendUrl(nextUrl);
+    nextUrl.trim();
+
+    if (nextSSID.length() == 0) {
+        ackRemoteCommand(commandId, "failed", "SSID remoto requerido");
+        return true;
+    }
+    if (preservePassword && nextPass.length() == 0) {
+        nextPass = wifiPass;
+    }
+    if (nextUrl.length() == 0) {
+        nextUrl = backendBase;
+    } else if (!hasHttpScheme(nextUrl)) {
+        ackRemoteCommand(commandId, "failed", "URL backend remota invalida");
+        return true;
+    }
+
+    if (!ackRemoteCommand(commandId, "completed", "Configuracion WiFi guardada; reiniciando")) {
+        return false;
+    }
+
+    saveConfig(nextSSID, nextPass, nextUrl);
+    wifiSSID = nextSSID;
+    wifiPass = nextPass;
+    backendBase = nextUrl;
+
+    Serial.printf("[REMOTE] Nueva WiFi guardada: %s\n", nextSSID.c_str());
+    Serial.printf("[REMOTE] Backend conservado/actualizado: %s\n", backendBase.c_str());
+    ledBlink(4, 70);
+    delay(350);
+    ESP.restart();
+    return true;
+}
+
+void pollRemoteCommands() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (!canProcessRemoteCommand()) return;
+
+    WiFiClient client;
+    HTTPClient http;
+    String url = backendBase + "/api/machine-control/commands/next";
+    if (!http.begin(client, url)) return;
+
+    http.addHeader("X-Machine-Mac", macAddress);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    int code = http.GET();
+    if (code == 204) {
+        http.end();
+        return;
+    }
+    if (code != 200) {
+        if (code > 0) Serial.printf("[REMOTE] Poll comandos HTTP %d\n", code);
+        http.end();
+        return;
+    }
+
+    String body = http.getString();
+    http.end();
+
+    DynamicJsonDocument doc(768);
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        Serial.printf("[REMOTE] JSON invalido en comando: %s\n", err.c_str());
+        return;
+    }
+
+    JsonObject command = doc["command"];
+    if (command.isNull()) return;
+
+    uint32_t commandId = command["id"] | 0;
+    String commandType = command["type"] | "";
+    if (commandId == 0 || commandType.length() == 0) return;
+
+    Serial.printf("[REMOTE] Comando recibido #%lu: %s\n",
+                  (unsigned long)commandId, commandType.c_str());
+
+    if (commandType == "reboot") {
+        if (ackRemoteCommand(commandId, "completed", "Reinicio remoto aceptado por la maquina")) {
+            Serial.println("[REMOTE] Reiniciando por comando remoto...");
+            ledBlink(3, 80);
+            delay(250);
+            ESP.restart();
+        }
+        return;
+    }
+
+    if (commandType == "wifi_scan") {
+        handleRemoteWifiScan(commandId);
+        return;
+    }
+
+    if (commandType == "wifi_update") {
+        JsonObject payload = command["payload"].as<JsonObject>();
+        if (payload.isNull()) {
+            ackRemoteCommand(commandId, "failed", "Payload remoto invalido");
+            return;
+        }
+        handleRemoteWifiUpdate(commandId, payload);
+        return;
+    }
+
+    ackRemoteCommand(commandId, "failed", "Comando no soportado por este firmware");
 }
 
 
@@ -1167,10 +1782,10 @@ void setup() {
     delay(100);
 
     pinMode(PIN_LED, OUTPUT);
+    pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+    bootFeedbackPinsInit();
+    bootFeedbackOff();
     ledBlink(3, 100);
-
-    // Verificar botón BOOT ANTES de todo (reset config si se mantiene presionado)
-    checkResetButton();
 
     // MAC address (identificador único de la máquina)
     macAddress = WiFi.macAddress();
@@ -1212,14 +1827,14 @@ void setup() {
     byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
     if (ver == 0x00 || ver == 0xFF) {
         Serial.println("[NFC] ERROR — RC522 no responde");
-        Serial.println("[NFC]   SCK=GPIO0  MOSI=GPIO1  MISO=GPIO2  SS=GPIO3  RST=GPIO4");
+        Serial.println("[NFC]   SCK=GPIO0  MOSI=GPIO1  MISO=GPIO3  SS=GPIO4  RST=GPIO7");
     } else {
         Serial.printf("[NFC] RC522 OK — chip: 0x%02X\n", ver);
     }
 
     // MDB 9-bit software serial
     mdb.begin();
-    Serial.println("[MDB] 9-bit software serial listo (RX=GPIO5, TX=GPIO6)");
+    Serial.println("[MDB] 9-bit software serial listo (TX=GPIO20, RX=GPIO21)");
 
     // WiFi
     readConfig();
@@ -1233,6 +1848,7 @@ void setup() {
         } else {
             Serial.printf("[CFG] Backend: %s\n", backendBase.c_str());
 
+            checkBackend();
             registerMachine();
             reconcileTaps();    // Fix Bug 4: revertir taps huérfanos al reiniciar
             flushQueue();       // Enviar eventos offline pendientes
@@ -1263,6 +1879,8 @@ void setup() {
 //  LOOP
 // ══════════════════════════════════════════════════════
 void loop() {
+    handleResetButtonRuntime();
+
     if (portalMode) {
         dnsServer.processNextRequest();
         portalServer.handleClient();
@@ -1309,6 +1927,7 @@ void loop() {
             wifiReady = true;
             Serial.println("[WiFi] Reconectado");
             checkBackend();
+            registerMachine();
             flushQueue();
             downloadCards();
         }
@@ -1319,6 +1938,13 @@ void loop() {
     if (wifiReady && millis() - lastCardsRefresh > 600000) {
         lastCardsRefresh = millis();
         downloadCards();
+    }
+
+    // ── Poll de comandos remotos cada 15s ─────────────
+    static unsigned long lastCommandPoll = 0;
+    if (millis() - lastCommandPoll > COMMAND_POLL_MS) {
+        lastCommandPoll = millis();
+        pollRemoteCommands();
     }
 
     // ── Reset de contadores al detectar día nuevo ─────
@@ -1340,10 +1966,10 @@ void loop() {
     if (millis() - lastHeartbeat > 60000) {
         lastHeartbeat = millis();
         checkBackend();   // re-verificar backend en cada heartbeat
-        if (backendReady) registerMachine();  // actualiza last_seen para estado online/offline
+        registerMachine();  // actualiza last_seen y telemetría de red
         const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
         Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | RTC:%s\n",
-                      WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
+                     WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
                       backendReady ? "OK" : "OFFLINE",
                       stStr[mdbState], cardCount, queueLen,
                       rtcAvailable ? "DS3231" : "NTP");

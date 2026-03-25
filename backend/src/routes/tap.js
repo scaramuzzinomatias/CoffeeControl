@@ -4,8 +4,36 @@
 const express  = require('express');
 const pool     = require('../db/pool');
 const { broadcast } = require('../ws');
+const alerts = require('../services/alerts');
+const systemSettings = require('../services/systemSettings');
+const {
+    normalizeLimitMode,
+    isLimitReached,
+    shouldWarnAfterApproval
+} = require('../lib/dailyLimit');
+const {
+    formatBusinessDate,
+    buildBusinessDayRangeSql
+} = require('../lib/businessTime');
 
 const router = express.Router();
+
+function shouldMarkOverLimit({ dailyLimit, mode, tapsBefore }) {
+    const normalizedMode = normalizeLimitMode(mode);
+    const limit = parseInt(dailyLimit, 10);
+    const countBefore = parseInt(tapsBefore, 10);
+    return normalizedMode !== 'off'
+        && Number.isInteger(limit)
+        && limit > 0
+        && Number.isInteger(countBefore)
+        && countBefore >= limit;
+}
+
+function normalizedCardStatus(row) {
+    const status = String(row?.card_status || '').trim().toLowerCase();
+    if (['active', 'inactive', 'lost'].includes(status)) return status;
+    return row?.card_active ? 'active' : 'inactive';
+}
 
 // ══════════════════════════════════════════════════════
 //  POST /api/tap
@@ -25,10 +53,13 @@ router.post('/', async (req, res) => {
     try {
         // ── 1. Buscar la tarjeta NFC ────────────────────────
         const cardResult = await pool.query(
-            `SELECT nc.id, nc.employee_id, e.name, e.daily_limit, e.active
+            `SELECT nc.id, nc.employee_id, nc.active AS card_active,
+                    COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
+                    e.name, e.daily_limit, e.daily_limit_mode,
+                    e.warning_enabled, e.active
              FROM nfc_cards nc
              JOIN employees e ON e.id = nc.employee_id
-             WHERE nc.uid = $1 AND nc.active = true`,
+             WHERE nc.uid = $1`,
             [uid]
         );
 
@@ -39,7 +70,30 @@ router.post('/', async (req, res) => {
             return res.status(403).json({ error: 'Tarjeta no registrada', reason: 'card_unknown' });
         }
 
-        const { employee_id, name, daily_limit, active } = cardResult.rows[0];
+        const {
+            employee_id,
+            name,
+            card_active,
+            card_status,
+            daily_limit,
+            daily_limit_mode,
+            warning_enabled,
+            active
+        } = cardResult.rows[0];
+
+        const resolvedCardStatus = normalizedCardStatus({ card_active, card_status });
+
+        if (resolvedCardStatus === 'lost') {
+            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_lost' });
+            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, machine: machine.name, reason: 'card_lost' });
+            return res.status(403).json({ error: 'TAG reportado como perdido', reason: 'card_lost' });
+        }
+
+        if (!card_active || resolvedCardStatus !== 'active') {
+            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_inactive' });
+            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, machine: machine.name, reason: 'card_inactive' });
+            return res.status(403).json({ error: 'TAG desactivado', reason: 'card_inactive' });
+        }
 
         if (!active) {
             await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'inactive' });
@@ -47,50 +101,96 @@ router.post('/', async (req, res) => {
         }
 
         // ── 2. Contar consumo de hoy ─────────────────────────
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
         const countResult = await pool.query(
             `SELECT COUNT(*) AS taps_today
              FROM taps
              WHERE employee_id = $1
                AND approved    = true
-               AND tapped_at  >= CURRENT_DATE
-               AND tapped_at  <  CURRENT_DATE + INTERVAL '1 day'`,
-            [employee_id]
+               AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}`,
+            [employee_id, timeZone, businessDate]
         );
 
         const tapsToday = parseInt(countResult.rows[0].taps_today, 10);
 
         // ── 3. Verificar límite ──────────────────────────────
-        if (tapsToday >= daily_limit) {
+        if (isLimitReached({ dailyLimit: daily_limit, mode: daily_limit_mode, tapsToday })) {
             await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'limit_reached' });
 
             console.log(`[TAP] DENEGADO — ${name} (${tapsToday}/${daily_limit} hoy)`);
 
             // Notificar al dashboard en tiempo real
             broadcast({ event: 'tap_denied', uid, employee: name, employee_id, tapsToday, daily_limit, machine: machine.name });
+            alerts.notifyEmployeeDailyBlocked({
+                employeeId: employee_id,
+                employeeName: name,
+                dailyLimit: daily_limit,
+                tapsToday,
+                machineName: machine.name,
+                uid
+            }).catch(err => console.error('[ALERT] Error alerta empleado bloqueado:', err.message));
 
             return res.status(403).json({
                 error:       'Límite diario alcanzado',
                 reason:      'limit_reached',
                 employee:    name,
                 taps_today:  tapsToday,
-                daily_limit
+                daily_limit,
+                daily_limit_mode
             });
         }
 
         // ── 4. Aprobar ───────────────────────────────────────
-        const tapId = await logTap({ uid, machine, employeeId: employee_id, approved: true });
+        const tapId = await logTap({
+            uid,
+            machine,
+            employeeId: employee_id,
+            approved: true,
+            overLimit: shouldMarkOverLimit({
+                dailyLimit: daily_limit,
+                mode: daily_limit_mode,
+                tapsBefore: tapsToday
+            })
+        });
 
         console.log(`[TAP] APROBADO — ${name} (${tapsToday + 1}/${daily_limit} hoy)`);
 
+        const warningLead = await alerts.getEmployeeLimitWarningLead();
+        if (warning_enabled && shouldWarnAfterApproval({
+            dailyLimit: daily_limit,
+            mode: daily_limit_mode,
+            tapsBefore: tapsToday,
+            warningLead
+        })) {
+            alerts.notifyEmployeeLimitWarning({
+                employeeId: employee_id,
+                dailyLimit: daily_limit,
+                tapsToday: tapsToday + 1,
+                machineName: machine.name,
+                uid
+            }).catch(err => console.error('[ALERT] Error alerta de advertencia:', err.message));
+        }
+
         // Notificar al dashboard en tiempo real
-        broadcast({ event: 'tap_approved', uid, employee: name, employee_id, tapsToday: tapsToday + 1, daily_limit, machine: machine.name, tap_id: tapId });
+        broadcast({
+            event: 'tap_approved',
+            uid,
+            employee: name,
+            employee_id,
+            tapsToday: tapsToday + 1,
+            daily_limit,
+            daily_limit_mode,
+            machine: machine.name,
+            tap_id: tapId
+        });
 
         return res.status(200).json({
             approved:    true,
             employee:    name,
             tap_id:      tapId,
             taps_today:  tapsToday + 1,
-            daily_limit
+            daily_limit,
+            daily_limit_mode
         });
 
     } catch (err) {
@@ -186,26 +286,40 @@ router.post('/reconcile', async (req, res) => {
 // ══════════════════════════════════════════════════════
 //  GET /api/tap/cards
 //  El firmware ESP32-C3 descarga el cache de tarjetas para modo offline.
-//  Retorna: [ { uid, daily_limit, used_today }, ... ]
+//  Retorna: [ { uid, daily_limit, daily_limit_mode, used_today }, ... ]
 // ══════════════════════════════════════════════════════
 router.get('/cards', require('../middleware/machineAuth'), async (req, res) => {
     try {
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
         const result = await pool.query(
             `SELECT
                 nc.uid,
                 e.daily_limit,
+                e.daily_limit_mode,
                 COALESCE(COUNT(t.id) FILTER (
                     WHERE t.approved   = true
-                      AND t.tapped_at >= CURRENT_DATE
-                      AND t.tapped_at <  CURRENT_DATE + INTERVAL '1 day'
+                      AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
                 ), 0)::int AS used_today
              FROM nfc_cards nc
              JOIN employees e ON e.id = nc.employee_id
              LEFT JOIN taps t ON t.employee_id = nc.employee_id
-             WHERE nc.active = true AND e.active = true
-             GROUP BY nc.uid, e.daily_limit`
+             WHERE nc.active = true
+               AND COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) = 'active'
+               AND e.active = true
+             GROUP BY nc.uid, e.daily_limit, e.daily_limit_mode`
+            ,
+            [timeZone, businessDate]
         );
-        res.json(result.rows);
+        const resetResult = await pool.query(
+            `SELECT EXTRACT(EPOCH FROM ((($2::date + INTERVAL '1 day')::timestamp) AT TIME ZONE $1))::bigint AS next_reset_at`,
+            [timeZone, businessDate]
+        );
+        res.json({
+            date: businessDate,
+            business_timezone: timeZone,
+            next_reset_at: parseInt(resetResult.rows[0]?.next_reset_at || '0', 10) || 0,
+            cards: result.rows
+        });
     } catch (err) {
         console.error('[CARDS] Error:', err.message);
         res.status(500).json({ error: 'Error interno' });
@@ -234,6 +348,7 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
 
     let processed = 0;
     let errors    = 0;
+    const timeZone = await systemSettings.getBusinessTimeZone();
 
     for (const ev of events) {
         const { uid, item_id, amount, ok, ts } = ev;
@@ -246,10 +361,13 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
         try {
             // Buscar tarjeta y empleado
             const cardResult = await pool.query(
-                `SELECT nc.employee_id, e.daily_limit, e.active
+                `SELECT nc.employee_id, nc.active AS card_active,
+                        COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
+                        e.name, e.daily_limit, e.daily_limit_mode,
+                        e.warning_enabled, e.active
                  FROM nfc_cards nc
                  JOIN employees e ON e.id = nc.employee_id
-                 WHERE nc.uid = $1 AND nc.active = true`,
+                 WHERE nc.uid = $1`,
                 [upperUid]
             );
 
@@ -265,7 +383,40 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
                 continue;
             }
 
-            const { employee_id, daily_limit, active } = cardResult.rows[0];
+            const {
+                employee_id,
+                name,
+                card_active,
+                card_status,
+                daily_limit,
+                daily_limit_mode,
+                warning_enabled,
+                active
+            } = cardResult.rows[0];
+
+            const resolvedCardStatus = normalizedCardStatus({ card_active, card_status });
+
+            if (resolvedCardStatus === 'lost') {
+                await pool.query(
+                    `INSERT INTO taps
+                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
+                     VALUES ($1, $2, $3, false, 'card_lost', false, $4)`,
+                    [upperUid, machine.id, employee_id, tappedAt]
+                );
+                processed++;
+                continue;
+            }
+
+            if (!card_active || resolvedCardStatus !== 'active') {
+                await pool.query(
+                    `INSERT INTO taps
+                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
+                     VALUES ($1, $2, $3, false, 'card_inactive', false, $4)`,
+                    [upperUid, machine.id, employee_id, tappedAt]
+                );
+                processed++;
+                continue;
+            }
 
             if (!active || !ok) {
                 // Empleado inactivo o venta fallida → no cuenta contra el límite
@@ -282,23 +433,23 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
 
             // ok = true: café dispensado offline
             // Verificar si superó el límite: contar taps aprobados ese día ANTES de este evento
-            const dayStart = new Date(tappedAt);
-            dayStart.setUTCHours(0, 0, 0, 0);
-            const dayEnd = new Date(dayStart);
-            dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+            const businessDate = formatBusinessDate(tappedAt, timeZone);
 
             const countResult = await pool.query(
                 `SELECT COUNT(*) AS cnt
                  FROM taps
                  WHERE employee_id = $1
                    AND approved    = true
-                   AND tapped_at  >= $2
-                   AND tapped_at   < $3
+                   AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}
                    AND tapped_at   < $4`,
-                [employee_id, dayStart, dayEnd, tappedAt]
+                [employee_id, timeZone, businessDate, tappedAt]
             );
             const countBefore = parseInt(countResult.rows[0].cnt, 10);
-            const overLimit   = countBefore >= daily_limit;
+            const overLimit = shouldMarkOverLimit({
+                dailyLimit: daily_limit,
+                mode: daily_limit_mode,
+                tapsBefore: countBefore
+            });
 
             await pool.query(
                 `INSERT INTO taps
@@ -312,6 +463,23 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
             if (overLimit) {
                 console.log(`[QUEUE] over_limit: uid=${upperUid} (${countBefore}/${daily_limit} ese dia)`);
             }
+
+            const warningLead = await alerts.getEmployeeLimitWarningLead();
+            if (warning_enabled && shouldWarnAfterApproval({
+                dailyLimit: daily_limit,
+                mode: daily_limit_mode,
+                tapsBefore: countBefore,
+                warningLead
+            })) {
+                alerts.notifyEmployeeLimitWarning({
+                    employeeId: employee_id,
+                    dailyLimit: daily_limit,
+                    tapsToday: countBefore + 1,
+                    machineName: machine.name,
+                    uid: upperUid
+                }).catch(err => console.error(`[ALERT] Error alerta advertencia uid=${upperUid}:`, err.message));
+            }
+
             broadcast({ event: 'queue_event', machine: machine.name, uid: upperUid, over_limit: overLimit });
             processed++;
 
@@ -326,12 +494,12 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
 });
 
 // ── Helper: insertar registro en taps ────────────────
-async function logTap({ uid, machine, employeeId, approved, reason }) {
+async function logTap({ uid, machine, employeeId, approved, reason, overLimit = false }) {
     const result = await pool.query(
-        `INSERT INTO taps (nfc_uid, machine_id, employee_id, approved, deny_reason)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO taps (nfc_uid, machine_id, employee_id, approved, deny_reason, over_limit)
+         VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id`,
-        [uid, machine.id, employeeId || null, approved, reason || null]
+        [uid, machine.id, employeeId || null, approved, reason || null, overLimit]
     );
     return result.rows[0]?.id;
 }

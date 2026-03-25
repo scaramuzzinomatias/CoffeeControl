@@ -148,6 +148,7 @@
 
 <script>
 let BASE_URL  = localStorage.getItem('cc_url') || 'http://localhost:3000';
+let TOKEN     = localStorage.getItem('cc_token') || '';
 let ws        = null;
 let KC        = null;
 let employees = [];
@@ -169,6 +170,7 @@ setInterval(() => {
 
 function connect() {
   BASE_URL = document.getElementById('backendUrl').value.trim().replace(/\/$/,'');
+  TOKEN = localStorage.getItem('cc_token') || '';
   localStorage.setItem('cc_url', BASE_URL);
   hideError();
   loadAll();
@@ -181,7 +183,8 @@ async function loadAll() {
 
 function connectWS() {
   if(ws){ ws.close(); ws=null; }
-  const wsUrl = BASE_URL.replace(/^http/,'ws') + '/ws';
+  if(!TOKEN){ setWsStatus('error'); return; }
+  const wsUrl = BASE_URL.replace(/^http/,'ws') + '/ws?token=' + encodeURIComponent(TOKEN);
   setWsStatus('connecting');
   try { ws = new WebSocket(wsUrl); } catch(e){ setWsStatus('error'); return; }
   ws.onopen  = () => setWsStatus('connected');
@@ -211,7 +214,14 @@ function setWsStatus(s) {
 }
 
 async function api(path) {
-  const res = await fetch(BASE_URL+path);
+  TOKEN = localStorage.getItem('cc_token') || '';
+  const headers = {};
+  if(TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
+  const res = await fetch(BASE_URL+path,{headers});
+  if(res.status===401){
+    showError('Iniciá sesión en el panel administrativo para acceder a estos datos.');
+    throw new Error('HTTP 401');
+  }
   if(!res.ok) throw new Error('HTTP '+res.status);
   return res.json();
 }
