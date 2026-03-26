@@ -1,6 +1,7 @@
 const {
     isManagerRole,
     isTechnicalRole,
+    canManageMachineSetup,
     canOperateMachines,
     canViewAnalytics
 } = require('../lib/accessScope');
@@ -12,7 +13,12 @@ function requireManager(req, res, next) {
 
 function requireMachineOperator(req, res, next) {
     if (canOperateMachines(req.user?.role)) return next();
-    return res.status(403).json({ error: 'Acceso solo para gerente/admin/técnico' });
+    return res.status(403).json({ error: 'Acceso solo para gerente/admin/técnico/distribuidor' });
+}
+
+function requireMachineSetup(req, res, next) {
+    if (canManageMachineSetup(req.user?.role)) return next();
+    return res.status(403).json({ error: 'Acceso solo para gerente/admin/distribuidor' });
 }
 
 function requireAnalyticsViewer(req, res, next) {
@@ -25,5 +31,6 @@ module.exports = {
     isTechnicalRole,
     requireManager,
     requireMachineOperator,
+    requireMachineSetup,
     requireAnalyticsViewer,
 };

@@ -4,6 +4,7 @@ const pool    = require('../db/pool');
 const { requireManager } = require('../middleware/roleAccess');
 const { normalizeLimitMode } = require('../lib/dailyLimit');
 const { buildDepartmentScopeClause } = require('../lib/accessScope');
+const { normalizeAccessLevelId } = require('../lib/accessLevels');
 const audit = require('../services/audit');
 
 const router = express.Router();
@@ -52,6 +53,15 @@ function departmentExpr(column) {
     return `COALESCE(NULLIF(TRIM(${column}), ''), 'Sin área')`;
 }
 
+async function getAccessLevelById(id) {
+    return pool.query(
+        `SELECT id, code, name, active
+         FROM access_levels
+         WHERE id = $1`,
+        [id]
+    );
+}
+
 // GET /api/employees — listar todos con tarjetas NFC
 router.get('/', async (req, res) => {
     try {
@@ -64,16 +74,25 @@ router.get('/', async (req, res) => {
         });
         const result = await pool.query(
             `SELECT e.*,
+                al.code AS access_level_code,
+                al.name AS access_level_name,
+                al.description AS access_level_description,
+                al.active AS access_level_active,
+                COALESCE(al.daily_limit, e.daily_limit) AS effective_daily_limit,
+                COALESCE(al.daily_limit_mode, e.daily_limit_mode) AS effective_daily_limit_mode,
+                COALESCE(al.warning_enabled, e.warning_enabled) AS effective_warning_enabled,
+                CASE WHEN al.id IS NULL THEN 'manual' ELSE 'access_level' END AS policy_source,
                 COALESCE(
                     json_agg(json_build_object(
                         'id', nc.id, 'uid', nc.uid, 'label', nc.label, 'active', nc.active, 'status', COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END)
                     )) FILTER (WHERE nc.id IS NOT NULL), '[]'
                 ) AS nfc_cards
              FROM employees e
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              LEFT JOIN nfc_cards nc ON nc.employee_id = e.id
              WHERE e.active = true
                ${scope.sql}
-             GROUP BY e.id
+             GROUP BY e.id, al.id
              ORDER BY e.name`
             ,
             params
@@ -100,16 +119,25 @@ router.get('/:id', async (req, res) => {
         });
         const emp = await pool.query(
             `SELECT e.*,
+                al.code AS access_level_code,
+                al.name AS access_level_name,
+                al.description AS access_level_description,
+                al.active AS access_level_active,
+                COALESCE(al.daily_limit, e.daily_limit) AS effective_daily_limit,
+                COALESCE(al.daily_limit_mode, e.daily_limit_mode) AS effective_daily_limit_mode,
+                COALESCE(al.warning_enabled, e.warning_enabled) AS effective_warning_enabled,
+                CASE WHEN al.id IS NULL THEN 'manual' ELSE 'access_level' END AS policy_source,
                 COALESCE(
                     json_agg(json_build_object(
                         'id', nc.id, 'uid', nc.uid, 'label', nc.label, 'active', nc.active, 'status', COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END)
                     )) FILTER (WHERE nc.id IS NOT NULL), '[]'
                 ) AS nfc_cards
              FROM employees e
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              LEFT JOIN nfc_cards nc ON nc.employee_id = e.id
              WHERE e.id = $1
                ${scope.sql}
-             GROUP BY e.id`,
+             GROUP BY e.id, al.id`,
             params
         );
         if (emp.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
@@ -148,7 +176,7 @@ router.get('/:id', async (req, res) => {
 
 // POST /api/employees — crear empleado
 router.post('/', requireManager, async (req, res) => {
-    const { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled } = req.body;
+    const { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id } = req.body;
     if (!name) return res.status(400).json({ error: 'name requerido' });
 
     try {
@@ -156,10 +184,19 @@ router.post('/', requireManager, async (req, res) => {
         const limitMode = normalizeLimitMode(daily_limit_mode);
         const warningEnabledValue = normalizeOptionalBoolean(warning_enabled);
         const warningEnabled = warningEnabledValue === null ? true : warningEnabledValue;
+        const accessLevelId = normalizeAccessLevelId(access_level_id, { allowNull: true });
+        let accessLevel = null;
+        if (accessLevelId !== null) {
+            const accessLevelResult = await getAccessLevelById(accessLevelId);
+            if (accessLevelResult.rowCount === 0) {
+                return res.status(400).json({ error: 'Nivel de acceso inválido' });
+            }
+            accessLevel = accessLevelResult.rows[0];
+        }
         const result = await pool.query(
             `INSERT INTO employees
-                (name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              RETURNING *`,
             [
                 name.trim(),
@@ -170,7 +207,8 @@ router.post('/', requireManager, async (req, res) => {
                 normalizeOptionalString(phone),
                 limitValue,
                 limitMode,
-                warningEnabled
+                warningEnabled,
+                accessLevelId
             ]
         );
         await audit.logAuditEvent({
@@ -185,12 +223,17 @@ router.post('/', requireManager, async (req, res) => {
                 daily_limit: result.rows[0].daily_limit,
                 daily_limit_mode: result.rows[0].daily_limit_mode,
                 warning_enabled: result.rows[0].warning_enabled,
+                access_level_id: result.rows[0].access_level_id,
+                access_level_name: accessLevel?.name || null,
                 email: result.rows[0].email
             }
         });
         res.status(201).json({ employee: result.rows[0] });
     } catch (err) {
         if (err.message === 'El límite diario debe ser un número entre 1 y 50') {
+            return res.status(400).json({ error: err.message });
+        }
+        if (err.message === 'Nivel de acceso inválido') {
             return res.status(400).json({ error: err.message });
         }
         if (err.code === '23505')
@@ -201,10 +244,10 @@ router.post('/', requireManager, async (req, res) => {
 
 // PATCH /api/employees/:id — editar empleado
 router.patch('/:id', requireManager, async (req, res) => {
-    const { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, active } = req.body;
+    const { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id, active } = req.body;
     try {
         const before = await pool.query(
-            `SELECT id, name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, active
+            `SELECT id, name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id, active
              FROM employees WHERE id = $1`,
             [req.params.id]
         );
@@ -213,6 +256,18 @@ router.patch('/:id', requireManager, async (req, res) => {
         const limitMode = daily_limit_mode === undefined ? null : normalizeLimitMode(daily_limit_mode);
         const warningEnabled = normalizeOptionalBoolean(warning_enabled);
         const activeValue = normalizeOptionalBoolean(active);
+        const hasAccessLevelField = Object.prototype.hasOwnProperty.call(req.body, 'access_level_id');
+        const accessLevelId = hasAccessLevelField
+            ? normalizeAccessLevelId(access_level_id, { allowNull: true })
+            : null;
+        let accessLevel = null;
+        if (hasAccessLevelField && accessLevelId !== null) {
+            const accessLevelResult = await getAccessLevelById(accessLevelId);
+            if (accessLevelResult.rowCount === 0) {
+                return res.status(400).json({ error: 'Nivel de acceso inválido' });
+            }
+            accessLevel = accessLevelResult.rows[0];
+        }
         const result = await pool.query(
             `UPDATE employees SET
                 name        = COALESCE($1, name),
@@ -224,8 +279,9 @@ router.patch('/:id', requireManager, async (req, res) => {
                 daily_limit = COALESCE($7, daily_limit),
                 daily_limit_mode = COALESCE($8, daily_limit_mode),
                 warning_enabled  = COALESCE($9, warning_enabled),
-                active      = COALESCE($10, active)
-             WHERE id = $11 RETURNING *`,
+                access_level_id = CASE WHEN $10 THEN $11::int ELSE access_level_id END,
+                active      = COALESCE($12, active)
+             WHERE id = $13 RETURNING *`,
             [
                 normalizeOptionalString(name),
                 normalizeOptionalString(department),
@@ -236,6 +292,8 @@ router.patch('/:id', requireManager, async (req, res) => {
                 limitValue,
                 limitMode,
                 warningEnabled,
+                hasAccessLevelField,
+                accessLevelId,
                 activeValue,
                 req.params.id
             ]
@@ -265,6 +323,8 @@ router.patch('/:id', requireManager, async (req, res) => {
                     daily_limit: result.rows[0].daily_limit,
                     daily_limit_mode: result.rows[0].daily_limit_mode,
                     warning_enabled: result.rows[0].warning_enabled,
+                    access_level_id: result.rows[0].access_level_id,
+                    access_level_name: accessLevel?.name || null,
                     active: result.rows[0].active
                 }
             }
@@ -272,6 +332,9 @@ router.patch('/:id', requireManager, async (req, res) => {
         res.json({ employee: result.rows[0] });
     } catch (err) {
         if (err.message === 'El límite diario debe ser un número entre 1 y 50') {
+            return res.status(400).json({ error: err.message });
+        }
+        if (err.message === 'Nivel de acceso inválido') {
             return res.status(400).json({ error: err.message });
         }
         res.status(500).json({ error: err.message });

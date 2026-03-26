@@ -12,6 +12,7 @@ const {
     isLimitReached,
     shouldWarnAfterApproval
 } = require('../lib/dailyLimit');
+const { effectivePolicyExpressions } = require('../lib/accessLevels');
 const {
     formatBusinessDate,
     buildBusinessDayRangeSql
@@ -36,6 +37,8 @@ function normalizedCardStatus(row) {
     return row?.card_active ? 'active' : 'inactive';
 }
 
+const effectivePolicy = effectivePolicyExpressions('e', 'al');
+
 // ══════════════════════════════════════════════════════
 //  POST /api/tap
 //  El ESP8266 manda: { nfc_uid, machine_id }
@@ -56,10 +59,16 @@ router.post('/', async (req, res) => {
         const cardResult = await pool.query(
             `SELECT nc.id, nc.employee_id, nc.active AS card_active,
                     COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
-                    e.name, e.department, e.daily_limit, e.daily_limit_mode,
-                    e.warning_enabled, e.active
+                    e.name, e.department, e.active,
+                    e.access_level_id,
+                    al.name AS access_level_name,
+                    ${effectivePolicy.dailyLimit} AS daily_limit,
+                    ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
+                    ${effectivePolicy.warningEnabled} AS warning_enabled,
+                    ${effectivePolicy.source} AS policy_source
              FROM nfc_cards nc
              JOIN employees e ON e.id = nc.employee_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              WHERE nc.uid = $1`,
             [uid]
         );
@@ -326,19 +335,20 @@ router.get('/cards', require('../middleware/machineAuth'), async (req, res) => {
         const result = await pool.query(
             `SELECT
                 nc.uid,
-                e.daily_limit,
-                e.daily_limit_mode,
+                ${effectivePolicy.dailyLimit} AS daily_limit,
+                ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
                 COALESCE(COUNT(t.id) FILTER (
                     WHERE t.approved   = true
                       AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
                 ), 0)::int AS used_today
              FROM nfc_cards nc
              JOIN employees e ON e.id = nc.employee_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              LEFT JOIN taps t ON t.employee_id = nc.employee_id
              WHERE nc.active = true
                AND COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) = 'active'
                AND e.active = true
-             GROUP BY nc.uid, e.daily_limit, e.daily_limit_mode`
+             GROUP BY nc.uid, e.id, al.id`
             ,
             [timeZone, businessDate]
         );
@@ -395,10 +405,16 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
             const cardResult = await pool.query(
                 `SELECT nc.employee_id, nc.active AS card_active,
                         COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
-                        e.name, e.daily_limit, e.daily_limit_mode,
-                        e.warning_enabled, e.active
+                        e.name, e.active,
+                        e.access_level_id,
+                        al.name AS access_level_name,
+                        ${effectivePolicy.dailyLimit} AS daily_limit,
+                        ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
+                        ${effectivePolicy.warningEnabled} AS warning_enabled,
+                        ${effectivePolicy.source} AS policy_source
                  FROM nfc_cards nc
                  JOIN employees e ON e.id = nc.employee_id
+                 LEFT JOIN access_levels al ON al.id = e.access_level_id
                  WHERE nc.uid = $1`,
                 [upperUid]
             );

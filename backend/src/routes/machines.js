@@ -1,7 +1,7 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { broadcast } = require('../ws');
-const { requireManager, requireMachineOperator } = require('../middleware/roleAccess');
+const { requireManager, requireMachineOperator, requireMachineSetup } = require('../middleware/roleAccess');
 const alerts = require('../services/alerts');
 const audit = require('../services/audit');
 const stock = require('../services/stock');
@@ -147,7 +147,7 @@ router.post('/register', async (req, res) => {
     }
 });
 
-router.get('/pending', requireManager, async (req, res) => {
+router.get('/pending', requireMachineSetup, async (req, res) => {
     try {
         const result = await pool.query(
             'SELECT id, mac, first_seen, last_ping FROM pending_machines WHERE approved = false ORDER BY first_seen DESC'
@@ -158,7 +158,7 @@ router.get('/pending', requireManager, async (req, res) => {
     }
 });
 
-router.post('/pending/:id/approve', requireManager, async (req, res) => {
+router.post('/pending/:id/approve', requireMachineSetup, async (req, res) => {
     const { name, location } = req.body;
     if (!name) return res.status(400).json({ error: 'nombre requerido' });
 
@@ -200,7 +200,7 @@ router.post('/pending/:id/approve', requireManager, async (req, res) => {
     }
 });
 
-router.post('/pending/:id/reject', requireManager, async (req, res) => {
+router.post('/pending/:id/reject', requireMachineSetup, async (req, res) => {
     try {
         const pending = await pool.query(
             'DELETE FROM pending_machines WHERE id = $1 RETURNING id, mac',
@@ -276,7 +276,7 @@ router.post('/', requireManager, async (req, res) => {
     }
 });
 
-router.patch('/:id', requireManager, async (req, res) => {
+router.patch('/:id', requireMachineSetup, async (req, res) => {
     const { name, location } = req.body;
     try {
         const before = await pool.query(

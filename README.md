@@ -1,7 +1,7 @@
 # ☕ CoffeeControl
 
 Sistema de control de consumo de café para empresas con expendedoras automáticas.
-Permite saber **quién consume, cuánto, en qué máquina** y aplicar límites o bloqueos por empleado o máquina.
+Permite saber **quién consume, cuánto, en qué máquina** y aplicar límites, jerarquías de acceso o bloqueos por empleado o máquina.
 
 ---
 
@@ -70,10 +70,10 @@ backend/
         ├── employees.js    ← CRUD + tarjetas NFC + límites
         ├── dashboard.js    ← Métricas diarias, mensuales, feed
         ├── reports.js      ← Rankings por máquina y por empleado
-        └── adminUsers.js   ← Usuarios del panel (solo gerente)
+        └── adminUsers.js   ← Usuarios del panel (solo gerente/admin)
 
 coffeecontrol-admin.html    ← Panel de administración completo
-coffeecontrol.html          ← Dashboard operativo standalone
+coffeecontrol.html          ← Monitor operativo liviano (solo lectura, sesión compartida)
 ```
 
 ---
@@ -226,12 +226,13 @@ Abrir `http://<ip-servidor>:3000` en el navegador.
 | **Dashboard** | Métricas del día, consumo mensual, % sobre límite, máquinas online/offline, alertas |
 | **Máquinas** | Lista con estado online, detalle de red (SSID/IP/RSSI/backend), reinicio remoto, cambio de WiFi, escaneo remoto de redes, stock por selección, bloquear/desbloquear y aprobar nuevas |
 | **Stock** | Control manual/estimado por máquina y selección, con reposición, ajuste e historial de movimientos |
-| **Empleados** | CRUD completo, asignar tarjetas NFC, definir política diaria (`bloquear`, `solo advertir`, `sin límite`) e historial de consumo |
+| **Empleados** | CRUD completo, asignar tarjetas NFC, definir política diaria manual o asociar una jerarquía reutilizable (`bloquear`, `solo advertir`, `sin límite`) e historial de consumo |
+| **Jerarquías** | ABM de niveles de acceso reutilizables, con límite diario, modo, advertencia y orden |
 | **TAGs NFC** | Vista global con estados `Activo`, `Perdido`, `De baja` y acciones de recuperación |
-| **Reportes** | Rango de fechas, resumen operativo, cortes por máquina/empleado/área, filtros por área y búsqueda rápida de empleado, reportes específicos de stock, gráficos y exportación Excel/PDF |
+| **Reportes** | Rango de fechas, resumen operativo, cortes por máquina/empleado/área, filtros por área, jerarquía y búsqueda rápida de empleado, reportes específicos de stock, gráficos y exportación Excel/PDF |
 | **Feed en vivo** | Stream de taps en tiempo real via WebSocket, con filtros por estado/máquina/empleado |
 | **Tarjetas desconocidas** | UIDs sin empleado asignado — botón Asignar directamente desde el panel |
-| **Usuarios** | Gestión de usuarios del panel con roles gerente, supervisor y técnico; los supervisores aceptan una o varias áreas asignadas |
+| **Usuarios** | Gestión de usuarios del panel con roles gerente, supervisor, técnico y distribuidor; los supervisores aceptan una o varias áreas asignadas |
 | **Sistema** | Zona horaria operativa global (`business_timezone`) |
 | **Alertas por email** | Máquina offline, empleado bloqueado y advertencia preventiva de límite (si SMTP está configurado) |
 | **Auditoría** | Bitácora administrativa con actor, acción, objeto y detalle técnico saneado |
@@ -249,7 +250,7 @@ La pantalla `Reportes` ahora trabaja con rango `desde / hasta` y muestra:
 - ranking por máquina con detalle de empleados del período
 - ranking por empleado con detalle de máquinas del período
 - resumen por departamento / área
-- filtro global por área y búsqueda rápida por nombre / legajo / email / DNI para ubicar un empleado puntual
+- filtro global por área, jerarquía y búsqueda rápida por nombre / legajo / email / DNI para ubicar un empleado puntual
 - sección de **stock** para `gerente/admin`, con estado actual por máquina, movimientos del rango y paquete exportable Excel/PDF
 - exportación global a Excel (`.xlsx`) y PDF desde la cabecera de la pantalla
 - detalle exportable por empleado y por área, pensado para reuniones de gestión
@@ -262,6 +263,7 @@ Importante:
 - la búsqueda rápida de **empleado** recorta la tabla y exportaciones de `Empleados`, sin deformar el resumen global del sector
 - si el usuario es `supervisor`, el backend recorta dashboard, feed y reportes a sus áreas asignadas (`admin_user_departments`)
 - si el usuario es `tecnico`, el panel aterriza en `Máquinas` y no puede acceder a dashboard, reportes, feed ni configuración global
+- si el usuario es `distribuidor`, el panel aterriza en `Máquinas`, puede gestionar onboarding/configuración de máquinas y no accede a analítica, empleados ni configuración global
 - el bloque de **stock** es global por máquina y en esta V1 no se recorta por área
 
 ### Estado de red por máquina
@@ -381,6 +383,27 @@ El umbral de esa advertencia se configura globalmente desde `Notificaciones` com
 
 En modo offline, el ESP32-C3 descarga y respeta esta misma política al autenticar tarjetas desde caché local.
 
+### Jerarquías de acceso
+
+La pantalla `Jerarquías` permite definir políticas reutilizables para distintos perfiles internos, por ejemplo `Standard`, `Supervisión`, `Gerencia` o `VIP`.
+
+Cada jerarquía puede configurar:
+
+- `daily_limit`
+- `daily_limit_mode`
+- `warning_enabled`
+- descripción
+- orden de visualización
+
+En `Empleados`, cada persona puede seguir con política **manual** o quedar asociada a una **jerarquía**. Cuando un empleado tiene `access_level_id`, el backend usa esa política efectiva en:
+
+- `POST /api/tap`
+- `POST /api/tap/queue`
+- `GET /api/tap/cards` para el caché offline del ESP32-C3
+- dashboard y reportes
+
+Si no hay jerarquía asignada, el sistema cae automáticamente a la configuración manual del empleado.
+
 ### Estados de TAG NFC
 
 Los TAGs NFC ahora tienen un estado operativo explícito:
@@ -440,7 +463,7 @@ POST  /api/employees/:id/cards  { uid, label }
 GET  /api/reports/machines
 GET  /api/reports/employees/:id/machines
 
-GET  /api/admin-users           (solo gerente)
+GET  /api/admin-users           (solo gerente/admin)
 POST /api/admin-users           { username, password, role, full_name, email, department_scopes[] }
 
 GET  /api/notification-settings
@@ -460,31 +483,96 @@ cd backend
 
 npm run db:init
 npm run db:migrate:all
+npm run db:backup
+npm run db:purge -- --dry-run
+npm run db:drop -- --dry-run
+npm run db:restore -- --input ..\\backups\\db\\coffeecontrol-YYYYMMDD-HHMMSS.sql --dry-run
+npm run db:rebuild -- --dry-run
 npm run support:doctor
 npm run test:integration
 
 node scripts/support-user.js --username admin --password nuevaClaveSegura --role admin
+node scripts/support-user.js --username admin --password nuevaClaveSegura --role admin --protected --activate
 node scripts/support-user.js --username supervisor.ventas --password coffeecontrol2024 --role supervisor --full-name "Supervisor Ventas" --email supervisor@empresa.com --departments "Ventas,RRHH"
+node scripts/support-user.js --username dist.norte --password coffeecontrol2024 --role distribuidor --full-name "Distribuidor Norte"
 ```
 
 Qué hace cada uno:
 
 - `db:init`: aplica el estado actual de `sql/schema.sql` sobre una base vacía.
-- `db:migrate:all`: ejecuta en orden todas las migraciones `migration_v2.sql ... migration_v20.sql`.
+- `db:migrate:all`: ejecuta en orden todas las migraciones `migration_v2.sql ... migration_v23.sql`.
+- `db:backup`: genera un backup lógico con `pg_dump` en `backups/db/` o en la ruta indicada por `--output`.
+- `db:purge`: limpia datos operativos/transaccionales sin borrar usuarios, empleados, TAGs, máquinas, jerarquías, configuración ni stock configurado. También resetea `last_seen` y la telemetría dinámica de máquinas.
+- `db:drop`: borra la base configurada en `DATABASE_URL`; exige confirmación explícita con `--confirm nombre_bd`.
+- `db:restore`: restaura un backup `.sql` o `.dump`; acepta `--recreate` para reconstruir la base antes de restaurar.
+- `db:rebuild`: reconstruye la base desde cero usando `schema.sql` y luego aplica las migraciones faltantes del repo.
 - `support:doctor`: valida `.env`, conexión PostgreSQL, tablas clave, SMTP y `/health` del backend.
-- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos, permisos sobre `Notificaciones`/`Auditoría`, configuración de stock, alertas de stock, reportes de stock y el rol `tecnico`.
+- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos, permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor` y cuentas protegidas.
 - `support:reset-admin`: wrapper para resetear o crear el usuario `admin` del panel.
-- `support:user`: crea o actualiza cualquier usuario del panel (`admin`, `gerente`, `supervisor`, `tecnico`). Si el rol es `supervisor`, acepta múltiples áreas con `--departments`.
+- `support:user`: crea o actualiza cualquier usuario del panel (`admin`, `gerente`, `supervisor`, `tecnico`, `distribuidor`). Si el rol es `supervisor`, acepta múltiples áreas con `--departments`. También permite marcar o desmarcar cuentas protegidas con `--protected` / `--unprotect`.
 - `support:create-supervisor`: wrapper cómodo de `support:user` para supervisores; igual requiere `--username`, `--password` y opcionalmente `--departments`.
 - `support:create-technician`: wrapper cómodo de `support:user` para dar de alta un técnico operativo.
+- `support:create-distributor`: wrapper cómodo de `support:user` para dar de alta un distribuidor operativo.
 
 Detalle importante:
 
 - las áreas de supervisor se guardan en `admin_user_departments`
 - dejar `--departments` vacío para un supervisor equivale a acceso amplio
+- la cuenta `admin` queda protegida por defecto: no puede editarse, desactivarse ni cambiar su contraseña desde el panel
+- una cuenta protegida solo se administra desde soporte local con `node scripts/support-user.js ... --protected` o `--unprotect`
 - estos scripts toman `DATABASE_URL` desde `backend/.env`
+- `db:backup` intenta encontrar `pg_dump` automáticamente (PATH, `PG_BIN` o instalación típica de PostgreSQL en Windows)
+- `db:restore` intenta encontrar `psql` o `pg_restore` automáticamente según el tipo de backup
+- `db:purge` y `db:drop` aceptan `--dry-run` para revisar antes de ejecutar algo destructivo
+- `db:restore` exige `--yes` para ejecutar, y si se usa `--recreate` también exige `--confirm nombre_bd`
+- `db:rebuild` es destructivo y exige `--confirm nombre_bd`
 - en PowerShell, para scripts con parámetros conviene usar `node scripts/...` directamente; `npm run` queda perfecto para tareas sin argumentos como `db:migrate:all` o `support:doctor`
 - si `full-name` o `departments` llevan espacios, usá la variante directa con `node scripts/support-user.js ...`
+
+Menú simple para Windows:
+
+- En la raíz del repo hay dos launchers:
+  - `mantenimiento-coffeecontrol.bat`
+  - `mantenimiento-coffeecontrol.ps1`
+- Ambos trabajan sobre `backend/.env` y ofrecen menú para:
+  - `doctor`
+  - `backup`
+  - `purge`
+  - `restore`
+  - `restore recreando base`
+  - `rebuild`
+- El menú muestra la base objetivo, la carpeta de backups, los últimos backups y advertencias claras antes de acciones destructivas.
+- Incluye `Ayuda rápida` para soporte.
+- El `.bat` es el acceso más cómodo para soporte diario en Windows.
+
+Ejemplos:
+
+```powershell
+.\mantenimiento-coffeecontrol.bat
+.\mantenimiento-coffeecontrol.bat -Action doctor
+.\mantenimiento-coffeecontrol.ps1 -Action backup
+.\mantenimiento-coffeecontrol.ps1 -Action restore -InputPath C:\Backups\coffeecontrol.sql
+.\mantenimiento-coffeecontrol.ps1 -Action restore -InputPath C:\Backups\coffeecontrol.sql -Recreate
+```
+
+Ejemplos rápidos:
+
+```bash
+npm run db:backup
+node scripts/db-backup.js --output C:\Backups\coffeecontrol.sql
+
+node scripts/db-purge.js --dry-run
+node scripts/db-purge.js --yes
+
+node scripts/db-drop.js --dry-run
+node scripts/db-drop.js --confirm coffeecontrol
+
+node scripts/db-restore.js --input C:\Backups\coffeecontrol.sql --yes
+node scripts/db-restore.js --input C:\Backups\coffeecontrol.dump --format custom --recreate --confirm coffeecontrol --yes
+
+node scripts/db-rebuild.js --dry-run
+node scripts/db-rebuild.js --confirm coffeecontrol
+```
 
 ### WebSocket — `ws://host/ws`
 
@@ -504,8 +592,11 @@ Acceso:
 
 - el handshake del WebSocket del panel ahora exige JWT válido
 - `coffeecontrol-admin.html` conecta usando la sesión del login
-- `coffeecontrol.html` solo funciona si ya existe un token válido en `localStorage`
-- solo `gerente/admin/supervisor` pueden consumir el feed en vivo; el rol `tecnico` no se conecta al canal WS
+- `coffeecontrol.html` quedó como monitor operativo liviano y solo lectura
+- usa la misma sesión JWT del panel (`cc_token` en `localStorage`)
+- si no hay sesión válida, muestra acceso guiado al panel admin en `/`
+- solo `gerente/admin/supervisor` pueden abrirlo; `tecnico` y `distribuidor` quedan fuera de este monitor
+- solo `gerente/admin/supervisor` pueden consumir el feed en vivo; los roles `tecnico` y `distribuidor` no se conectan al canal WS
 
 ---
 
@@ -513,9 +604,19 @@ Acceso:
 
 | Rol | Acceso |
 |---|---|
-| `gerente` / `admin` | Todo, incluyendo gestión de usuarios del panel |
+| `admin` | Acceso total. Si la cuenta está marcada como protegida, solo puede administrarse desde soporte local |
+| `gerente` | Todo a nivel funcional del cliente, incluyendo gestión de usuarios del panel |
 | `supervisor` | Dashboard, Reportes y Feed en vivo, acotados a una o varias áreas asignadas — sin configuración |
 | `tecnico` | Máquinas, stock y comandos remotos; sin acceso a empleados, analítica, feed ni configuración global |
+| `distribuidor` | Máquinas, stock, comandos remotos y onboarding/configuración de máquinas; sin acceso a empleados, analítica, feed ni configuración global |
+
+---
+
+## Documentación operativa de piloto
+
+- [CHECKLIST_PILOTO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/CHECKLIST_PILOTO.md)
+- [PROTOCOLO_PRUEBAS.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_PRUEBAS.md)
+- [GUIA_SOPORTE.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/GUIA_SOPORTE.md)
 
 ---
 
@@ -527,6 +628,7 @@ Acceso:
 - [x] Control de stock V1 manual/estimado por máquina y selección
 - [x] Reportes específicos de stock para `gerente/admin`
 - [x] Perfil técnico para operar máquinas, stock y comandos remotos sin permisos gerenciales
+- [x] Jerarquías de acceso reutilizables con política efectiva online/offline y filtro en reportes
 - [x] Scripts DB y soporte (`db:migrate:all`, `support:doctor`, reseteo/alta de usuarios del panel)
 - [x] Tests de integración mínimos (`npm run test:integration`)
 - [ ] OTA (Over The Air) — actualización de firmware desde el panel

@@ -11,10 +11,34 @@ CREATE TABLE employees (
     daily_limit INT NOT NULL DEFAULT 4,   -- cafés por día
     daily_limit_mode VARCHAR(16) NOT NULL DEFAULT 'enforce',
     warning_enabled BOOLEAN NOT NULL DEFAULT true,
+    access_level_id INT,
     active      BOOLEAN NOT NULL DEFAULT true,
     created_at  TIMESTAMPTZ DEFAULT NOW(),
     CHECK (daily_limit_mode IN ('enforce', 'warn_only', 'off'))
 );
+
+CREATE TABLE access_levels (
+    id               SERIAL PRIMARY KEY,
+    code             VARCHAR(40) NOT NULL UNIQUE,
+    name             VARCHAR(80) NOT NULL UNIQUE,
+    description      VARCHAR(255),
+    daily_limit      INT NOT NULL,
+    daily_limit_mode VARCHAR(16) NOT NULL DEFAULT 'enforce',
+    warning_enabled  BOOLEAN NOT NULL DEFAULT true,
+    sort_order       INT NOT NULL DEFAULT 100,
+    active           BOOLEAN NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (daily_limit BETWEEN 1 AND 50),
+    CHECK (daily_limit_mode IN ('enforce', 'warn_only', 'off')),
+    CHECK (sort_order BETWEEN 0 AND 9999)
+);
+
+ALTER TABLE employees
+    ADD CONSTRAINT employees_access_level_fk
+    FOREIGN KEY (access_level_id)
+    REFERENCES access_levels(id)
+    ON DELETE SET NULL;
 
 -- Tarjetas NFC (un empleado puede tener más de una)
 CREATE TABLE nfc_cards (
@@ -87,12 +111,13 @@ CREATE TABLE admin_users (
     username      VARCHAR(60) UNIQUE NOT NULL,
     password_hash VARCHAR(128) NOT NULL,
     role          VARCHAR(20) NOT NULL DEFAULT 'admin',
+    is_protected  BOOLEAN NOT NULL DEFAULT false,
     department    VARCHAR(60),
     full_name     VARCHAR(100),
     email         VARCHAR(120),
     active        BOOLEAN NOT NULL DEFAULT true,
     created_at    TIMESTAMPTZ DEFAULT NOW(),
-    CHECK (role IN ('admin', 'gerente', 'supervisor', 'tecnico'))
+    CHECK (role IN ('admin', 'gerente', 'supervisor', 'tecnico', 'distribuidor'))
 );
 
 CREATE TABLE admin_user_departments (
@@ -177,6 +202,7 @@ CREATE TABLE stock_movements (
 CREATE INDEX idx_taps_employee_date ON taps (employee_id, tapped_at);
 CREATE INDEX idx_taps_machine       ON taps (machine_id, tapped_at);
 CREATE INDEX idx_nfc_uid            ON nfc_cards (uid);
+CREATE INDEX idx_employees_access_level_id ON employees (access_level_id);
 CREATE INDEX idx_admin_user_departments_department ON admin_user_departments (department);
 CREATE INDEX idx_machine_stock_items_machine_active ON machine_stock_items (machine_id, active, item_id);
 CREATE INDEX idx_stock_movements_machine_created ON stock_movements (machine_id, created_at DESC, id DESC);
@@ -198,20 +224,23 @@ SELECT
     e.id          AS employee_id,
     e.name        AS employee_name,
     e.department,
-    e.daily_limit,
-    e.daily_limit_mode,
-    e.warning_enabled,
+    e.access_level_id,
+    al.name       AS access_level_name,
+    COALESCE(al.daily_limit, e.daily_limit) AS daily_limit,
+    COALESCE(al.daily_limit_mode, e.daily_limit_mode) AS daily_limit_mode,
+    COALESCE(al.warning_enabled, e.warning_enabled) AS warning_enabled,
     COUNT(t.id) FILTER (WHERE t.approved = true)  AS taps_today,
     COUNT(t.id) FILTER (WHERE t.approved = true AND t.over_limit = true) AS taps_over_limit,
     COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_today_cents
 FROM employees e
+LEFT JOIN access_levels al ON al.id = e.access_level_id
 CROSS JOIN bounds b
 LEFT JOIN taps t
     ON t.employee_id = e.id
     AND t.tapped_at >= b.day_start
     AND t.tapped_at <  b.day_end
 WHERE e.active = true
-GROUP BY e.id, e.name, e.department, e.daily_limit, e.daily_limit_mode, e.warning_enabled;
+GROUP BY e.id, al.id;
 
 -- ── Vista: resumen mensual ────────────────────────────
 CREATE VIEW monthly_summary AS
@@ -222,14 +251,17 @@ SELECT
     e.id          AS employee_id,
     e.name        AS employee_name,
     e.department,
+    e.access_level_id,
+    al.name       AS access_level_name,
     DATE_TRUNC('month', t.tapped_at AT TIME ZONE cfg.business_timezone) AS month,
     COUNT(t.id) FILTER (WHERE t.approved = true)  AS taps_total,
     COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents
 FROM employees e
+LEFT JOIN access_levels al ON al.id = e.access_level_id
 CROSS JOIN cfg
 LEFT JOIN taps t ON t.employee_id = e.id AND t.approved = true
 WHERE e.active = true
-GROUP BY e.id, e.name, e.department, DATE_TRUNC('month', t.tapped_at AT TIME ZONE cfg.business_timezone);
+GROUP BY e.id, al.id, DATE_TRUNC('month', t.tapped_at AT TIME ZONE cfg.business_timezone);
 
 -- ── Datos de ejemplo ──────────────────────────────────
 INSERT INTO machines (name, location, secret) VALUES

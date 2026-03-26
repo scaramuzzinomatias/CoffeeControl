@@ -52,6 +52,7 @@ async function syncUserDepartmentScopes(client, userId, scopes) {
 function mapUserWithScopes(user, departmentScopes) {
     return {
         ...user,
+        is_protected: Boolean(user?.is_protected),
         department_scopes: normalizeDepartmentList(
             Array.isArray(departmentScopes) && departmentScopes.length
                 ? departmentScopes
@@ -60,10 +61,27 @@ function mapUserWithScopes(user, departmentScopes) {
     };
 }
 
-// Middleware: solo gerente puede gestionar usuarios
+async function rejectProtectedAccountMutation(req, res, targetUser, attemptedAction) {
+    await audit.logAuditEvent({
+        req,
+        action: 'admin_user.protected_denied',
+        entityType: 'admin_user',
+        entityId: targetUser.id,
+        entityLabel: targetUser.username,
+        summary: `Intentó modificar la cuenta protegida ${targetUser.username}`,
+        details: {
+            attempted_action: attemptedAction,
+            target_role: targetUser.role,
+            is_protected: true
+        }
+    });
+    return res.status(403).json({ error: 'La cuenta protegida solo puede modificarse desde soporte local' });
+}
+
+// Middleware: solo gerente/admin puede gestionar usuarios
 function onlyGerente(req, res, next) {
     if (req.user.role !== 'gerente' && req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Solo el gerente puede gestionar usuarios' });
+        return res.status(403).json({ error: 'Acceso solo para gerente/admin' });
     }
     next();
 }
@@ -77,6 +95,7 @@ router.get('/', onlyGerente, async (req, res) => {
                     au.full_name,
                     au.email,
                     au.role,
+                    au.is_protected,
                     au.department,
                     au.active,
                     au.created_at,
@@ -102,7 +121,9 @@ router.post('/', onlyGerente, async (req, res) => {
 
     if (!username || !password)
         return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
-    if (!['gerente', 'supervisor', 'admin', 'tecnico'].includes(role))
+    if (Object.prototype.hasOwnProperty.call(req.body, 'is_protected'))
+        return res.status(403).json({ error: 'Las cuentas protegidas solo pueden configurarse desde soporte local' });
+    if (!['gerente', 'supervisor', 'admin', 'tecnico', 'distribuidor'].includes(role))
         return res.status(400).json({ error: 'Rol inválido' });
     if (password.length < 8)
         return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
@@ -125,7 +146,7 @@ router.post('/', onlyGerente, async (req, res) => {
         const result = await client.query(
             `INSERT INTO admin_users (username, password_hash, role, full_name, department, email)
              VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING id, username, full_name, email, role, department, active`,
+             RETURNING id, username, full_name, email, role, is_protected, department, active`,
             [
                 username.trim().toLowerCase(),
                 hash,
@@ -176,7 +197,7 @@ router.patch('/:id', onlyGerente, async (req, res) => {
     try {
         await client.query('BEGIN');
         const before = await client.query(
-            `SELECT id, username, full_name, email, role, department, active
+            `SELECT id, username, full_name, email, role, is_protected, department, active
              FROM admin_users
              WHERE id = $1`,
             [req.params.id]
@@ -197,7 +218,16 @@ router.patch('/:id', onlyGerente, async (req, res) => {
             beforeScopesResult.rows.map(row => row.department)
         );
 
+        if (beforeUser.is_protected) {
+            await client.query('ROLLBACK');
+            return rejectProtectedAccountMutation(req, res, beforeUser, 'update');
+        }
+
         const nextRole = role || beforeUser.role;
+        if (!['gerente', 'supervisor', 'admin', 'tecnico', 'distribuidor'].includes(nextRole)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Rol inválido' });
+        }
         const scopesProvided = Object.prototype.hasOwnProperty.call(req.body, 'department_scopes');
         const nextScopes = nextRole === 'supervisor'
             ? normalizeDepartmentList(scopesProvided ? department_scopes : beforeUser.department_scopes)
@@ -246,7 +276,7 @@ router.patch('/:id', onlyGerente, async (req, res) => {
                 active     = $5
                 ${hashUpdate}
               WHERE id = $6
-              RETURNING id, username, full_name, email, role, department, active`,
+              RETURNING id, username, full_name, email, role, is_protected, department, active`,
             params
         );
         const scopes = await syncUserDepartmentScopes(client, result.rows[0].id, nextScopes);
@@ -283,15 +313,24 @@ router.delete('/:id', onlyGerente, async (req, res) => {
     if (parseInt(req.params.id) === req.user.id)
         return res.status(400).json({ error: 'No podés eliminar tu propia cuenta' });
     try {
+        const before = await pool.query(
+            `SELECT id, username, role, is_protected, department, email, active
+             FROM admin_users
+             WHERE id = $1`,
+            [req.params.id]
+        );
+        if (before.rowCount === 0)
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        if (before.rows[0].is_protected)
+            return rejectProtectedAccountMutation(req, res, before.rows[0], 'deactivate');
+
         const result = await pool.query(
             `UPDATE admin_users
              SET active=false
              WHERE id=$1
-             RETURNING id, username, role, department, email`,
+             RETURNING id, username, role, is_protected, department, email`,
             [req.params.id]
         );
-        if (result.rowCount === 0)
-            return res.status(404).json({ error: 'Usuario no encontrado' });
         await audit.logAuditEvent({
             req,
             action: 'admin_user.deactivate',

@@ -8,6 +8,7 @@ const systemSettings = require('../services/systemSettings');
 const { requireManager, requireAnalyticsViewer } = require('../middleware/roleAccess');
 const { statusFromUsage } = require('../lib/dailyLimit');
 const { buildDepartmentScopeClause } = require('../lib/accessScope');
+const { effectivePolicyExpressions } = require('../lib/accessLevels');
 const {
     buildBusinessDayRangeSql,
     buildBusinessMonthRangeSql
@@ -19,6 +20,8 @@ router.use(requireAnalyticsViewer);
 function departmentExpr(column) {
     return `COALESCE(NULLIF(TRIM(${column}), ''), 'Sin área')`;
 }
+
+const effectivePolicy = effectivePolicyExpressions('e', 'al');
 
 // ── GET /api/dashboard/today ──────────────────────────
 // Resumen del día: métricas + ranking + alertas
@@ -38,19 +41,23 @@ router.get('/today', async (req, res) => {
                 e.id AS employee_id,
                 e.name AS employee_name,
                 e.department,
-                e.daily_limit,
-                e.daily_limit_mode,
-                e.warning_enabled,
+                e.access_level_id,
+                al.name AS access_level_name,
+                ${effectivePolicy.dailyLimit} AS daily_limit,
+                ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
+                ${effectivePolicy.warningEnabled} AS warning_enabled,
+                ${effectivePolicy.source} AS policy_source,
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS taps_today,
                 COUNT(t.id) FILTER (WHERE t.approved = true AND t.over_limit = true) AS taps_over_limit,
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_today_cents
              FROM employees e
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              LEFT JOIN taps t
                 ON t.employee_id = e.id
                AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
              WHERE e.active = true
                ${scope.sql}
-             GROUP BY e.id, e.name, e.department, e.daily_limit, e.daily_limit_mode, e.warning_enabled
+             GROUP BY e.id, al.id
              ORDER BY taps_today DESC`
             ,
             params

@@ -297,6 +297,7 @@ Pendiente de esta mejora:
 
 ### 16. Acceso premium por jerarquía
 Origen: pedido usuario
+Estado: realizado en V1
 
 Problema:
 - Hoy el acceso es bastante uniforme por empleado.
@@ -311,6 +312,19 @@ Dependencias:
 - Modelo de datos para jerarquía/nivel.
 - Reglas de autorización aplicadas en `tap`.
 - UI para administrar niveles y excepciones.
+
+Implementado:
+- tabla `access_levels` + asociación opcional `employees.access_level_id`
+- pantalla `Jerarquías` en el panel con ABM, descripción, orden y activación
+- política efectiva aplicada en `POST /api/tap`, `POST /api/tap/queue` y `GET /api/tap/cards`
+- fallback automático a la configuración manual del empleado cuando no hay jerarquía asignada
+- reportes con filtro por jerarquía y distinción entre `Jerarquía` y `Manual`
+- cobertura en `npm run test:integration` para auditoría, override efectivo y filtro de reportes
+
+Pendiente de esta mejora:
+- restricciones por producto/categoría cuando exista un catálogo global limpio
+- gratuidades, subsidios o saldo por jerarquía
+- ventanas horarias o reglas comerciales más finas por nivel
 
 ## Prioridad 5 — Seguridad y robustez
 
@@ -400,12 +414,20 @@ Implementado:
 ### 22. Revisar o retirar `coffeecontrol.html`
 Origen: sugerido
 
+Estado:
+- Resuelto.
+
 Problema:
-- Quedó desalineado con la seguridad actual del backend.
+- Quedó desalineado con la seguridad actual del backend y duplicaba configuración vieja.
 
 Resultado esperado:
-- O se adapta con auth real.
-- O se retira para evitar confusión.
+- Mantenerlo solo si quedaba con auth real y rol claro.
+
+Implementado:
+- `coffeecontrol.html` pasó a ser un monitor operativo liviano, autenticado y solo lectura
+- usa la misma sesión JWT del panel admin
+- ya no ofrece edición de límites ni configuración paralela
+- si no hay sesión válida, deriva al usuario al panel admin
 
 ### 23. Scripts claros de base de datos y soporte
 Origen: sugerido
@@ -418,12 +440,20 @@ Resultado esperado:
 - Script para reset de password admin.
 - Script para crear/actualizar usuarios del panel.
 - Script de diagnóstico rápido.
+- Launcher Windows con menú simple para `backup / purge / restore / rebuild / doctor`.
 
 Implementado:
 - `backend/scripts/db-init.js`
 - `backend/scripts/db-migrate-all.js`
+- `backend/scripts/db-backup.js`
+- `backend/scripts/db-purge.js`
+- `backend/scripts/db-drop.js`
+- `backend/scripts/db-restore.js`
+- `backend/scripts/db-rebuild.js`
 - `backend/scripts/support-doctor.js`
 - `backend/scripts/support-user.js`
+- `mantenimiento-coffeecontrol.bat`
+- `mantenimiento-coffeecontrol.ps1`
 
 ### 24. Tests de integración mínimos
 Origen: sugerido
@@ -492,6 +522,43 @@ Implementado:
 - backend endurecido para que los permisos no dependan solo de la UI
 - cobertura incluida en `npm run test:integration`
 
+### 28. Cuenta maestra protegida del panel
+Origen: necesidad operativa para resguardar la cuenta raíz del sistema
+
+Estado:
+- Resuelto.
+
+Resultado esperado:
+- Evitar que la cuenta principal de administración pueda modificarse desde el panel.
+- Mantener un camino de recuperación local para soporte.
+
+Implementado:
+- columna `admin_users.is_protected`
+- `migration_v22.sql` y `schema.sql` alineados
+- la cuenta `admin` queda protegida por defecto
+- el panel muestra badge `Protegida` y bloquea edición/desactivación con mensaje claro
+- el backend rechaza por API editar, desactivar o cambiar contraseña de cuentas protegidas
+- la recuperación y administración quedan solo por `backend/scripts/support-user.js --protected / --unprotect`
+- cobertura incluida en `npm run test:integration`
+
+### 29. Rol distribuidor para instalación y soporte de máquinas
+Origen: necesidad operativa para asistir configuraciones sin usar rol gerencial
+
+Estado:
+- Resuelto.
+
+Resultado esperado:
+- Permitir onboarding/configuración de máquinas sin exponer analítica ni datos sensibles de empleados.
+
+Implementado:
+- nuevo rol `distribuidor` en `admin_users`
+- acceso a `Máquinas`, stock, comandos remotos y máquinas pendientes
+- puede aprobar/rechazar onboarding de máquinas y consultar la cola de pendientes
+- no puede acceder a `Dashboard`, `Reportes`, `Feed`, `Empleados`, `Usuarios`, `Notificaciones`, `Sistema` ni `Auditoría`
+- sin permisos para bloquear, desbloquear o dar de baja máquinas
+- wrapper de soporte `support:create-distributor`
+- cobertura incluida en `npm run test:integration`
+
 ## Orden recomendado de implementación
 
 ### Fase A — Rápidas y de alto valor
@@ -516,7 +583,7 @@ Implementado:
 ### Fase D — Alertas, stock y negocio
 14. [x] Notificaciones automáticas.
 15. [x] Control de stock por máquina (V1 manual/estimada).
-16. Acceso premium por jerarquía.
+16. [x] Acceso premium por jerarquía (V1).
 
 ### Fase E — Seguridad y robustez
 17. [x] WebSocket autenticado.
@@ -532,6 +599,8 @@ Implementado:
 25. Limpieza final de logs y startup.
 26. [x] Filtros avanzados en reportes para alto volumen (v1).
 27. [x] Perfil técnico para operar máquinas y stock.
+28. [x] Cuenta maestra protegida del panel.
+29. [x] Rol distribuidor para instalación y soporte.
 
 ## Recomendación práctica
 
@@ -550,7 +619,7 @@ Si retomamos desde donde quedó el proyecto, el orden que más sentido tiene ser
 1. Integración DEX/UCS como V2 de stock.
 2. Resolver `coffeecontrol.html`.
 3. Refinar filtros/paginado de `Reportes` si el volumen real lo pide.
-4. Acceso premium por jerarquía.
+4. Extender jerarquías a catálogo/productos/subsidios cuando exista modelo global de productos.
 
 Razón:
 - Reportes, exportaciones y stock ya quedaron fuertes para operar y llevar a reunión.

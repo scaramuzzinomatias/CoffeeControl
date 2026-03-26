@@ -37,6 +37,7 @@ router.post('/login', async (req, res) => {
                 id: user.id,
                 username: user.username,
                 role: user.role,
+                is_protected: Boolean(user.is_protected),
                 department: user.department || null,
                 department_scopes: departmentScopes
             },
@@ -48,6 +49,7 @@ router.post('/login', async (req, res) => {
             token,
             username: user.username,
             role: user.role,
+            is_protected: Boolean(user.is_protected),
             department: user.department || null,
             department_scopes: departmentScopes
         });
@@ -67,9 +69,24 @@ router.post('/change-password', require('../middleware/authJwt'), async (req, re
 
     try {
         const result = await pool.query(
-            'SELECT password_hash FROM admin_users WHERE id = $1',
+            'SELECT username, password_hash, is_protected FROM admin_users WHERE id = $1',
             [req.user.id]
         );
+
+        if (result.rowCount === 0)
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+
+        if (result.rows[0].is_protected) {
+            await audit.logAuditEvent({
+                req,
+                action: 'auth.change_password_denied',
+                entityType: 'admin_user',
+                entityId: req.user.id,
+                entityLabel: result.rows[0].username,
+                summary: `Intentó cambiar la contraseña de la cuenta protegida ${result.rows[0].username}`
+            });
+            return res.status(403).json({ error: 'La cuenta protegida solo puede cambiar su contraseña desde soporte local' });
+        }
 
         const valid = await bcrypt.compare(current_password, result.rows[0].password_hash);
         if (!valid) return res.status(401).json({ error: 'Contraseña actual incorrecta' });

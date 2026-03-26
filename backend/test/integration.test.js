@@ -18,6 +18,8 @@ let fixture = null;
 let adminToken = '';
 let managerToken = '';
 let technicianToken = '';
+let distributorToken = '';
+let protectedToken = '';
 let notificationSettingsSnapshot = null;
 
 function machineHeaders(mac) {
@@ -90,6 +92,10 @@ function tempMac() {
     return `AA55${base}`.slice(0, 12);
 }
 
+function todayIso() {
+    return new Date().toISOString().slice(0, 10);
+}
+
 async function cleanupFixtures() {
     await withDb(async (client) => {
         await client.query('BEGIN');
@@ -138,6 +144,12 @@ async function cleanupFixtures() {
                  WHERE name LIKE $1
                     OR email LIKE $2`,
                 [`${TEST_PREFIX}%`, `${TEST_PREFIX}%@%`]
+            );
+            await client.query(
+                `DELETE FROM access_levels
+                 WHERE name LIKE $1
+                    OR code LIKE $2`,
+                [`${TEST_PREFIX}%`, `${TEST_PREFIX}%`]
             );
             await client.query(
                 `DELETE FROM machines
@@ -310,6 +322,32 @@ async function seedFixtures() {
             );
             const technician = technicianResult.rows[0];
 
+            const distributorResult = await client.query(
+                `INSERT INTO admin_users(username, password_hash, role, full_name, email, active)
+                 VALUES ($1, $2, 'distribuidor', $3, $4, true)
+                 RETURNING id, username`,
+                [
+                    `${TEST_PREFIX}_dist`,
+                    passwordHash,
+                    `${TEST_PREFIX}_Distribuidor`,
+                    tempEmail('dist')
+                ]
+            );
+            const distributor = distributorResult.rows[0];
+
+            const protectedResult = await client.query(
+                `INSERT INTO admin_users(username, password_hash, role, full_name, email, active, is_protected)
+                 VALUES ($1, $2, 'admin', $3, $4, true, true)
+                 RETURNING id, username, is_protected`,
+                [
+                    `${TEST_PREFIX}_protected`,
+                    passwordHash,
+                    `${TEST_PREFIX}_Protected`,
+                    tempEmail('protected')
+                ]
+            );
+            const protectedAdmin = protectedResult.rows[0];
+
             await client.query('COMMIT');
             return {
                 departments: { deptA, deptB, deptOut },
@@ -325,7 +363,9 @@ async function seedFixtures() {
                 },
                 supervisor,
                 manager,
-                technician
+                technician,
+                distributor,
+                protectedAdmin
             };
         } catch (err) {
             try { await client.query('ROLLBACK'); } catch (_) {}
@@ -379,6 +419,18 @@ before(async () => {
     });
     assert.equal(technicianLogin.status, 200);
     technicianToken = technicianLogin.json.token;
+
+    const distributorLogin = await requestJson('POST', '/api/auth/login', {
+        body: { username: fixture.distributor.username, password: 'coffeecontrol2024' }
+    });
+    assert.equal(distributorLogin.status, 200);
+    distributorToken = distributorLogin.json.token;
+
+    const protectedLogin = await requestJson('POST', '/api/auth/login', {
+        body: { username: fixture.protectedAdmin.username, password: 'coffeecontrol2024' }
+    });
+    assert.equal(protectedLogin.status, 200);
+    protectedToken = protectedLogin.json.token;
 });
 
 after(async () => {
@@ -637,6 +689,189 @@ test('alta de empleado genera auditoría visible para gerente', async () => {
     assert.equal(log.entity_type, 'employee');
 });
 
+test('gerente puede crear una jerarquía y asignarla a un empleado con auditoría', async () => {
+    const levelName = `${TEST_PREFIX}_nivel_warn`;
+    const level = await requestJson('POST', '/api/access-levels', {
+        token: managerToken,
+        body: {
+            name: levelName,
+            description: 'Jerarquía de prueba para integración',
+            daily_limit: 1,
+            daily_limit_mode: 'warn_only',
+            warning_enabled: false,
+            sort_order: 10,
+            active: true
+        }
+    });
+    assert.equal(level.status, 201);
+    assert.equal(level.json.access_level.name, levelName);
+
+    const employee = await requestJson('POST', '/api/employees', {
+        token: managerToken,
+        body: {
+            name: `${TEST_PREFIX}_emp_level`,
+            department: fixture.departments.deptA,
+            email: tempEmail('emp_level'),
+            daily_limit: 4,
+            daily_limit_mode: 'enforce',
+            warning_enabled: true,
+            access_level_id: level.json.access_level.id
+        }
+    });
+    assert.equal(employee.status, 201);
+    assert.equal(employee.json.employee.access_level_id, level.json.access_level.id);
+
+    const employees = await requestJson('GET', '/api/employees', { token: managerToken });
+    assert.equal(employees.status, 200);
+    const createdEmployee = employees.json.employees.find(item => item.id === employee.json.employee.id);
+    assert.ok(createdEmployee, 'No apareció el empleado con jerarquía en /api/employees');
+    assert.equal(createdEmployee.policy_source, 'access_level');
+    assert.equal(createdEmployee.access_level_name, levelName);
+    assert.equal(Number(createdEmployee.effective_daily_limit), 1);
+    assert.equal(createdEmployee.effective_daily_limit_mode, 'warn_only');
+    assert.equal(createdEmployee.effective_warning_enabled, false);
+
+    const auditLogs = await requestJson(
+        'GET',
+        `/api/audit-logs?action=access_level.create&q=${encodeURIComponent(levelName)}`,
+        { token: managerToken }
+    );
+    assert.equal(auditLogs.status, 200);
+    const log = auditLogs.json.logs.find(entry => entry.entity_label === levelName);
+    assert.ok(log, 'No se encontró la auditoría de access_level.create');
+    assert.equal(log.actor_username, fixture.manager.username);
+    assert.equal(log.entity_type, 'access_level');
+});
+
+test('la jerarquía prevalece sobre la política manual en /api/tap y /api/tap/cards', async () => {
+    const levelName = `${TEST_PREFIX}_nivel_override`;
+    const level = await requestJson('POST', '/api/access-levels', {
+        token: managerToken,
+        body: {
+            name: levelName,
+            daily_limit: 1,
+            daily_limit_mode: 'warn_only',
+            warning_enabled: false,
+            sort_order: 20,
+            active: true
+        }
+    });
+    assert.equal(level.status, 201);
+
+    const employee = await requestJson('POST', '/api/employees', {
+        token: managerToken,
+        body: {
+            name: `${TEST_PREFIX}_emp_override`,
+            department: fixture.departments.deptA,
+            email: tempEmail('emp_override'),
+            daily_limit: 1,
+            daily_limit_mode: 'enforce',
+            warning_enabled: true,
+            access_level_id: level.json.access_level.id
+        }
+    });
+    assert.equal(employee.status, 201);
+
+    const uid = tempUid('A0');
+    const card = await requestJson('POST', `/api/employees/${employee.json.employee.id}/cards`, {
+        token: managerToken,
+        body: {
+            uid,
+            label: 'TAG jerarquía'
+        }
+    });
+    assert.equal(card.status, 201);
+
+    const firstTap = await requestJson('POST', '/api/tap', {
+        headers: machineHeaders(fixture.machine.mac),
+        body: { nfc_uid: uid }
+    });
+    assert.equal(firstTap.status, 200);
+    assert.equal(firstTap.json.daily_limit_mode, 'warn_only');
+
+    const secondTap = await requestJson('POST', '/api/tap', {
+        headers: machineHeaders(fixture.machine.mac),
+        body: { nfc_uid: uid }
+    });
+    assert.equal(secondTap.status, 200);
+    assert.equal(secondTap.json.daily_limit_mode, 'warn_only');
+    assert.equal(secondTap.json.taps_today, 2);
+
+    const cards = await requestJson('GET', '/api/tap/cards', {
+        headers: machineHeaders(fixture.machine.mac)
+    });
+    assert.equal(cards.status, 200);
+    const cachedCard = cards.json.cards.find(item => item.uid === uid);
+    assert.ok(cachedCard, 'No apareció la tarjeta en /api/tap/cards');
+    assert.equal(Number(cachedCard.daily_limit), 1);
+    assert.equal(cachedCard.daily_limit_mode, 'warn_only');
+});
+
+test('reportes filtran empleados por jerarquía y por configuración manual', async () => {
+    const levelName = `${TEST_PREFIX}_nivel_reportes`;
+    const level = await requestJson('POST', '/api/access-levels', {
+        token: managerToken,
+        body: {
+            name: levelName,
+            daily_limit: 3,
+            daily_limit_mode: 'enforce',
+            warning_enabled: true,
+            sort_order: 30,
+            active: true
+        }
+    });
+    assert.equal(level.status, 201);
+
+    const assigned = await requestJson('POST', '/api/employees', {
+        token: managerToken,
+        body: {
+            name: `${TEST_PREFIX}_emp_report_level`,
+            department: fixture.departments.deptA,
+            email: tempEmail('emp_report_level'),
+            daily_limit: 4,
+            daily_limit_mode: 'warn_only',
+            warning_enabled: true,
+            access_level_id: level.json.access_level.id
+        }
+    });
+    assert.equal(assigned.status, 201);
+
+    const manual = await requestJson('POST', '/api/employees', {
+        token: managerToken,
+        body: {
+            name: `${TEST_PREFIX}_emp_report_manual`,
+            department: fixture.departments.deptA,
+            email: tempEmail('emp_report_manual'),
+            daily_limit: 2,
+            daily_limit_mode: 'enforce',
+            warning_enabled: true
+        }
+    });
+    assert.equal(manual.status, 201);
+
+    const range = `from=${todayIso()}&to=${todayIso()}`;
+    const byLevel = await requestJson(
+        'GET',
+        `/api/reports/employees?${range}&access_level_id=${level.json.access_level.id}`,
+        { token: managerToken }
+    );
+    assert.equal(byLevel.status, 200);
+    const levelEmployee = byLevel.json.employees.find(item => item.id === assigned.json.employee.id);
+    assert.ok(levelEmployee, 'No apareció el empleado asignado al nivel en el filtro por jerarquía');
+    assert.equal(levelEmployee.access_level_name, levelName);
+    assert.equal(levelEmployee.policy_source, 'access_level');
+    assert.ok(!byLevel.json.employees.some(item => item.id === manual.json.employee.id));
+
+    const manualOnly = await requestJson(
+        'GET',
+        `/api/reports/employees?${range}&access_level_id=manual`,
+        { token: managerToken }
+    );
+    assert.equal(manualOnly.status, 200);
+    assert.ok(manualOnly.json.employees.some(item => item.id === manual.json.employee.id));
+    assert.ok(!manualOnly.json.employees.some(item => item.id === assigned.json.employee.id));
+});
+
 test('gerente puede configurar stock por máquina y consultarlo', async () => {
     const itemId = Math.floor(Math.random() * 10000) + 1000;
     const created = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock`, {
@@ -830,4 +1065,109 @@ test('técnico no puede acceder a empleados, analítica ni configuración global
 
     const notifications = await requestJson('GET', '/api/notification-settings', { token: technicianToken });
     assert.equal(notifications.status, 403);
+});
+
+test('distribuidor puede gestionar onboarding de máquinas y operar comandos técnicos', async () => {
+    const pendingMacApprove = tempMac();
+    const pendingMacReject = tempMac();
+    const [pendingApprove, pendingReject] = await withDb(async client => {
+        const approve = await client.query(
+            `INSERT INTO pending_machines(mac)
+             VALUES ($1)
+             RETURNING id, mac`,
+            [pendingMacApprove]
+        );
+        const reject = await client.query(
+            `INSERT INTO pending_machines(mac)
+             VALUES ($1)
+             RETURNING id, mac`,
+            [pendingMacReject]
+        );
+        return [approve.rows[0], reject.rows[0]];
+    });
+
+    try {
+        const pendingList = await requestJson('GET', '/api/machines/pending', { token: distributorToken });
+        assert.equal(pendingList.status, 200);
+        assert.ok((pendingList.json.pending || []).some(item => item.id === pendingApprove.id));
+
+        const approved = await requestJson('POST', `/api/machines/pending/${pendingApprove.id}/approve`, {
+            token: distributorToken,
+            body: {
+                name: `${TEST_PREFIX}_machine_setup`,
+                location: 'Sala de pruebas'
+            }
+        });
+        assert.equal(approved.status, 201);
+        assert.equal(approved.json.machine.name, `${TEST_PREFIX}_machine_setup`);
+
+        const rejected = await requestJson('POST', `/api/machines/pending/${pendingReject.id}/reject`, {
+            token: distributorToken
+        });
+        assert.equal(rejected.status, 200);
+
+        const command = await requestJson('POST', `/api/machines/${fixture.machine.id}/commands`, {
+            token: distributorToken,
+            body: { type: 'wifi_scan' }
+        });
+        assert.ok([201, 409].includes(command.status));
+    } finally {
+        await withDb(client => client.query(
+            'DELETE FROM pending_machines WHERE id = ANY($1::int[])',
+            [[pendingApprove.id, pendingReject.id]]
+        ));
+    }
+});
+
+test('distribuidor no puede acceder a analítica, empleados ni configuración global', async () => {
+    const employees = await requestJson('GET', '/api/employees', { token: distributorToken });
+    assert.equal(employees.status, 403);
+
+    const dashboard = await requestJson('GET', '/api/dashboard/today', { token: distributorToken });
+    assert.equal(dashboard.status, 403);
+
+    const reports = await requestJson('GET', '/api/reports/departments', { token: distributorToken });
+    assert.equal(reports.status, 403);
+
+    const users = await requestJson('GET', '/api/admin-users', { token: distributorToken });
+    assert.equal(users.status, 403);
+
+    const block = await requestJson('POST', `/api/machines/${fixture.machine.id}/block`, {
+        token: distributorToken,
+        body: { reason: 'No debería poder bloquear' }
+    });
+    assert.equal(block.status, 403);
+});
+
+test('cuenta protegida no puede editarse ni desactivarse desde el panel', async () => {
+    const users = await requestJson('GET', '/api/admin-users', { token: managerToken });
+    assert.equal(users.status, 200);
+    const protectedUser = users.json.users.find(user => user.id === fixture.protectedAdmin.id);
+    assert.ok(protectedUser, 'No apareció la cuenta protegida en /api/admin-users');
+    assert.equal(protectedUser.is_protected, true);
+
+    const patchAttempt = await requestJson('PATCH', `/api/admin-users/${fixture.protectedAdmin.id}`, {
+        token: adminToken,
+        body: { full_name: 'Intento de cambio' }
+    });
+    assert.equal(patchAttempt.status, 403);
+    assert.match(patchAttempt.json.error, /cuenta protegida/i);
+
+    const deleteAttempt = await requestJson('DELETE', `/api/admin-users/${fixture.protectedAdmin.id}`, {
+        token: adminToken
+    });
+    assert.equal(deleteAttempt.status, 403);
+    assert.match(deleteAttempt.json.error, /cuenta protegida/i);
+});
+
+test('cuenta protegida no puede cambiar su contraseña desde el panel', async () => {
+    const response = await requestJson('POST', '/api/auth/change-password', {
+        token: protectedToken,
+        body: {
+            current_password: 'coffeecontrol2024',
+            new_password: 'NuevaClave2024'
+        }
+    });
+    assert.equal(response.status, 403);
+    assert.match(response.json.error, /soporte local/i);
 });

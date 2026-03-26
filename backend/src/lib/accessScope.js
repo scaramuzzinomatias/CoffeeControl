@@ -1,7 +1,8 @@
 const pool = require('../db/pool');
 
 const MANAGER_ROLES = new Set(['admin', 'gerente']);
-const TECHNICAL_ROLES = new Set(['tecnico']);
+const TECHNICAL_ROLES = new Set(['tecnico', 'distribuidor']);
+const MACHINE_SETUP_ROLES = new Set(['admin', 'gerente', 'distribuidor']);
 const ANALYTICS_ROLES = new Set(['admin', 'gerente', 'supervisor']);
 
 function isManagerRole(role) {
@@ -10,6 +11,10 @@ function isManagerRole(role) {
 
 function isTechnicalRole(role) {
     return TECHNICAL_ROLES.has(role);
+}
+
+function canManageMachineSetup(role) {
+    return MACHINE_SETUP_ROLES.has(role);
 }
 
 function canOperateMachines(role) {
@@ -112,6 +117,7 @@ function buildDepartmentScopeClause({ user, requestedDepartment, params, column 
 module.exports = {
     isManagerRole,
     isTechnicalRole,
+    canManageMachineSetup,
     canOperateMachines,
     canViewAnalytics,
     normalizeDepartmentName,

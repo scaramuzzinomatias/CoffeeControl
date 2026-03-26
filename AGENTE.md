@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 25/03/2026 — panel/admin, notificaciones, control remoto, WebSocket JWT, zona horaria operativa global, auditoría administrativa, stock V1, alertas de stock bajo, reportes específicos de stock y perfil técnico activos en el repo canónico.
+> Última actualización: 26/03/2026 — panel/admin, notificaciones, control remoto, WebSocket JWT, zona horaria operativa global, auditoría administrativa, stock V1, alertas de stock bajo, reportes específicos de stock, perfil técnico, jerarquías de acceso, launcher de mantenimiento Windows y documentación de salida a piloto activos en el repo canónico.
 >
 > **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
@@ -97,6 +97,16 @@ Se subió código de **VMflow.xyz** (ESP32-S3 + MDB + BLE + MQTT). Decisión: no
 
 ---
 
+## Documentación operativa de salida a piloto
+
+- `CHECKLIST_PILOTO.md`
+- `PROTOCOLO_PRUEBAS.md`
+- `GUIA_SOPORTE.md`
+
+Usarlos como referencia principal para instalación, validación online/offline y soporte en campo.
+
+---
+
 ## Estructura de archivos del proyecto
 
 ```
@@ -130,7 +140,7 @@ backend/
         ├── reports.js      ← Rankings por máquina y por empleado
         └── adminUsers.js   ← CRUD usuarios del panel (solo gerente)
 
-coffeecontrol.html          ← Dashboard operativo (conectado al backend real)
+coffeecontrol.html          ← Monitor operativo liviano (solo lectura, misma sesión JWT)
 coffeecontrol-admin.html    ← Panel de administración completo
 ```
 
@@ -229,9 +239,15 @@ machine_approved    { event, mac, machine }
 
 | Rol | Acceso |
 |---|---|
-| `gerente` / `admin` | Todo — incluyendo crear/editar usuarios |
+| `admin` | Todo. Si la cuenta está protegida, solo soporte local puede modificarla |
+| `gerente` | Todo a nivel funcional del cliente — incluyendo crear/editar usuarios |
 | `supervisor` | Dashboard, Reportes y Feed en vivo — acotado a una o varias áreas asignadas, sin configuración ni gestión |
 | `tecnico` | Máquinas, stock y comandos remotos — sin acceso a dashboard, reportes, feed, empleados ni configuración global |
+| `distribuidor` | Máquinas, stock, comandos remotos y onboarding/configuración de máquinas — sin acceso a dashboard, reportes, feed, empleados ni configuración global |
+
+Notas:
+- La cuenta `admin` del sistema puede marcarse como **protegida** (`is_protected=true`).
+- Una cuenta protegida no puede editarse, desactivarse ni cambiar su contraseña desde el panel; solo desde soporte local con `backend/scripts/support-user.js`.
 
 ---
 
@@ -312,13 +328,15 @@ Total pines usados: 10 de 11 disponibles
 - Base de datos PostgreSQL con schema, vistas y migraciones
 - `taps.employee_id` es **nullable** (para taps con `card_unknown`)
 - Panel de administración HTML completo (`coffeecontrol-admin.html`):
-  - Login con JWT, roles `gerente` / `supervisor` / `tecnico`
+  - Login con JWT, roles `gerente` / `supervisor` / `tecnico` / `distribuidor`
   - Dashboard con métricas, ranking, alertas y gráfico en tiempo real
   - **Gestión de máquinas** con filtros client-side: búsqueda, estado (activa/inactiva/bloqueada), actividad (tap hoy / sin actividad)
   - **Control remoto de máquinas**: reinicio, cambio de WiFi, escaneo remoto de redes visibles y detalle de estado de red (SSID, IP, RSSI, backend y último error)
   - **Alertas por email** para advertencia preventiva de límite, empleado bloqueado, máquina offline y stock bajo/sin stock por selección configurada (si SMTP está configurado), con pantalla `Notificaciones` para destinatarios, eventos, umbral (`faltan N cafés`) y prueba manual; las plantillas quedan en configuración interna del backend
   - **Pantalla `Sistema`** para definir la `business_timezone` global con identificadores IANA reales
   - **Política diaria configurable por empleado**: `enforce`, `warn_only` y `off`, con advertencia opcional por email al empleado y a supervisores activos de la misma área
+  - **Jerarquías / niveles de acceso**: pantalla `Jerarquías`, tabla `access_levels`, asignación opcional por empleado (`access_level_id`) y fallback automático a política manual si no hay nivel asignado
+    - la política efectiva se usa en `POST /api/tap`, `POST /api/tap/queue`, `GET /api/tap/cards`, dashboard y reportes
   - **Timezone unificada** entre backend y firmware: dashboard/reportes usan `business_timezone`, `/api/tap/cards` entrega `date + next_reset_at`, y el ESP32-C3 resetea contadores offline con esa referencia
   - **Estados explícitos para TAGs NFC**: `active`, `lost`, `inactive`, con acciones `Marcar perdido`, `Dar de baja`, `Reactivar` y `Reasignar`
 - **Pantalla `Auditoría`** para revisar altas, ediciones, bajas, bloqueos, comandos remotos y cambios de configuración con actor, fecha y detalle técnico saneado
@@ -334,10 +352,11 @@ Total pines usados: 10 de 11 disponibles
   - **Feed en vivo** con WebSocket, UID NFC visible, y 4 filtros client-side (estado, máquina, empleado, motivo rechazo) + botón "Limpiar vista"
   - **WebSocket del panel protegido con JWT** en el handshake de `/ws`
   - **Tarjetas desconocidas**: sección dedicada con badge en el nav, carga desde DB + WS en tiempo real, acciones **Asignar**, **Ver intentos** (historial modal), **Descartar** (persiste en `localStorage` con clave `cc_discarded_uids`; reaparece si el ESP tapea de nuevo)
-  - Gestión de usuarios del panel con roles (`gerente`, `supervisor`, `tecnico`)
+  - Gestión de usuarios del panel con roles (`gerente`, `supervisor`, `tecnico`, `distribuidor`) y soporte para cuentas protegidas
   - **Perfil técnico operativo**: acceso a `Máquinas`, stock y comandos remotos, sin analítica ni configuración global; el detalle de máquina evita exponer consumo nominal de empleados
-  - `backend/test/integration.test.js` cubre login, scope multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos/auditoría de `Notificaciones`, configuración de stock, alerta de stock bajo, reportes de stock, descuento automático en `vend_confirmed` y permisos del rol `tecnico`
-- Dashboard operativo standalone (`coffeecontrol.html`) con WebSocket
+  - **Perfil distribuidor operativo**: onboarding/configuración de máquinas pendientes, más acceso técnico a máquinas, stock y comandos remotos, sin acceso a analítica ni gestión de empleados/usuarios
+  - `backend/test/integration.test.js` cubre login, scope multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos/auditoría de `Notificaciones`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alerta de stock bajo, reportes de stock, descuento automático en `vend_confirmed`, permisos de los roles `tecnico` / `distribuidor` y bloqueo de edición/cambio de contraseña para cuentas protegidas
+- Monitor operativo liviano (`coffeecontrol.html`) con WebSocket y sin configuración administrativa
 - Repositorio git inicializado; checkpoint `a25148b` representa este estado
 
 ### Alta de empleado con tarjeta NFC — flujo actual
@@ -358,8 +377,9 @@ Total pines usados: 10 de 11 disponibles
 - [x] **Control de stock V1** manual/estimado por máquina y selección, con descuento automático en `vend_confirmed`
 - [x] **Reportes específicos de stock** solo para `gerente/admin`, con movimientos del rango
 - [x] **Filtros avanzados en reportes** para empresas grandes (búsqueda rápida por empleado y filtro por área)
-- [x] **Scripts DB y soporte** sin depender de `psql` (`db:init`, `db:migrate:all`, `support:doctor`, creación/reset de usuarios del panel)
+- [x] **Scripts DB y soporte** sin depender de `psql` para la lógica principal (`db:init`, `db:migrate:all`, `db:backup`, `db:purge`, `db:drop`, `db:restore`, `db:rebuild`, `support:doctor`, creación/reset de usuarios del panel) y launcher Windows `mantenimiento-coffeecontrol.bat/.ps1`
 - [x] **Tests de integración mínimos** con `node:test` (`npm run test:integration`)
+- [x] **Jerarquías de acceso** reutilizables con política efectiva online/offline, ABM en panel y filtro en reportes
 - [ ] **Refinar reportes de alto volumen** con recortes adicionales, paginado y filtros más específicos
 - [x] **Perfil técnico** para operar máquinas y stock sin permisos gerenciales completos
 - [ ] **Multi-tenant** para modo SaaS (campo `tenant_id` en todas las tablas, schema separado por empresa)

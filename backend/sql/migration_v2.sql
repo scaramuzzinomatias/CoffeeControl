@@ -8,15 +8,16 @@ CREATE TABLE IF NOT EXISTS admin_users (
     id          SERIAL PRIMARY KEY,
     username    VARCHAR(60) UNIQUE NOT NULL,
     password_hash VARCHAR(128) NOT NULL,   -- bcrypt
-    role        VARCHAR(20) NOT NULL DEFAULT 'admin',  -- 'admin' | 'supervisor'
+    role        VARCHAR(20) NOT NULL DEFAULT 'admin',  -- 'admin' | 'gerente' | 'supervisor' | 'tecnico' | 'distribuidor'
+    is_protected BOOLEAN NOT NULL DEFAULT false,
     active      BOOLEAN NOT NULL DEFAULT true,
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Usuario seed por defecto: admin / coffeecontrol
 -- (hash bcrypt de "coffeecontrol", cost=10)
-INSERT INTO admin_users (username, password_hash, role) VALUES
-    ('admin', '$2a$10$V.a1qNi2zNRRT2pIKSqkMe5ao6C9C4gK7JZzHP14NP8WKaCyNjtay', 'admin')
+INSERT INTO admin_users (username, password_hash, role, is_protected) VALUES
+    ('admin', '$2a$10$V.a1qNi2zNRRT2pIKSqkMe5ao6C9C4gK7JZzHP14NP8WKaCyNjtay', 'admin', true)
 ON CONFLICT (username) DO NOTHING;
 
 -- Agregar campos faltantes a employees
@@ -84,11 +85,18 @@ GROUP BY e.id, e.name, e.department, e.legajo, m.id, m.name, m.location;
 -- gerente    → acceso total
 -- supervisor → puede ver dashboard, feed, reportes de SU área
 --              NO puede: crear/editar empleados, bloquear máquinas, ver otros supervisores
+-- tecnico    → opera máquinas, stock y comandos remotos
+-- distribuidor → onboarding y configuración de máquinas, sin analítica ni gestión de usuarios
 
 ALTER TABLE admin_users
+    ADD COLUMN IF NOT EXISTS is_protected BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS department VARCHAR(60),  -- null = acceso a todos los departamentos
     ADD COLUMN IF NOT EXISTS full_name  VARCHAR(100),
     ADD COLUMN IF NOT EXISTS email      VARCHAR(120);
+
+UPDATE admin_users
+SET is_protected = true
+WHERE username = 'admin';
 
 -- Insertar supervisor seed de ejemplo
 -- credenciales: supervisor1 / coffeecontrol2024

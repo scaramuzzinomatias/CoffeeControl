@@ -4,7 +4,7 @@ const {
     normalizeDepartmentList
 } = require('./_lib');
 
-const BOOLEAN_FLAGS = new Set(['activate', 'help', 'h']);
+const BOOLEAN_FLAGS = new Set(['activate', 'help', 'h', 'protected', 'unprotect']);
 
 function parseCli(argv) {
     const args = {};
@@ -47,15 +47,19 @@ function usage() {
         '  node scripts/support-user.js --username admin --password nuevaClave --role admin',
         '  node scripts/support-user.js --username sup.ventas --password coffeecontrol2024 --role supervisor --full-name "Supervisor Ventas" --email sup@empresa.com --departments "Ventas,RRHH"',
         '  node scripts/support-user.js --username tecnico.1 --password coffeecontrol2024 --role tecnico --full-name "Técnico de campo"',
+        '  node scripts/support-user.js --username dist.1 --password coffeecontrol2024 --role distribuidor --full-name "Distribuidor de campo"',
+        '  node scripts/support-user.js --username admin --password nuevaClaveSegura --role admin --protected --activate',
         '',
         'Parámetros:',
         '  --username      requerido',
         '  --password      requerido',
-        '  --role          admin | gerente | supervisor | tecnico',
+        '  --role          admin | gerente | supervisor | tecnico | distribuidor',
         '  --full-name     opcional',
         '  --email         opcional',
         '  --departments   áreas separadas por coma, punto y coma o salto de línea',
-        '  --activate      fuerza active=true'
+        '  --activate      fuerza active=true',
+        '  --protected     marca la cuenta como protegida',
+        '  --unprotect     quita la protección de la cuenta'
     ].join('\n'));
 }
 
@@ -98,13 +102,14 @@ async function main() {
     const fullName = typeof fullNameRaw === 'string' ? fullNameRaw.trim() : null;
     const email = typeof emailRaw === 'string' ? emailRaw.trim() : null;
     const active = args.activate ? true : null;
+    const isProtected = args.protected ? true : (args.unprotect ? false : null);
 
     if (!username || !password) {
         usage();
         throw new Error('username y password son requeridos');
     }
-    if (!['admin', 'gerente', 'supervisor', 'tecnico'].includes(role)) {
-        throw new Error('role inválido. Usá admin, gerente, supervisor o tecnico');
+    if (!['admin', 'gerente', 'supervisor', 'tecnico', 'distribuidor'].includes(role)) {
+        throw new Error('role inválido. Usá admin, gerente, supervisor, tecnico o distribuidor');
     }
     if (password.length < 8) {
         throw new Error('La contraseña debe tener al menos 8 caracteres');
@@ -123,24 +128,27 @@ async function main() {
         try {
             await client.query('BEGIN');
             const existing = await client.query(
-                `SELECT id, username
+                `SELECT id, username, is_protected
                  FROM admin_users
                  WHERE username = $1`,
                 [username]
             );
 
             let userId;
+            let finalProtected = false;
             if (existing.rowCount > 0) {
                 userId = existing.rows[0].id;
-                await client.query(
+                const updated = await client.query(
                     `UPDATE admin_users
                      SET password_hash = $1,
                          role = $2,
                          full_name = COALESCE($3, full_name),
                          department = $4,
                          email = COALESCE($5, email),
-                         active = COALESCE($6, active)
-                     WHERE id = $7`,
+                         active = COALESCE($6, active),
+                         is_protected = COALESCE($7, is_protected)
+                     WHERE id = $8
+                     RETURNING is_protected`,
                     [
                         passwordHash,
                         role,
@@ -148,14 +156,16 @@ async function main() {
                         legacyDepartment,
                         email,
                         active,
+                        isProtected,
                         userId
                     ]
                 );
+                finalProtected = Boolean(updated.rows[0]?.is_protected);
             } else {
                 const inserted = await client.query(
-                    `INSERT INTO admin_users (username, password_hash, role, full_name, department, email, active)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)
-                     RETURNING id`,
+                    `INSERT INTO admin_users (username, password_hash, role, full_name, department, email, active, is_protected)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     RETURNING id, is_protected`,
                     [
                         username,
                         passwordHash,
@@ -163,10 +173,12 @@ async function main() {
                         fullName,
                         legacyDepartment,
                         email,
-                        active === null ? true : active
+                        active === null ? true : active,
+                        isProtected === null ? false : isProtected
                     ]
                 );
                 userId = inserted.rows[0].id;
+                finalProtected = Boolean(inserted.rows[0]?.is_protected);
             }
 
             await syncScopes(client, userId, scopes);
@@ -176,6 +188,7 @@ async function main() {
                 ok: true,
                 username,
                 role,
+                is_protected: finalProtected,
                 department_scopes: scopes,
                 created: existing.rowCount === 0
             }));

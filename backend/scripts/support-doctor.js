@@ -1,4 +1,4 @@
-const { withPool } = require('./_lib');
+const { withPool, findPostgresExecutable } = require('./_lib');
 
 function ok(label, detail) {
     console.log(`OK   ${label}${detail ? ` — ${detail}` : ''}`);
@@ -52,6 +52,16 @@ async function main() {
         warn('SMTP', 'configuración incompleta o pendiente');
     }
 
+    const pgDumpPath = findPostgresExecutable('pg_dump');
+    const psqlPath = findPostgresExecutable('psql');
+    const pgRestorePath = findPostgresExecutable('pg_restore');
+    if (pgDumpPath) ok('pg_dump', pgDumpPath);
+    else warn('pg_dump', 'no encontrado — db:backup no va a funcionar hasta instalar PostgreSQL o definir PG_BIN');
+    if (psqlPath) ok('psql', psqlPath);
+    else warn('psql', 'no encontrado — restore de backups .sql no va a funcionar');
+    if (pgRestorePath) ok('pg_restore', pgRestorePath);
+    else warn('pg_restore', 'no encontrado — restore de backups .dump no va a funcionar');
+
     await withPool(async (pool) => {
         const dbNow = await pool.query('SELECT NOW() AS now');
         ok('PostgreSQL', `conectado (${dbNow.rows[0].now.toISOString()})`);
@@ -64,6 +74,7 @@ async function main() {
                 ('public.machines'),
                 ('public.admin_users'),
                 ('public.admin_user_departments'),
+                ('public.access_levels'),
                 ('public.alert_events'),
                 ('public.notification_settings'),
                 ('public.system_settings'),
@@ -82,10 +93,11 @@ async function main() {
                 (SELECT COUNT(*)::int FROM nfc_cards) AS nfc_cards,
                 (SELECT COUNT(*)::int FROM machines) AS machines,
                 (SELECT COUNT(*)::int FROM admin_users) AS admin_users,
-                (SELECT COUNT(*)::int FROM admin_user_departments) AS admin_user_departments`
+                (SELECT COUNT(*)::int FROM admin_user_departments) AS admin_user_departments,
+                (SELECT COUNT(*)::int FROM access_levels) AS access_levels`
         );
         const snapshot = counts.rows[0];
-        ok('Conteos', `employees=${snapshot.employees}, nfc_cards=${snapshot.nfc_cards}, machines=${snapshot.machines}, admin_users=${snapshot.admin_users}, admin_user_departments=${snapshot.admin_user_departments}`);
+        ok('Conteos', `employees=${snapshot.employees}, nfc_cards=${snapshot.nfc_cards}, machines=${snapshot.machines}, admin_users=${snapshot.admin_users}, admin_user_departments=${snapshot.admin_user_departments}, access_levels=${snapshot.access_levels}`);
     });
 
     await httpHealth();

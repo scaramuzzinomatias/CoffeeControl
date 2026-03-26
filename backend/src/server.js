@@ -17,6 +17,7 @@ const machineCommandRoutes = require('./routes/machineCommands');
 const reportRoutes     = require('./routes/reports');
 const adminUserRoutes  = require('./routes/adminUsers');
 const nfcCardsRoutes   = require('./routes/nfcCards');
+const accessLevelsRoutes = require('./routes/accessLevels');
 const notificationSettingsRoutes = require('./routes/notificationSettings');
 const systemSettingsRoutes = require('./routes/systemSettings');
 const auditLogsRoutes = require('./routes/auditLogs');
@@ -56,6 +57,7 @@ app.use('/api/machines', (req, res, next) => {
 app.use('/api/reports',     authJwt, reportRoutes);
 app.use('/api/admin-users', authJwt, adminUserRoutes);
 app.use('/api/nfc-cards',   authJwt, nfcCardsRoutes);
+app.use('/api/access-levels', authJwt, accessLevelsRoutes);
 app.use('/api/notification-settings', authJwt, notificationSettingsRoutes);
 app.use('/api/system-settings', authJwt, systemSettingsRoutes);
 app.use('/api/audit-logs', authJwt, auditLogsRoutes);
@@ -82,7 +84,7 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`\n CoffeeControl v2 en http://localhost:${PORT}`);
     console.log(` Red local:    http://192.168.1.76:${PORT}`);
     console.log(` Panel admin:  http://localhost:${PORT}/`);
-    console.log(` Dashboard:    http://localhost:${PORT}/coffeecontrol.html`);
+    console.log(` Monitor op:   http://localhost:${PORT}/coffeecontrol.html`);
     console.log(` Demo:         http://localhost:${PORT}/demo.html`);
     console.log(` Credenciales seed: admin / coffeecontrol | supervisor1 / coffeecontrol2024\n`);
 });

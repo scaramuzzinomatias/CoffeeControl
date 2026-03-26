@@ -2,44 +2,13 @@ const fs = require('fs');
 const path = require('path');
 const { withPool, sqlDir } = require('./_lib');
 
-function migrationVersion(filename) {
-    const match = /^migration_v(\d+)\.sql$/i.exec(filename);
-    return match ? parseInt(match[1], 10) : null;
-}
-
 const BASELINE_CHECKS = [
-    { version: 17, sql: `SELECT to_regclass('public.admin_user_departments') IS NOT NULL AS ok` },
-    { version: 16, sql: `SELECT to_regclass('public.audit_logs') IS NOT NULL AS ok` },
-    { version: 15, sql: `SELECT EXISTS (
+    { version: 4, sql: `SELECT EXISTS (
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = 'public'
-          AND table_name = 'nfc_cards'
-          AND column_name = 'status'
-    ) AS ok` },
-    { version: 14, sql: `SELECT to_regclass('public.system_settings') IS NOT NULL AS ok` },
-    { version: 11, sql: `SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'notification_settings'
-          AND column_name = 'employee_limit_warning_lead'
-    ) AS ok` },
-    { version: 10, sql: `SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'employees'
-          AND column_name = 'daily_limit_mode'
-    ) AS ok` },
-    { version: 9, sql: `SELECT to_regclass('public.notification_settings') IS NOT NULL AS ok` },
-    { version: 8, sql: `SELECT to_regclass('public.alert_events') IS NOT NULL AS ok` },
-    { version: 7, sql: `SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'machines'
-          AND column_name = 'backend_ok'
+          AND table_name = 'daily_consumption'
+          AND column_name = 'taps_over_limit'
     ) AS ok` },
     { version: 6, sql: `SELECT EXISTS (
         SELECT 1
@@ -48,21 +17,55 @@ const BASELINE_CHECKS = [
           AND table_name = 'machines'
           AND column_name = 'wifi_ssid'
     ) AS ok` },
-    { version: 5, sql: `SELECT to_regclass('public.machine_commands') IS NOT NULL AS ok` },
-    { version: 3, sql: `SELECT EXISTS (
+    { version: 7, sql: `SELECT EXISTS (
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = 'machines'
-          AND column_name = 'mac'
+          AND column_name = 'backend_ok'
     ) AS ok` },
-    { version: 2, sql: `SELECT EXISTS (
+    { version: 8, sql: `SELECT to_regclass('public.alert_events') IS NOT NULL AS ok` },
+    { version: 9, sql: `SELECT to_regclass('public.notification_settings') IS NOT NULL AS ok` },
+    { version: 10, sql: `SELECT EXISTS (
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = 'public'
-          AND table_name = 'admin_users'
-          AND column_name = 'department'
-    ) AS ok` }
+          AND table_name = 'employees'
+          AND column_name = 'daily_limit_mode'
+    ) AS ok` },
+    { version: 11, sql: `SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'notification_settings'
+          AND column_name = 'employee_limit_warning_lead'
+    ) AS ok` },
+    { version: 14, sql: `SELECT to_regclass('public.system_settings') IS NOT NULL AS ok` },
+    { version: 15, sql: `SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'nfc_cards'
+          AND column_name = 'status'
+    ) AS ok` },
+    { version: 16, sql: `SELECT to_regclass('public.audit_logs') IS NOT NULL AS ok` },
+    { version: 17, sql: `SELECT to_regclass('public.admin_user_departments') IS NOT NULL AS ok` },
+    { version: 18, sql: `SELECT to_regclass('public.machine_stock_items') IS NOT NULL
+                              AND to_regclass('public.stock_movements') IS NOT NULL AS ok` },
+    { version: 19, sql: `SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'notification_settings'
+          AND column_name = 'notify_stock_low'
+    ) AS ok` },
+    { version: 21, sql: `SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'employees'
+          AND column_name = 'access_level_id'
+    ) AS ok` },
 ];
 
 async function ensureSchemaMigrationsTable(pool) {
@@ -75,22 +78,18 @@ async function ensureSchemaMigrationsTable(pool) {
     );
 }
 
-async function detectBaselineVersion(pool) {
+async function detectSatisfiedBaselineVersions(pool) {
+    const versions = [];
     for (const check of BASELINE_CHECKS) {
         const result = await pool.query(check.sql);
-        if (result.rows[0]?.ok) return check.version;
+        if (result.rows[0]?.ok) versions.push(check.version);
     }
-    return 0;
+    return versions;
 }
 
 async function main() {
-    const files = fs.readdirSync(sqlDir)
-        .map(name => ({
-            name,
-            version: migrationVersion(name)
-        }))
-        .filter(item => Number.isInteger(item.version))
-        .sort((a, b) => a.version - b.version);
+    const { listMigrationFiles } = require('./_lib');
+    const files = listMigrationFiles();
 
     if (!files.length) {
         console.log('No se encontraron migraciones.');
@@ -104,9 +103,9 @@ async function main() {
         const appliedVersions = new Set(appliedResult.rows.map(row => parseInt(row.version, 10)));
 
         if (!appliedVersions.size) {
-            const baselineVersion = await detectBaselineVersion(pool);
-            if (baselineVersion > 0) {
-                const baselineFiles = files.filter(file => file.version <= baselineVersion);
+            const baselineVersions = await detectSatisfiedBaselineVersions(pool);
+            if (baselineVersions.length > 0) {
+                const baselineFiles = files.filter(file => baselineVersions.includes(file.version));
                 for (const file of baselineFiles) {
                     await pool.query(
                         `INSERT INTO schema_migrations (version, filename)
@@ -116,7 +115,7 @@ async function main() {
                     );
                     appliedVersions.add(file.version);
                 }
-                console.log(`Baseline detectado: v${baselineVersion}. Se marcan migraciones previas como aplicadas.`);
+                console.log(`Baseline detectado: ${baselineFiles.map(file => `v${file.version}`).join(', ')}. Se marcan migraciones ya incorporadas por schema actual.`);
             }
         }
 

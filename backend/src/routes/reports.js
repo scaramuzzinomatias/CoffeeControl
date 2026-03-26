@@ -4,9 +4,15 @@ const systemSettings = require('../services/systemSettings');
 const { buildDepartmentScopeClause } = require('../lib/accessScope');
 const { requireManager, requireAnalyticsViewer } = require('../middleware/roleAccess');
 const { classifyStockStatus } = require('../services/stock');
+const {
+    normalizeAccessLevelFilter,
+    buildAccessLevelClause,
+    effectivePolicyExpressions
+} = require('../lib/accessLevels');
 
 const router = express.Router();
 router.use(requireAnalyticsViewer);
+const effectivePolicy = effectivePolicyExpressions('e', 'al');
 
 function normalizeDateInput(value) {
     const raw = String(value || '').trim();
@@ -55,6 +61,13 @@ function reportMeta(range) {
 function toInt(value, fallback = 0) {
     const parsed = parseInt(value, 10);
     return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+function reportErrorStatus(err) {
+    if (err.status) return err.status;
+    if (err.message?.startsWith('Fecha inválida')) return 400;
+    if (err.message === 'Nivel de acceso inválido') return 400;
+    return 500;
 }
 
 function serializeStockReportItem(row) {
@@ -132,6 +145,7 @@ function buildStockReportSummary(items, movementSummaryRow) {
 router.get('/overview', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
         const params = [range.from, range.to, range.timeZone];
         const scope = buildDepartmentScopeClause({
             user: req.user,
@@ -139,14 +153,27 @@ router.get('/overview', async (req, res) => {
             params,
             column: departmentExpr('e_filter.department')
         });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e_filter.access_level_id'
+        });
         const departmentClause = scope.sql
             ? ` AND EXISTS (
                     SELECT 1
                     FROM employees e_filter
                     WHERE e_filter.id = t.employee_id
                       ${scope.sql}
+                      ${accessLevel.sql}
                 )`
-            : '';
+            : accessLevel.sql
+                ? ` AND EXISTS (
+                        SELECT 1
+                        FROM employees e_filter
+                        WHERE e_filter.id = t.employee_id
+                          ${accessLevel.sql}
+                    )`
+                : '';
         const summaryResult = await pool.query(
             `SELECT
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS approved_taps,
@@ -183,12 +210,13 @@ router.get('/overview', async (req, res) => {
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             summary: summaryResult.rows[0],
             by_day: seriesResult.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -196,12 +224,18 @@ router.get('/overview', async (req, res) => {
 router.get('/machines', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
         const params = [range.from, range.to, range.timeZone];
         const scope = buildDepartmentScopeClause({
             user: req.user,
             requestedDepartment: req.query.department,
             params,
             column: departmentExpr('e_filter.department')
+        });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e_filter.access_level_id'
         });
         const result = await pool.query(
             `SELECT
@@ -220,6 +254,7 @@ router.get('/machines', async (req, res) => {
              LEFT JOIN employees e_filter ON e_filter.id = t.employee_id
              WHERE m.active = true
                ${scope.sql}
+               ${accessLevel.sql}
              GROUP BY m.id, m.name, m.location
              ORDER BY spent_cents DESC, taps_count DESC, m.name`,
             params
@@ -228,11 +263,12 @@ router.get('/machines', async (req, res) => {
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             machines: result.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -240,6 +276,7 @@ router.get('/machines', async (req, res) => {
 router.get('/machines/:id/employees', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
         const params = [req.params.id, range.from, range.to, range.timeZone];
         const scope = buildDepartmentScopeClause({
             user: req.user,
@@ -247,32 +284,45 @@ router.get('/machines/:id/employees', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e.access_level_id'
+        });
         const result = await pool.query(
             `SELECT
                 e.id,
                 e.name AS employee_name,
                 e.legajo,
                 e.department,
+                e.access_level_id,
+                al.name AS access_level_name,
+                ${effectivePolicy.dailyLimit} AS daily_limit,
+                ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
+                ${effectivePolicy.source} AS policy_source,
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS taps_count,
                 COUNT(t.id) FILTER (WHERE t.approved = false) AS denied_taps,
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents
              FROM taps t
              JOIN employees e ON e.id = t.employee_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              WHERE t.machine_id = $1
                AND ${buildBusinessDateRangeSql('t.tapped_at', 2, 3, 4)}
                ${scope.sql}
-             GROUP BY e.id, e.name, e.legajo, e.department
+               ${accessLevel.sql}
+             GROUP BY e.id, al.id
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
             params
         );
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             employees: result.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -281,6 +331,7 @@ router.get('/employees', async (req, res) => {
     try {
         const range = await getReportRange(req);
         const employeeSearch = normalizeTextFilter(req.query.employee_search, 120);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
         const params = [range.from, range.to, range.timeZone];
         const whereClauses = ['e.active = true'];
         const scope = buildDepartmentScopeClause({
@@ -289,7 +340,13 @@ router.get('/employees', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e.access_level_id'
+        });
         if (scope.sql) whereClauses.push(scope.sql.replace(/^ AND /, ''));
+        if (accessLevel.sql) whereClauses.push(accessLevel.sql.replace(/^ AND /, ''));
         if (employeeSearch) {
             params.push(`%${employeeSearch}%`);
             whereClauses.push(`(
@@ -307,19 +364,24 @@ router.get('/employees', async (req, res) => {
                 e.name,
                 e.legajo,
                 e.department,
-                e.daily_limit,
-                e.daily_limit_mode,
+                e.access_level_id,
+                al.name AS access_level_name,
+                ${effectivePolicy.dailyLimit} AS daily_limit,
+                ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
+                ${effectivePolicy.warningEnabled} AS warning_enabled,
+                ${effectivePolicy.source} AS policy_source,
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS taps_count,
                 COUNT(t.id) FILTER (WHERE t.approved = false) AS denied_taps,
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents,
                 COUNT(DISTINCT t.machine_id) FILTER (WHERE t.approved = true) AS machines_count,
                 MAX(t.tapped_at) AS last_tap_at
              FROM employees e
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              LEFT JOIN taps t
                ON t.employee_id = e.id
                AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              WHERE ${whereClauses.join(' AND ')}
-             GROUP BY e.id, e.name, e.legajo, e.department, e.daily_limit, e.daily_limit_mode
+             GROUP BY e.id, al.id
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
             params
         );
@@ -327,12 +389,13 @@ router.get('/employees', async (req, res) => {
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             employee_search: employeeSearch || null,
             employees: result.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -340,12 +403,18 @@ router.get('/employees', async (req, res) => {
 router.get('/employees/:id/machines', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
         const params = [req.params.id, range.from, range.to, range.timeZone];
         const scope = buildDepartmentScopeClause({
             user: req.user,
             requestedDepartment: req.query.department,
             params,
             column: departmentExpr('e.department')
+        });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e.access_level_id'
         });
         const result = await pool.query(
             `SELECT
@@ -362,6 +431,7 @@ router.get('/employees/:id/machines', async (req, res) => {
              WHERE t.employee_id = $1
                AND ${buildBusinessDateRangeSql('t.tapped_at', 2, 3, 4)}
                ${scope.sql}
+               ${accessLevel.sql}
              GROUP BY m.id, m.name, m.location
              ORDER BY spent_cents DESC, taps_count DESC, m.name`,
             params
@@ -369,11 +439,12 @@ router.get('/employees/:id/machines', async (req, res) => {
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             machines: result.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -381,6 +452,7 @@ router.get('/employees/:id/machines', async (req, res) => {
 router.get('/departments', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
         const params = [range.from, range.to, range.timeZone];
         const whereClauses = ['e.active = true'];
         const scope = buildDepartmentScopeClause({
@@ -389,7 +461,13 @@ router.get('/departments', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e.access_level_id'
+        });
         if (scope.sql) whereClauses.push(scope.sql.replace(/^ AND /, ''));
+        if (accessLevel.sql) whereClauses.push(accessLevel.sql.replace(/^ AND /, ''));
         const result = await pool.query(
             `SELECT
                 COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área') AS department,
@@ -410,11 +488,12 @@ router.get('/departments', async (req, res) => {
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             departments: result.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -425,6 +504,7 @@ router.get('/recent-taps', async (req, res) => {
         const limit = normalizeLimit(req.query.limit, 30, 100);
         const machineId = parseInt(req.query.machine_id, 10);
         const employeeId = parseInt(req.query.employee_id, 10);
+        const accessLevelFilter = normalizeAccessLevelFilter(req.query.access_level_id);
 
         const clauses = [buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)];
         const params = [range.from, range.to, range.timeZone];
@@ -434,7 +514,13 @@ router.get('/recent-taps', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
+        const accessLevel = buildAccessLevelClause({
+            filter: accessLevelFilter,
+            params,
+            column: 'e.access_level_id'
+        });
         if (scope.sql) clauses.push(scope.sql.replace(/^ AND /, ''));
+        if (accessLevel.sql) clauses.push(accessLevel.sql.replace(/^ AND /, ''));
 
         if (Number.isInteger(machineId)) {
             params.push(machineId);
@@ -457,10 +543,13 @@ router.get('/recent-taps', async (req, res) => {
                 t.tapped_at,
                 e.name AS employee_name,
                 e.legajo,
+                e.access_level_id,
+                al.name AS access_level_name,
                 m.name AS machine_name,
                 m.location
              FROM taps t
              LEFT JOIN employees e ON e.id = t.employee_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id
              JOIN machines m ON m.id = t.machine_id
              WHERE ${clauses.join(' AND ')}
              ORDER BY t.tapped_at DESC
@@ -471,11 +560,12 @@ router.get('/recent-taps', async (req, res) => {
         return res.json({
             ...reportMeta(range),
             department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            access_level_filter: accessLevel.value,
             department_scopes: scope.appliedScopes,
             taps: result.rows
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -587,7 +677,7 @@ router.get('/stock', requireManager, async (req, res) => {
             recent_movements: recentMovementsResult.rows.map(serializeStockReportMovement)
         });
     } catch (err) {
-        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        const status = reportErrorStatus(err);
         return res.status(status).json({ error: err.message });
     }
 });

@@ -62,12 +62,17 @@ function toggleUserDepartmentFields(){
 function openEditUserFromButton(btn){
   const payload=btn?.getAttribute('data-user')||'';
   if(!payload) return;
-  openEditUser(JSON.parse(decodeURIComponent(payload)));
+  const user=JSON.parse(decodeURIComponent(payload));
+  if(user?.is_protected){
+    alert('La cuenta protegida solo puede modificarse desde soporte local.');
+    return;
+  }
+  openEditUser(user);
 }
 
 function renderUsers(users){
-  const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor',tecnico:'Técnico'};
-  const roleBadge = {admin:'bi',gerente:'bi',supervisor:'bw',tecnico:'bs'};
+  const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor',tecnico:'Técnico',distribuidor:'Distribuidor'};
+  const roleBadge = {admin:'bi',gerente:'bi',supervisor:'bw',tecnico:'bs',distribuidor:'bs'};
   const rows = users.map(u=>`<tr>
     <td>
       <strong>${u.username}</strong>
@@ -76,11 +81,15 @@ function renderUsers(users){
     </td>
     <td><span class="badge ${roleBadge[u.role]||'bs'}">${roleLabel[u.role]||u.role}</span></td>
     <td>${formatDepartmentScopesLabel(u)}</td>
-    <td><span class="badge ${u.active?'bs':'bd'}">${u.active?'Activo':'Inactivo'}</span></td>
+    <td>
+      <span class="badge ${u.active?'bs':'bd'}">${u.active?'Activo':'Inactivo'}</span>
+      ${u.is_protected?'<span class="badge bi" style="margin-left:4px">Protegida</span>':''}
+    </td>
     <td style="font-size:11px;color:var(--tx3)">${new Date(u.created_at).toLocaleDateString('es-AR')}</td>
-    <td style="white-space:nowrap">
-      <button class="btn btn-ghost btn-xs" data-user="${escHtml(encodeURIComponent(JSON.stringify(u)))}" onclick="openEditUserFromButton(this)">Editar</button>
-      <button class="btn btn-xs" style="background:var(--bgd);color:var(--txd);margin-left:4px" onclick="deleteUser(${u.id},'${u.username}')">Eliminar</button>
+    <td style="white-space:nowrap">${u.is_protected
+      ? '<span style="font-size:11px;color:var(--tx3)">Solo soporte local</span>'
+      : `<button class="btn btn-ghost btn-xs" data-user="${escHtml(encodeURIComponent(JSON.stringify(u)))}" onclick="openEditUserFromButton(this)">Editar</button>
+      <button class="btn btn-xs" style="background:var(--bgd);color:var(--txd);margin-left:4px" onclick="deleteUser(${u.id},'${u.username}')">Eliminar</button>`}
     </td>
   </tr>`).join('');
 
@@ -95,6 +104,8 @@ function renderUsers(users){
       &nbsp;·&nbsp;<strong>Gerente</strong> — acceso total, puede crear/editar usuarios
       &nbsp;·&nbsp;<strong>Supervisor</strong> — puede ver dashboard y reportes de una o varias áreas asignadas, sin acceso a configuración
       &nbsp;·&nbsp;<strong>Técnico</strong> — opera máquinas, stock y comandos remotos, sin acceso a consumo por empleado ni configuración global
+      &nbsp;·&nbsp;<strong>Distribuidor</strong> — onboarding y configuración de máquinas, sin acceso a analítica, empleados ni configuración global
+      <br><strong>Cuentas protegidas:</strong> no pueden editarse, desactivarse ni cambiar su contraseña desde el panel; solo desde soporte local.
     </div>
   </div>
   <div class="card">
@@ -119,6 +130,7 @@ function openAddUser(){
           <option value="gerente">Gerente (acceso total)</option>
           <option value="supervisor" selected>Supervisor (solo lectura)</option>
           <option value="tecnico">Técnico (máquinas y stock)</option>
+          <option value="distribuidor">Distribuidor (instalación y máquinas)</option>
         </select>
       </div>
     </div>
@@ -167,6 +179,7 @@ function openEditUser(user){
           <option value="admin" ${data.role==='admin'?'selected':''}>Administrador</option>
           <option value="supervisor" ${data.role==='supervisor'?'selected':''}>Supervisor</option>
           <option value="tecnico" ${data.role==='tecnico'?'selected':''}>Técnico</option>
+          <option value="distribuidor" ${data.role==='distribuidor'?'selected':''}>Distribuidor</option>
         </select>
       </div>
     </div>
@@ -204,6 +217,199 @@ async function deleteUser(id,username){
   if(!confirm('¿Desactivar al usuario "'+username+'"?')) return;
   try{await api('DELETE',`/api/admin-users/${id}`);loadUsers();}
   catch(e){alert('Error: '+e.message);}
+}
+
+// ══════════════════════════════════════════════════════
+//  JERARQUÍAS / NIVELES DE ACCESO
+// ══════════════════════════════════════════════════════
+function normalizeAccessLevelIdValue(value){
+  const raw=String(value??'').trim();
+  if(!raw) return null;
+  const parsed=parseInt(raw,10);
+  return Number.isInteger(parsed)&&parsed>0 ? parsed : null;
+}
+
+function findAccessLevelById(id){
+  const parsed=normalizeAccessLevelIdValue(id);
+  if(!parsed) return null;
+  return (accessLevelCache||[]).find(level=>Number(level.id)===parsed) || null;
+}
+
+function accessLevelDisplayName(levelOrRow){
+  if(levelOrRow?.policy_source==='access_level' && levelOrRow?.access_level_name) return levelOrRow.access_level_name;
+  if(levelOrRow?.access_level_name) return levelOrRow.access_level_name;
+  const level=findAccessLevelById(levelOrRow?.access_level_id);
+  if(level?.name) return level.name;
+  return 'Manual';
+}
+
+function accessLevelSourceLabel(row){
+  return row?.policy_source==='access_level' ? 'Jerarquía' : 'Manual';
+}
+
+function accessLevelPolicySummary(levelOrRow){
+  return employeeLimitPolicyText({
+    daily_limit: levelOrRow?.daily_limit,
+    daily_limit_mode: levelOrRow?.daily_limit_mode,
+    policy_source: 'manual',
+    access_level_name: null
+  });
+}
+
+function accessLevelOptionsHtml(selectedId,{includeInactive=false, allowManual=true}={}){
+  const selected=normalizeAccessLevelIdValue(selectedId);
+  const items=(accessLevelCache||[]).filter(level=>includeInactive || level.active!==false || Number(level.id)===selected);
+  const rows=items.map(level=>{
+    const inactive=level.active===false ? ' (inactiva)' : '';
+    return `<option value="${level.id}" ${Number(level.id)===selected?'selected':''}>${escHtml(level.name)}${escHtml(inactive)}</option>`;
+  }).join('');
+  return `${allowManual?`<option value="">Manual / sin jerarquía</option>`:''}${rows}`;
+}
+
+async function refreshAccessLevelsCache(includeInactive=false){
+  const qs=includeInactive ? '?include_inactive=true' : '';
+  const d=await api('GET',`/api/access-levels${qs}`);
+  accessLevelCache=d.access_levels||[];
+  return accessLevelCache;
+}
+
+function renderAccessLevels(){
+  const rows=(accessLevelCache||[]).map(level=>`<tr>
+    <td>
+      <div style="font-weight:600">${escHtml(level.name)}</div>
+      <div style="font-size:11px;color:var(--tx3);font-family:monospace">${escHtml(level.code||'')}</div>
+      ${level.description?`<div style="font-size:11px;color:var(--tx3);margin-top:4px">${escHtml(level.description)}</div>`:''}
+    </td>
+    <td>${escHtml(accessLevelPolicySummary(level))}</td>
+    <td>${level.warning_enabled===false?'<span class="badge bw">Sin advertencia</span>':'<span class="badge bs">Advertencia activa</span>'}</td>
+    <td>${formatReportInt(level.employees_count||0)}</td>
+    <td>${formatReportInt(level.sort_order||0)}</td>
+    <td>${level.active===false?'<span class="badge bd">Inactiva</span>':'<span class="badge bs">Activa</span>'}</td>
+    <td style="white-space:nowrap">
+      <button class="btn btn-ghost btn-xs" onclick="openEditAccessLevel(${level.id})">Editar</button>
+      <button class="btn btn-ghost btn-xs" style="margin-left:4px;color:var(--txd)" onclick='deactivateAccessLevel(${level.id},${JSON.stringify(level.name||'')})'>Desactivar</button>
+    </td>
+  </tr>`).join('');
+  render(`
+    <div class="topbar">
+      <div class="page-title">Jerarquías</div>
+      <button class="btn btn-primary btn-sm" onclick="openAddAccessLevel()">+ Nueva jerarquía</button>
+    </div>
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+      <div style="font-size:13px;color:var(--txi)">
+        Definí políticas reutilizables para distintos perfiles operativos. Cuando un empleado tiene jerarquía asignada, esa política prevalece sobre su configuración manual.
+      </div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Jerarquía</th><th>Política diaria</th><th>Advertencia</th><th>Empleados</th><th>Orden</th><th>Estado</th><th></th></tr></thead>
+        <tbody>${rows||'<tr><td colspan="7" class="empty">Sin jerarquías configuradas</td></tr>'}</tbody>
+      </table>
+    </div>
+  `);
+}
+
+async function loadAccessLevels(){
+  render('<div class="page-title">Jerarquías</div><div class="empty">Cargando...</div>');
+  try{
+    await refreshAccessLevelsCache(true);
+    renderAccessLevels();
+  }catch(e){
+    render('<div class="page-title">Jerarquías</div><p style="color:var(--txd)">'+e.message+'</p>');
+  }
+}
+
+function toggleAccessLevelCodeHelp(){
+  const codeInput=document.getElementById('alCode');
+  const hint=document.getElementById('alCodeHint');
+  if(!codeInput||!hint) return;
+  hint.textContent=codeInput.value.trim()
+    ? 'Si lo cambiás, usá un identificador corto y estable.'
+    : 'Si lo dejás vacío, se genera automáticamente a partir del nombre.';
+}
+
+function buildAccessLevelModalBody(level={}){
+  return `
+    <div class="field-row">
+      <div class="field"><label>Nombre *</label><input id="alName" value="${escHtml(level.name||'')}" placeholder="Gerencia"></div>
+      <div class="field"><label>Código interno</label><input id="alCode" value="${escHtml(level.code||'')}" placeholder="gerencia" oninput="toggleAccessLevelCodeHelp()"></div>
+    </div>
+    <div style="font-size:12px;color:var(--tx3);margin-top:-6px;margin-bottom:12px" id="alCodeHint">Si lo dejás vacío, se genera automáticamente a partir del nombre.</div>
+    <div class="field"><label>Descripción</label><input id="alDescription" value="${escHtml(level.description||'')}" placeholder="Acceso preferencial para gerencia"></div>
+    <div class="field-row">
+      <div class="field"><label>Límite diario *</label><input id="alLimit" type="number" min="1" max="50" value="${escHtml(level.daily_limit||4)}"></div>
+      <div class="field">
+        <label>Modo</label>
+        <select id="alMode">
+          <option value="enforce" ${level.daily_limit_mode==='enforce'||!level.daily_limit_mode?'selected':''}>Bloquear al alcanzar el límite</option>
+          <option value="warn_only" ${level.daily_limit_mode==='warn_only'?'selected':''}>Solo advertir y registrar</option>
+          <option value="off" ${level.daily_limit_mode==='off'?'selected':''}>Sin límite diario</option>
+        </select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Orden</label><input id="alSort" type="number" min="0" max="9999" value="${escHtml(level.sort_order??100)}"></div>
+      <div class="field"></div>
+    </div>
+    <label class="pw-inline" style="margin-top:-4px;margin-bottom:8px"><input type="checkbox" id="alWarn" ${level.warning_enabled===false?'':'checked'}> Enviar advertencia preventiva al acercarse al límite</label>
+    <label class="pw-inline" style="margin-top:0;margin-bottom:12px"><input type="checkbox" id="alActive" ${level.active===false?'':'checked'}> Jerarquía activa</label>
+    <div class="err-banner" id="alErr"></div>
+  `;
+}
+
+function accessLevelFormPayload(){
+  return {
+    name: v('alName'),
+    code: v('alCode'),
+    description: v('alDescription'),
+    daily_limit: parseInt(v('alLimit'),10)||4,
+    daily_limit_mode: v('alMode')||'enforce',
+    warning_enabled: !!document.getElementById('alWarn')?.checked,
+    sort_order: parseInt(v('alSort'),10)||0,
+    active: !!document.getElementById('alActive')?.checked
+  };
+}
+
+function openAddAccessLevel(){
+  openModal('Nueva jerarquía',buildAccessLevelModalBody({daily_limit:4,daily_limit_mode:'enforce',warning_enabled:true,sort_order:100,active:true}),'saveAccessLevel()');
+  toggleAccessLevelCodeHelp();
+}
+
+async function saveAccessLevel(){
+  try{
+    await api('POST','/api/access-levels',accessLevelFormPayload());
+    closeModal();
+    await refreshAccessLevelsCache(true);
+    if(currentPage==='levels') renderAccessLevels();
+  }catch(e){showModalErr('alErr',e.message);}
+}
+
+async function openEditAccessLevel(id){
+  const level=findAccessLevelById(id);
+  if(!level){
+    alert('No se encontró la jerarquía.');
+    return;
+  }
+  openModal(`Editar jerarquía: ${level.name}`,buildAccessLevelModalBody(level),`updateAccessLevel(${id})`);
+  toggleAccessLevelCodeHelp();
+}
+
+async function updateAccessLevel(id){
+  try{
+    await api('PATCH',`/api/access-levels/${id}`,accessLevelFormPayload());
+    closeModal();
+    await refreshAccessLevelsCache(true);
+    if(currentPage==='levels') renderAccessLevels();
+  }catch(e){showModalErr('alErr',e.message);}
+}
+
+async function deactivateAccessLevel(id,name){
+  if(!confirm(`¿Desactivar la jerarquía "${name}"? Los empleados asignados conservarán la referencia, pero dejará de ofrecerse como opción nueva.`)) return;
+  try{
+    await api('DELETE',`/api/access-levels/${id}`);
+    await refreshAccessLevelsCache(true);
+    if(currentPage==='levels') renderAccessLevels();
+  }catch(e){alert('Error: '+e.message);}
 }
 
 // ══════════════════════════════════════════════════════
@@ -849,6 +1055,7 @@ tr:hover td{background:var(--bg2);}
 /* MISC */
 .ws-pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:100px;background:var(--bg2);color:var(--tx3);border:1px solid var(--br);}
 .ws-pill.ok{background:var(--bgs);color:var(--txs);border-color:transparent;}
+.ws-pill.na{background:var(--bgi);color:var(--txi);border-color:transparent;}
 .ws-dot{width:6px;height:6px;border-radius:50%;background:currentColor;}
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:10px;}
 .section-lbl{font-size:11px;font-weight:500;color:var(--tx2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
@@ -898,6 +1105,7 @@ tr:hover td{background:var(--bg2);}
   <div class="nav-item"     onclick="nav('live')"       id="n-live"><span class="nav-icon">●</span>Feed en vivo</div>
   <div class="nav-item"     onclick="nav('unknown')"    id="n-unknown"><span class="nav-icon">⚑</span>NFCs sin asignar <span id="unknownBadge" style="display:none;background:#E24B4A;color:#fff;border-radius:100px;font-size:10px;padding:1px 6px;margin-left:4px">0</span></div>
   <div class="nav-item"     onclick="nav('nfc')"       id="n-nfc"><span class="nav-icon">📶</span>TAGs NFC</div>
+  <div class="nav-item"     onclick="nav('levels')" id="n-levels" style="display:none"><span class="nav-icon">▣</span>Jerarquías</div>
   
   <div class="nav-item"     onclick="nav('notifications')" id="n-notifications" style="display:none"><span class="nav-icon">✉</span>Notificaciones</div>
   <div class="nav-item"     onclick="nav('system')" id="n-system" style="display:none"><span class="nav-icon">⌘</span>Sistema</div>
@@ -906,7 +1114,7 @@ tr:hover td{background:var(--bg2);}
   <div id="userInfo" style="padding:8px 18px 0;font-size:12px;color:var(--tx3)"></div>
   <div class="sidebar-bottom">
     <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
-      <div class="ws-pill" id="wsPill" style="flex:1;justify-content:center"><span class="ws-dot"></span><span id="wsLbl">Desconectado</span></div>
+      <div class="ws-pill" id="wsPill" style="flex:1;justify-content:center" title="Estado del feed en vivo via WebSocket"><span class="ws-dot"></span><span id="wsLbl">Desconectado</span></div>
       <button id="themeBtn" onclick="toggleTheme()" title="Modo claro / oscuro" style="background:var(--bg2);border:1px solid var(--br);border-radius:var(--r);padding:5px 7px;cursor:pointer;font-size:13px;color:var(--tx2);line-height:1;flex-shrink:0;">☀</button>
     </div>
     <div class="nav-item" onclick="doLogout()" style="color:var(--txd)"><span class="nav-icon">←</span>Cerrar sesión</div>
@@ -933,13 +1141,18 @@ let remoteWifiMachineName = '';
 let remoteWifiMachineState = null;
 let remoteWifiScanPollTimer = null;
 let remoteWifiScanCommandId = null;
+let accessLevelCache = [];
 
 function isManagerRole(){
   return CURRENT_ROLE==='admin' || CURRENT_ROLE==='gerente';
 }
 
 function isTechnicalRole(){
-  return CURRENT_ROLE==='tecnico';
+  return CURRENT_ROLE==='tecnico' || CURRENT_ROLE==='distribuidor';
+}
+
+function canManageMachineSetup(){
+  return isManagerRole() || CURRENT_ROLE==='distribuidor';
 }
 
 function canOperateMachines(){
@@ -1020,14 +1233,14 @@ function showApp(){
   try{
     const payload = JSON.parse(atob(TOKEN.split('.')[1]));
     CURRENT_ROLE = payload.role || null;
-    const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor',tecnico:'Técnico'}[payload.role]||payload.role;
+    const roleLabel = {admin:'Administrador',gerente:'Gerente',supervisor:'Supervisor',tecnico:'Técnico',distribuidor:'Distribuidor'}[payload.role]||payload.role;
     const ui = document.getElementById('userInfo');
     if(ui) ui.innerHTML = '<strong>'+payload.username+'</strong><br>'+roleLabel;
     const manager = isManagerRole();
     const technical = isTechnicalRole();
     const machineNav=document.getElementById('n-machines');
     if(machineNav) machineNav.style.display=canOperateMachines()?'flex':'none';
-    ['n-employees','n-unknown','n-nfc','n-notifications','n-system','n-audit'].forEach(id=>{
+    ['n-employees','n-unknown','n-nfc','n-levels','n-notifications','n-system','n-audit'].forEach(id=>{
       const el=document.getElementById(id);
       if(el) el.style.display=manager?'flex':'none';
     });
@@ -1044,9 +1257,11 @@ function showApp(){
   connectWS();
   nav(defaultPageForRole());
   if(pendingPollTimer){clearInterval(pendingPollTimer);pendingPollTimer=null;}
-  if(isManagerRole()){
+  if(canManageMachineSetup()){
     checkPending();
     pendingPollTimer=setInterval(checkPending, 30000);
+  }
+  if(isManagerRole()){
     loadUnknownBadge();
   }
 }
@@ -1069,7 +1284,8 @@ async function api(method, path, body){
 // ══════════════════════════════════════════════════════
 function connectWS(){
   if(WS){WS.close();WS=null;}
-  if(!TOKEN || isTechnicalRole()){setWS('off');return;}
+  if(!TOKEN){setWS('off');return;}
+  if(isTechnicalRole()){setWS('na');return;}
   const url=BASE.replace(/^http/,'ws')+'/ws?token='+encodeURIComponent(TOKEN);
   try{WS=new WebSocket(url);}catch(e){setWS('err');return;}
   WS.onopen=()=>setWS('ok');
@@ -1092,7 +1308,7 @@ function connectWS(){
       if(currentPage==='live') prependLive(msg);
     if(canOperateMachines() && (currentPage==='machines'||(msg.event==='machine_blocked'||msg.event==='machine_unblocked'||msg.event==='machine_pending'||msg.event==='machine_approved'||msg.event==='machine_stock_updated'||msg.event==='machine_command_queued'))) loadMachines();
       if(msg.event==='machine_stock_updated' && machineStockState.machineId===msg.machine_id && document.getElementById('modal')?.classList.contains('show')) refreshMachineStockModal();
-      if(isManagerRole() && msg.event==='machine_pending') showPendingBadge();
+      if(canManageMachineSetup() && msg.event==='machine_pending') showPendingBadge();
       if(isManagerRole() && msg.event==='card_unknown') handleUnknownCard(msg);
     }catch(_){}
   };
@@ -1100,9 +1316,21 @@ function connectWS(){
 function setWS(s){
   const p=document.getElementById('wsPill'),l=document.getElementById('wsLbl');
   p.className='ws-pill';
-  if(s==='ok'){p.classList.add('ok');l.textContent='En vivo';}
-  else if(s==='err'){l.textContent='Error WS';}
-  else{l.textContent='Desconectado';}
+  if(s==='ok'){
+    p.classList.add('ok');
+    l.textContent='En vivo';
+    p.title='Estado del feed en vivo via WebSocket: conectado';
+  }else if(s==='err'){
+    l.textContent='Error WS';
+    p.title='Estado del feed en vivo via WebSocket: error al conectar';
+  }else if(s==='na'){
+    p.classList.add('na');
+    l.textContent='WS no aplica';
+    p.title='Este rol operativo no usa feed en vivo ni WebSocket.';
+  }else{
+    l.textContent='Desconectado';
+    p.title='Estado del feed en vivo via WebSocket: desconectado';
+  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -1123,6 +1351,7 @@ function nav(page){
     unknown:loadUnknown,
     users:loadUsers,
     nfc:loadNfcTags,
+    levels:loadAccessLevels,
     notifications:loadNotifications,
     system:loadSystemSettings,
     audit:loadAuditLogs
@@ -1472,8 +1701,9 @@ async function loadMachines(){
 
 function renderMachines(){
   const manager=isManagerRole();
+  const installer=canManageMachineSetup();
   render(`
-  ${manager?'<div id="pendingContainer"></div>':''}
+  ${installer?'<div id="pendingContainer"></div>':''}
   <div class="topbar">
     <div class="page-title">Máquinas</div>
     ${manager?'<button class="btn btn-primary btn-sm" onclick="openAddMachine()">+ Nueva máquina</button>':''}
@@ -1511,7 +1741,7 @@ function renderMachines(){
       <tbody id="machinesTbody"></tbody>
     </table>
   </div>`);
-  if(manager){
+  if(installer){
     renderPendingSection(document.getElementById('pendingContainer'));
   }
   applyMachineFilters();
@@ -2084,7 +2314,7 @@ function renderEmployees(){
       <button class="btn btn-ghost btn-sm" onclick="resetEmployeeFilters()" style="align-self:flex-end">Limpiar filtros</button>
     </div>
     <table>
-      <thead><tr><th>Nombre</th><th>Legajo</th><th>DNI</th><th>Área</th><th>Límite</th><th>TAGs NFC</th><th></th></tr></thead>
+      <thead><tr><th>Nombre</th><th>Legajo</th><th>DNI</th><th>Área</th><th>Jerarquía</th><th>Límite</th><th>TAGs NFC</th><th></th></tr></thead>
       <tbody id="employeesTbody"></tbody>
     </table>
   </div>`);
@@ -2115,6 +2345,7 @@ function applyEmployeeFilters(){
       <td>${e.legajo||'—'}</td>
       <td>${e.dni||'—'}</td>
       <td>${e.department||'—'}</td>
+      <td>${employeeAccessLevelCell(e)}</td>
       <td>${employeeLimitCell(e)}</td>
       <td>${activeCards} TAG NFC</td>
       <td style="white-space:nowrap">
@@ -2126,7 +2357,7 @@ function applyEmployeeFilters(){
     </tr>`;
   }).join('');
   const tbody=document.getElementById('employeesTbody');
-  if(tbody) tbody.innerHTML=rows||'<tr><td colspan="7" class="empty">Sin empleados</td></tr>';
+  if(tbody) tbody.innerHTML=rows||'<tr><td colspan="8" class="empty">Sin empleados</td></tr>';
 }
 
 function resetEmployeeFilters(){
@@ -2155,10 +2386,12 @@ async function showEmployeeDetail(id){
         <div><span style="color:var(--tx3)">DNI:</span> ${e.dni||'—'}</div>
         <div><span style="color:var(--tx3)">Legajo:</span> ${e.legajo||'—'}</div>
         <div><span style="color:var(--tx3)">Área:</span> ${e.department||'—'}</div>
+        <div><span style="color:var(--tx3)">Jerarquía:</span> ${escHtml(employeeAccessLevelLabel(e))}</div>
         <div><span style="color:var(--tx3)">Política diaria:</span> ${employeeLimitPolicyText(e)}</div>
         <div><span style="color:var(--tx3)">Email:</span> ${e.email||'—'}</div>
         <div><span style="color:var(--tx3)">Teléfono:</span> ${e.phone||'—'}</div>
-        <div><span style="color:var(--tx3)">Advertencia email:</span> ${e.warning_enabled===false?'Desactivada':'Activa'}</div>
+        <div><span style="color:var(--tx3)">Advertencia email:</span> ${employeeWarningEnabled(e)?'Activa':'Desactivada'}</div>
+        <div><span style="color:var(--tx3)">Origen de política:</span> ${escHtml(accessLevelSourceLabel(e))}</div>
       </div>
       <div class="section-lbl" style="margin-bottom:8px">TAGs NFC</div>
       <div style="margin-bottom:20px">${cardRows||'<div class="empty">Sin TAGs NFC</div>'}</div>
@@ -2170,7 +2403,24 @@ async function showEmployeeDetail(id){
   }catch(e){alert('Error: '+e.message);}
 }
 
-function openAddEmployee(){
+function toggleEmployeePolicyFields(){
+  const select=document.getElementById('eAccessLevel');
+  const hint=document.getElementById('ePolicyHint');
+  const level=findAccessLevelById(select?.value);
+  ['eLim','eLimMode','eWarn'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.disabled=!!level;
+  });
+  if(!hint) return;
+  if(level){
+    hint.innerHTML=`Jerarquía activa: <strong>${escHtml(level.name)}</strong>. Política aplicada: ${escHtml(accessLevelPolicySummary(level))}. La configuración manual del empleado queda como respaldo si más adelante quitás la jerarquía.`;
+  }else{
+    hint.textContent='Sin jerarquía asignada. Se aplica la configuración manual del empleado.';
+  }
+}
+
+async function openAddEmployee(){
+  await refreshAccessLevelsCache(true);
   openModal('Nuevo empleado',`
     <div class="field-row">
       <div class="field"><label>Nombre completo *</label><input id="eN" placeholder="Juan Pérez"></div>
@@ -2184,6 +2434,11 @@ function openAddEmployee(){
       <div class="field"><label>Email</label><input id="eEmail" type="email" placeholder="juan@empresa.com"></div>
       <div class="field"><label>Teléfono</label><input id="eTel" placeholder="+54 11 1234-5678"></div>
     </div>
+    <div class="field">
+      <label>Jerarquía</label>
+      <select id="eAccessLevel" onchange="toggleEmployeePolicyFields()">${accessLevelOptionsHtml(null,{includeInactive:true})}</select>
+    </div>
+    <div style="font-size:12px;color:var(--tx3);margin-top:-4px;margin-bottom:12px" id="ePolicyHint">Sin jerarquía asignada. Se aplica la configuración manual del empleado.</div>
     <div class="field-row">
       <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="4" min="1" max="50"></div>
       <div class="field">
@@ -2198,6 +2453,7 @@ function openAddEmployee(){
     <label class="pw-inline" style="margin-top:-4px;margin-bottom:12px"><input type="checkbox" id="eWarn" checked> Avisar por email cuando quede cerca del límite</label>
     <div class="err-banner" id="eErr"></div>
   `,'saveEmployee()');
+  toggleEmployeePolicyFields();
 }
 
 async function saveEmployee(){
@@ -2207,6 +2463,7 @@ async function saveEmployee(){
     await api('POST','/api/employees',{
       name,department:v('eDep'),email:v('eEmail'),dni:v('eDni'),
       legajo:v('eLeg'),phone:v('eTel'),
+      access_level_id: normalizeAccessLevelIdValue(v('eAccessLevel')),
       daily_limit:parseInt(v('eLim'))||4,
       daily_limit_mode:v('eLimMode')||'enforce',
       warning_enabled:!!document.getElementById('eWarn')?.checked
@@ -2217,6 +2474,7 @@ async function saveEmployee(){
 
 async function openEditEmployee(id){
   try{
+    await refreshAccessLevelsCache(true);
     const d=await api('GET',`/api/employees/${id}`);
     const e=d.employee;
     openModal('Editar: '+e.name,`
@@ -2232,6 +2490,11 @@ async function openEditEmployee(id){
         <div class="field"><label>Email</label><input id="eEmail" value="${e.email||''}"></div>
         <div class="field"><label>Teléfono</label><input id="eTel" value="${e.phone||''}"></div>
       </div>
+      <div class="field">
+        <label>Jerarquía</label>
+        <select id="eAccessLevel" onchange="toggleEmployeePolicyFields()">${accessLevelOptionsHtml(e.access_level_id,{includeInactive:true})}</select>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);margin-top:-4px;margin-bottom:12px" id="ePolicyHint"></div>
       <div class="field-row">
         <div class="field"><label>Límite diario de cafés</label><input id="eLim" type="number" value="${e.daily_limit}" min="1" max="50"></div>
         <div class="field">
@@ -2246,6 +2509,7 @@ async function openEditEmployee(id){
       <label class="pw-inline" style="margin-top:-4px;margin-bottom:12px"><input type="checkbox" id="eWarn" ${e.warning_enabled===false?'':'checked'}> Avisar por email cuando quede cerca del límite</label>
       <div class="err-banner" id="eErr"></div>
     `,`updateEmployee(${id})`);
+    toggleEmployeePolicyFields();
   }catch(e){alert('Error: '+e.message);}
 }
 
@@ -2254,6 +2518,7 @@ async function updateEmployee(id){
     await api('PATCH',`/api/employees/${id}`,{
       name:v('eN'),department:v('eDep'),email:v('eEmail'),dni:v('eDni'),
       legajo:v('eLeg'),phone:v('eTel'),
+      access_level_id: normalizeAccessLevelIdValue(v('eAccessLevel')),
       daily_limit:parseInt(v('eLim'))||4,
       daily_limit_mode:v('eLimMode')||'enforce',
       warning_enabled:!!document.getElementById('eWarn')?.checked
@@ -2356,7 +2621,7 @@ async function saveReassignCard(cardId){
 //  REPORTES
 // ══════════════════════════════════════════════════════
 const REPORT_CHART_COLORS=['#4C8BF5','#2FBF71','#FFB020','#E24B4A','#8E6EF2','#00A7C4','#F66B3D','#4FCEB8','#7A869A','#D16BA5'];
-let reportState={from:'',to:'',filters:{department:'',employee_search:''},overview:null,machines:[],employees:[],departments:[],stock:null,departmentOptions:[]};
+let reportState={from:'',to:'',filters:{department:'',employee_search:'',access_level_id:''},overview:null,machines:[],employees:[],departments:[],stock:null,departmentOptions:[],accessLevelOptions:[]};
 let reportEmployeeDetailState=null;
 let reportDepartmentDetailState=null;
 let reportTrendChart=null;
@@ -2389,7 +2654,8 @@ function normalizeReportFilters(filters){
     from: current.from||reportState.from||defaults.from,
     to: current.to||reportState.to||defaults.to,
     department: String(current.department ?? previous.department ?? '').trim(),
-    employee_search: String(current.employee_search ?? current.employeeSearch ?? previous.employee_search ?? '').trim()
+    employee_search: String(current.employee_search ?? current.employeeSearch ?? previous.employee_search ?? '').trim(),
+    access_level_id: String(current.access_level_id ?? current.accessLevelId ?? previous.access_level_id ?? '').trim()
   };
 }
 
@@ -2417,7 +2683,8 @@ function reportFormFilters(){
     from: document.getElementById('repFrom')?.value||'',
     to: document.getElementById('repTo')?.value||'',
     department: document.getElementById('repDepartment')?.value||'',
-    employee_search: document.getElementById('repEmployeeSearch')?.value||''
+    employee_search: document.getElementById('repEmployeeSearch')?.value||'',
+    access_level_id: document.getElementById('repAccessLevel')?.value||''
   };
 }
 
@@ -2425,6 +2692,9 @@ function reportFilterSummary(filters=reportState.filters||{}){
   const current=filters||{};
   const parts=[];
   if(current.department) parts.push(`Área: ${current.department}`);
+  if(current.access_level_id){
+    parts.push(`Jerarquía: ${current.access_level_id==='manual'?'Manual / sin jerarquía':accessLevelDisplayName({access_level_id:current.access_level_id})}`);
+  }
   if(current.employee_search) parts.push(`Empleado: ${current.employee_search}`);
   return parts.join(' · ');
 }
@@ -2519,8 +2789,10 @@ function reportEmployeeRows(){
     name: row.name,
     legajo: row.legajo||'—',
     department: row.department||'Sin área',
-    daily_limit_mode: reportLimitModeLabel(row.daily_limit_mode),
-    daily_limit: formatReportInt(row.daily_limit),
+    access_level_name: employeeAccessLevelLabel(row),
+    policy_source: accessLevelSourceLabel(row),
+    daily_limit_mode: reportLimitModeLabel(employeeEffectiveLimitMode(row)),
+    daily_limit: formatReportInt(employeeEffectiveLimit(row)),
     taps_count: formatReportInt(row.taps_count),
     denied_taps: formatReportInt(row.denied_taps),
     spent_cents: formatReportMoney(row.spent_cents),
@@ -2684,6 +2956,8 @@ function getReportSectionConfig(section){
         {label:'Empleado',value:'name',maxWidth:24},
         {label:'Legajo',value:'legajo',maxWidth:18},
         {label:'Área',value:'department',maxWidth:24},
+        {label:'Jerarquía',value:row=>employeeAccessLevelLabel(row),maxWidth:22},
+        {label:'Origen',value:row=>accessLevelSourceLabel(row),maxWidth:14},
         {label:'Modo límite',value:row=>reportLimitModeLabel(row.daily_limit_mode),maxWidth:18},
         {label:'Límite diario',value:'daily_limit',type:'number',maxWidth:16},
         {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
@@ -3122,6 +3396,8 @@ function buildEmployeeDetailExportOptions(detail){
     details:[
       ['Legajo', employee.legajo||'—'],
       ['Área', employee.department||'Sin área'],
+      ['Jerarquía', employeeAccessLevelLabel(employee)],
+      ['Origen de política', accessLevelSourceLabel(employee)],
       ['Política diaria', employeeLimitPolicyText(employee)],
       ['Rango', formatReportRangeLabel(reportState.from,reportState.to)],
       ['Zona horaria', reportState.overview?.business_timezone||'—']
@@ -3179,6 +3455,8 @@ function buildDepartmentDetailExportOptions(detail){
         columns:[
           {label:'Empleado',value:'name',maxWidth:24},
           {label:'Legajo',value:'legajo',maxWidth:18},
+          {label:'Jerarquía',value:row=>employeeAccessLevelLabel(row),maxWidth:22},
+          {label:'Origen',value:row=>accessLevelSourceLabel(row),maxWidth:14},
           {label:'Modo límite',value:row=>reportLimitModeLabel(row.daily_limit_mode),maxWidth:18},
           {label:'Límite diario',value:'daily_limit',type:'number',maxWidth:16},
           {label:'Cafés aprobados',value:'taps_count',type:'number',maxWidth:18},
@@ -3485,6 +3763,8 @@ function exportReportsPdf(){
     {label:'Empleado',value:'name'},
     {label:'Legajo',value:'legajo'},
     {label:'Área',value:'department'},
+    {label:'Jerarquía',value:'access_level_name'},
+    {label:'Origen',value:'policy_source'},
     {label:'Modo límite',value:'daily_limit_mode'},
     {label:'Límite',value:'daily_limit'},
     {label:'Cafés',value:'taps_count'},
@@ -3678,19 +3958,21 @@ function setReportPreset(preset){
 
 function applyReportFilters(){
   const filters=normalizeReportFilters(reportFormFilters());
-  const {from,to,department,employee_search}=filters;
+  const {from,to,department,employee_search,access_level_id}=filters;
   if(!from||!to){
     alert('Elegí una fecha desde y hasta.');
     return;
   }
-  loadReports({from,to,department,employee_search});
+  loadReports({from,to,department,employee_search,access_level_id});
 }
 
 function clearReportFilters(){
   const department=document.getElementById('repDepartment');
   const employeeSearch=document.getElementById('repEmployeeSearch');
+  const accessLevel=document.getElementById('repAccessLevel');
   if(department) department.value='';
   if(employeeSearch) employeeSearch.value='';
+  if(accessLevel) accessLevel.value='';
   applyReportFilters();
 }
 
@@ -3812,21 +4094,25 @@ function renderReportCharts(){
 async function loadReports(customFilters){
   render('<div class="page-title">Reportes</div><div class="empty">Cargando...</div>');
   try{
+    await refreshAccessLevelsCache(isManagerRole());
     const filters=normalizeReportFilters(customFilters);
     const sharedQuery=reportBuildQueryString({
       from: filters.from,
       to: filters.to,
-      department: filters.department
+      department: filters.department,
+      access_level_id: filters.access_level_id
     });
     const employeesQuery=reportBuildQueryString({
       from: filters.from,
       to: filters.to,
       department: filters.department,
-      employee_search: filters.employee_search
+      employee_search: filters.employee_search,
+      access_level_id: filters.access_level_id
     });
     const departmentOptionsQuery=reportBuildQueryString({
       from: filters.from,
-      to: filters.to
+      to: filters.to,
+      access_level_id: filters.access_level_id
     });
     const requests=[
       api('GET',`/api/reports/overview${sharedQuery}`),
@@ -3847,14 +4133,16 @@ async function loadReports(customFilters){
       to: overview.to||filters.to,
       filters: {
         department: selectedDepartment,
-        employee_search: filters.employee_search||''
+        employee_search: filters.employee_search||'',
+        access_level_id: filters.access_level_id||''
       },
       overview,
       machines: machines.machines||[],
       employees: employees.employees||[],
       departments: departments.departments||[],
       stock: isManagerRole() ? (stock||null) : null,
-      departmentOptions: allDepartments
+      departmentOptions: allDepartments,
+      accessLevelOptions: accessLevelCache.slice()
     };
     renderReports();
   }catch(e){render('<p style="color:var(--txd)">'+e.message+'</p>');}
@@ -3865,8 +4153,15 @@ function renderReports(){
   const filters=reportState.filters||{};
   const summaryHtml=reportSummaryCards(overview);
   const departmentOptions=(reportState.departmentOptions||[]).map(dep=>`<option value="${escHtml(dep)}"${dep===filters.department?' selected':''}>${escHtml(dep)}</option>`).join('');
+  const accessLevelOptions=(reportState.accessLevelOptions||[])
+    .filter(level=>level.active!==false || String(level.id)===String(filters.access_level_id||''))
+    .map(level=>`<option value="${level.id}"${String(level.id)===String(filters.access_level_id||'')?' selected':''}>${escHtml(level.name)}${level.active===false?' (inactiva)':''}</option>`)
+    .join('');
   const activeFilters=[];
   if(filters.department) activeFilters.push(`Área: <strong>${escHtml(filters.department)}</strong>`);
+  if(filters.access_level_id){
+    activeFilters.push(`Jerarquía: <strong>${escHtml(filters.access_level_id==='manual'?'Manual / sin jerarquía':accessLevelDisplayName({access_level_id:filters.access_level_id}))}</strong>`);
+  }
   if(filters.employee_search) activeFilters.push(`Empleado: <strong>${escHtml(filters.employee_search)}</strong>`);
   const filterStatus=activeFilters.length ? activeFilters.join(' &nbsp;·&nbsp; ') : 'Sin filtros adicionales';
   const filterHint=filters.employee_search ? 'La búsqueda rápida solo ajusta la tabla y las exportaciones de Empleados.' : '';
@@ -3886,8 +4181,10 @@ function renderReports(){
     <td><strong>${i+1}.</strong> ${escHtml(e.name)}</td>
     <td>${escHtml(e.legajo||'—')}</td>
     <td>${escHtml(e.department||'Sin área')}</td>
-    <td>${escHtml(reportLimitModeLabel(e.daily_limit_mode))}</td>
-    <td>${formatReportInt(e.daily_limit)}</td>
+    <td>${escHtml(employeeAccessLevelLabel(e))}</td>
+    <td>${escHtml(accessLevelSourceLabel(e))}</td>
+    <td>${escHtml(reportLimitModeLabel(employeeEffectiveLimitMode(e)))}</td>
+    <td>${formatReportInt(employeeEffectiveLimit(e))}</td>
     <td>${formatReportInt(e.taps_count)}</td>
     <td>${formatReportInt(e.denied_taps)}</td>
     <td><strong>${formatReportMoney(e.spent_cents)}</strong></td>
@@ -3951,6 +4248,14 @@ function renderReports(){
             ${departmentOptions}
           </select>
         </div>
+        <div class="field" style="margin:0;min-width:240px">
+          <label>Jerarquía</label>
+          <select id="repAccessLevel">
+            <option value="">Todas</option>
+            <option value="manual"${filters.access_level_id==='manual'?' selected':''}>Manual / sin jerarquía</option>
+            ${accessLevelOptions}
+          </select>
+        </div>
         <div class="field" style="margin:0;min-width:260px;flex:1 1 260px">
           <label>Buscar empleado</label>
           <input id="repEmployeeSearch" type="text" value="${escHtml(filters.employee_search||'')}" placeholder="Nombre, legajo, email o DNI" onkeydown="if(event.key==='Enter') applyReportFilters()">
@@ -3992,11 +4297,11 @@ function renderReports(){
           <button class="btn btn-ghost btn-sm" onclick="exportReportSection('employees','pdf')">PDF</button>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:18px;align-items:start">
+        <div style="display:grid;grid-template-columns:minmax(260px,340px) 1fr;gap:18px;align-items:start">
         <div style="height:280px"><canvas id="repEmployeesChart"></canvas></div>
         <div style="overflow:auto">
-          <table><thead><tr><th>Empleado</th><th>Legajo</th><th>Área</th><th>Modo</th><th>Límite</th><th>Cafés</th><th>Rech.</th><th>$</th><th>Máqs.</th><th></th></tr></thead>
-          <tbody>${employeeRows||'<tr><td colspan="10" class="empty">Sin datos</td></tr>'}</tbody></table>
+          <table><thead><tr><th>Empleado</th><th>Legajo</th><th>Área</th><th>Jerarquía</th><th>Origen</th><th>Modo</th><th>Límite</th><th>Cafés</th><th>Rech.</th><th>$</th><th>Máqs.</th><th></th></tr></thead>
+          <tbody>${employeeRows||'<tr><td colspan="12" class="empty">Sin datos</td></tr>'}</tbody></table>
         </div>
       </div>
     </div>
@@ -4074,6 +4379,7 @@ async function employeeReportDetail(id,name){
       </div>
       <div class="metrics" style="margin-bottom:18px">
         <div class="metric"><div class="mlbl">Área</div><div class="mval">${escHtml(employee.department||'Sin área')}</div></div>
+        <div class="metric"><div class="mlbl">Jerarquía</div><div class="mval">${escHtml(employeeAccessLevelLabel(employee))}</div></div>
         <div class="metric"><div class="mlbl">Cafés</div><div class="mval">${formatReportInt(employee.taps_count)}</div></div>
         <div class="metric"><div class="mlbl">Rechazados</div><div class="mval">${formatReportInt(employee.denied_taps)}</div></div>
         <div class="metric"><div class="mlbl">Importe</div><div class="mval">${formatReportMoney(employee.spent_cents)}</div></div>
@@ -4101,7 +4407,7 @@ async function departmentReportDetail(department){
       machines:machines.machines||[],
       taps:taps.taps||[]
     };
-    const employeeRows=reportDepartmentDetailState.employees.map(e=>`<tr><td>${escHtml(e.name)}</td><td>${escHtml(e.legajo||'—')}</td><td>${formatReportInt(e.taps_count)}</td><td>${formatReportInt(e.denied_taps)}</td><td>${formatReportMoney(e.spent_cents)}</td></tr>`).join('');
+    const employeeRows=reportDepartmentDetailState.employees.map(e=>`<tr><td>${escHtml(e.name)}</td><td>${escHtml(e.legajo||'—')}</td><td>${escHtml(employeeAccessLevelLabel(e))}</td><td>${formatReportInt(e.taps_count)}</td><td>${formatReportInt(e.denied_taps)}</td><td>${formatReportMoney(e.spent_cents)}</td></tr>`).join('');
     const machineRows=reportDepartmentDetailState.machines.map(m=>`<tr><td>${escHtml(m.name)}</td><td>${escHtml(m.location||'—')}</td><td>${formatReportInt(m.taps_count)}</td><td>${formatReportInt(m.denied_taps)}</td><td>${formatReportMoney(m.spent_cents)}</td></tr>`).join('');
     const tapRows=reportDepartmentDetailState.taps.map(t=>`<tr><td>${escHtml(t.employee_name||'—')}</td><td>${escHtml(t.machine_name||'—')}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓ OK':`✕ ${escHtml(t.deny_reason||'Rechazado')}`}</td><td>${t.amount_cents?formatReportMoney(t.amount_cents):(t.approved?'OK':'—')}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
     openModal(`Área: ${department}`,`
@@ -4116,7 +4422,7 @@ async function departmentReportDetail(department){
         <div class="metric"><div class="mlbl">Empleados / Máquinas</div><div class="mval">${formatReportInt(summary.employees_count)} / ${formatReportInt(summary.machines_count)}</div></div>
       </div>
       <div class="section-lbl" style="margin-bottom:8px">Empleados del área (${escHtml(formatReportRangeLabel(reportState.from,reportState.to))})</div>
-      <table style="margin-bottom:20px"><thead><tr><th>Empleado</th><th>Legajo</th><th>Cafés</th><th>Rech.</th><th>$</th></tr></thead><tbody>${employeeRows||'<tr><td colspan="5" class="empty">Sin datos</td></tr>'}</tbody></table>
+      <table style="margin-bottom:20px"><thead><tr><th>Empleado</th><th>Legajo</th><th>Jerarquía</th><th>Cafés</th><th>Rech.</th><th>$</th></tr></thead><tbody>${employeeRows||'<tr><td colspan="6" class="empty">Sin datos</td></tr>'}</tbody></table>
       <div class="section-lbl" style="margin-bottom:8px">Máquinas usadas por el área</div>
       <table style="margin-bottom:20px"><thead><tr><th>Máquina</th><th>Ubicación</th><th>Cafés</th><th>Rech.</th><th>$</th></tr></thead><tbody>${machineRows||'<tr><td colspan="5" class="empty">Sin datos</td></tr>'}</tbody></table>
       <div class="section-lbl" style="margin-bottom:8px">Últimos 30 taps del área</div>
@@ -4463,6 +4769,26 @@ function showModalErr(id,msg){const el=document.getElementById(id);if(el){el.tex
 //  Helpers
 // ══════════════════════════════════════════════════════
 function v(id){const el=document.getElementById(id);return el?el.value.trim()||null:null;}
+function employeeEffectiveLimit(e){
+  return parseInt(e?.effective_daily_limit ?? e?.daily_limit ?? 0,10)||0;
+}
+function employeeEffectiveLimitMode(e){
+  return e?.effective_daily_limit_mode || e?.daily_limit_mode || 'enforce';
+}
+function employeeWarningEnabled(e){
+  return (e?.effective_warning_enabled ?? e?.warning_enabled) === false ? false : true;
+}
+function employeeAccessLevelLabel(e){
+  return accessLevelDisplayName(e);
+}
+function employeeAccessLevelCell(e){
+  const label=employeeAccessLevelLabel(e);
+  const source=accessLevelSourceLabel(e);
+  if(source==='Manual'){
+    return `<div>${escHtml(label)}</div><div style="font-size:11px;color:var(--tx3)">Configuración individual</div>`;
+  }
+  return `<div>${escHtml(label)}</div><div style="font-size:11px;color:var(--tx3)">Política reutilizable</div>`;
+}
 function employeeLimitModeLabel(mode){
   return {
     enforce:'Bloquea al alcanzar el límite',
@@ -4471,19 +4797,24 @@ function employeeLimitModeLabel(mode){
   }[mode||'enforce']||'Bloquea al alcanzar el límite';
 }
 function employeeLimitPolicyText(e){
-  const limit=parseInt(e.daily_limit||0,10)||0;
-  const mode=e.daily_limit_mode||'enforce';
-  if(mode==='off') return `Sin límite diario (referencia ${limit} cafés)`;
-  if(mode==='warn_only') return `${limit} cafés/día · solo advertencia`;
-  return `${limit} cafés/día · bloqueo activo`;
+  const limit=employeeEffectiveLimit(e);
+  const mode=employeeEffectiveLimitMode(e);
+  const label=mode==='off'
+    ? `Sin límite diario (referencia ${limit} cafés)`
+    : mode==='warn_only'
+      ? `${limit} cafés/día · solo advertencia`
+      : `${limit} cafés/día · bloqueo activo`;
+  return accessLevelSourceLabel(e)==='Jerarquía'
+    ? `${label} · vía ${employeeAccessLevelLabel(e)}`
+    : label;
 }
 function employeeLimitCell(e){
-  return `<div>${parseInt(e.daily_limit||0,10)||0} cafés/día</div><div style="font-size:11px;color:var(--tx3)">${employeeLimitModeLabel(e.daily_limit_mode)}</div>`;
+  return `<div>${employeeEffectiveLimit(e)} cafés/día</div><div style="font-size:11px;color:var(--tx3)">${employeeLimitModeLabel(employeeEffectiveLimitMode(e))}</div>`;
 }
 function empStatus(e){
   const taps=parseInt(e.taps_today||0,10)||0;
-  const limit=parseInt(e.daily_limit||0,10)||0;
-  const mode=e.daily_limit_mode||'enforce';
+  const limit=employeeEffectiveLimit(e);
+  const mode=employeeEffectiveLimitMode(e);
   if(mode==='off'||!limit) return 'ok';
   if(mode==='enforce'&&taps>=limit) return 'blocked';
   return taps>=Math.max(limit-1,1)?'warning':'ok';

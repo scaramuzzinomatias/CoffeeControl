@@ -8,11 +8,17 @@
     "db:init": "node scripts/db-init.js",
     "db:migrate": "node scripts/db-migrate-all.js",
     "db:migrate:all": "node scripts/db-migrate-all.js",
+    "db:backup": "node scripts/db-backup.js",
+    "db:purge": "node scripts/db-purge.js",
+    "db:drop": "node scripts/db-drop.js",
+    "db:restore": "node scripts/db-restore.js",
+    "db:rebuild": "node scripts/db-rebuild.js",
     "support:doctor": "node scripts/support-doctor.js",
     "support:user": "node scripts/support-user.js",
     "support:reset-admin": "node scripts/support-user.js --username admin --role admin --activate",
     "support:create-supervisor": "node scripts/support-user.js --role supervisor --activate",
     "support:create-technician": "node scripts/support-user.js --role tecnico --activate",
+    "support:create-distributor": "node scripts/support-user.js --role distribuidor --activate",
     "test:integration": "node --test test/integration.test.js"
   },
   "dependencies": {
