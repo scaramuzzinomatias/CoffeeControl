@@ -145,6 +145,11 @@ psql $DATABASE_URL -f sql/migration_v12.sql
 psql $DATABASE_URL -f sql/migration_v13.sql
 psql $DATABASE_URL -f sql/migration_v14.sql
 psql $DATABASE_URL -f sql/migration_v15.sql
+psql $DATABASE_URL -f sql/migration_v16.sql
+psql $DATABASE_URL -f sql/migration_v17.sql
+psql $DATABASE_URL -f sql/migration_v18.sql
+psql $DATABASE_URL -f sql/migration_v19.sql
+psql $DATABASE_URL -f sql/migration_v20.sql
 ```
 
 Configurar variables de entorno (crear `.env` en `backend/`):
@@ -219,13 +224,14 @@ Abrir `http://<ip-servidor>:3000` en el navegador.
 | Sección | Descripción |
 |---|---|
 | **Dashboard** | Métricas del día, consumo mensual, % sobre límite, máquinas online/offline, alertas |
-| **Máquinas** | Lista con estado online, detalle de red (SSID/IP/RSSI/backend), reinicio remoto, cambio de WiFi, escaneo remoto de redes, bloquear/desbloquear y aprobar nuevas |
+| **Máquinas** | Lista con estado online, detalle de red (SSID/IP/RSSI/backend), reinicio remoto, cambio de WiFi, escaneo remoto de redes, stock por selección, bloquear/desbloquear y aprobar nuevas |
+| **Stock** | Control manual/estimado por máquina y selección, con reposición, ajuste e historial de movimientos |
 | **Empleados** | CRUD completo, asignar tarjetas NFC, definir política diaria (`bloquear`, `solo advertir`, `sin límite`) e historial de consumo |
 | **TAGs NFC** | Vista global con estados `Activo`, `Perdido`, `De baja` y acciones de recuperación |
-| **Reportes** | Rango de fechas, resumen operativo, cortes por máquina/empleado/área, gráficos y exportación Excel/PDF |
+| **Reportes** | Rango de fechas, resumen operativo, cortes por máquina/empleado/área, filtros por área y búsqueda rápida de empleado, reportes específicos de stock, gráficos y exportación Excel/PDF |
 | **Feed en vivo** | Stream de taps en tiempo real via WebSocket, con filtros por estado/máquina/empleado |
 | **Tarjetas desconocidas** | UIDs sin empleado asignado — botón Asignar directamente desde el panel |
-| **Usuarios** | Gestión de usuarios del panel con roles gerente/supervisor |
+| **Usuarios** | Gestión de usuarios del panel con roles gerente, supervisor y técnico; los supervisores aceptan una o varias áreas asignadas |
 | **Sistema** | Zona horaria operativa global (`business_timezone`) |
 | **Alertas por email** | Máquina offline, empleado bloqueado y advertencia preventiva de límite (si SMTP está configurado) |
 | **Auditoría** | Bitácora administrativa con actor, acción, objeto y detalle técnico saneado |
@@ -243,10 +249,20 @@ La pantalla `Reportes` ahora trabaja con rango `desde / hasta` y muestra:
 - ranking por máquina con detalle de empleados del período
 - ranking por empleado con detalle de máquinas del período
 - resumen por departamento / área
+- filtro global por área y búsqueda rápida por nombre / legajo / email / DNI para ubicar un empleado puntual
+- sección de **stock** para `gerente/admin`, con estado actual por máquina, movimientos del rango y paquete exportable Excel/PDF
 - exportación global a Excel (`.xlsx`) y PDF desde la cabecera de la pantalla
 - detalle exportable por empleado y por área, pensado para reuniones de gestión
 
 Los gráficos usan `Chart.js` y respetan la `business_timezone` configurada en `Sistema`.
+
+Importante:
+
+- el filtro por **área** recorta el resumen, los rankings y las exportaciones del rango
+- la búsqueda rápida de **empleado** recorta la tabla y exportaciones de `Empleados`, sin deformar el resumen global del sector
+- si el usuario es `supervisor`, el backend recorta dashboard, feed y reportes a sus áreas asignadas (`admin_user_departments`)
+- si el usuario es `tecnico`, el panel aterriza en `Máquinas` y no puede acceder a dashboard, reportes, feed ni configuración global
+- el bloque de **stock** es global por máquina y en esta V1 no se recorta por área
 
 ### Estado de red por máquina
 
@@ -264,6 +280,39 @@ Desde esa misma vista ahora también se puede:
 - enviar **reinicio remoto**
 - abrir modal de **cambio de WiFi**
 - pedir **escaneo remoto de redes** visibles en el entorno real de esa máquina
+
+### Control de stock por máquina
+
+La vista **Máquinas** ahora tiene un botón **Stock** por equipo. Esta primera versión trabaja en modo **manual/estimado** y modela inventario por `machine + item_id`.
+
+Cada selección puede guardar:
+
+- nombre visible del producto
+- slot / espiral opcional
+- capacidad
+- stock actual
+- mínimo de alerta
+- estado `OK`, `Bajo`, `Sin stock` o `Inactivo`
+
+Operación disponible en esta V1:
+
+- alta de selección
+- edición de configuración
+- reposición manual
+- ajuste manual
+- baja / reactivación de selección
+- historial de movimientos (`sale`, `restock`, `adjustment`, `unconfigured_sale`)
+
+Cuando una venta queda confirmada en `POST /api/tap/result`, el backend descuenta automáticamente `1` unidad de la selección correspondiente. Si esa selección todavía no está configurada, **la venta no se rompe**: solo se registra un movimiento `unconfigured_sale` para dejar trazabilidad.
+
+En esta etapa el stock es **informativo / operativo**:
+
+- no bloquea expendios por falta de stock
+- no depende todavía de DEX/UCS
+- ya dispara alertas de **stock bajo / sin stock** cuando una selección activa cae al mínimo configurado o queda vacía
+- la alerta se resuelve sola al reponer o ajustar por encima del mínimo
+- la activación del evento se controla desde `Panel admin > Notificaciones`
+- `Panel admin > Reportes` suma una vista específica de stock para `gerente/admin`, con estado actual, movimientos del rango y exportación dedicada
 
 ### Zona horaria operativa
 
@@ -293,6 +342,7 @@ El backend ya puede enviar emails automáticos para estos eventos:
 - advertencia preventiva de límite diario al empleado y supervisores activos de su área
 - empleado bloqueado por límite diario
 - máquina offline por falta de heartbeat
+- stock bajo / sin stock por selección configurada
 
 El estado `backend sin respuesta` se mantiene como diagnóstico en la vista de máquinas, pero ya no genera email.
 
@@ -325,7 +375,7 @@ Cada empleado ahora puede trabajar en uno de estos modos:
 Además, cada empleado puede activar o desactivar la advertencia por email cuando queda cerca del límite diario. Si esa advertencia está activa y el evento también está habilitado en `Notificaciones`, el sistema envía el aviso a:
 
 - el email del propio empleado
-- los usuarios `supervisor` activos con email cargado en la misma `department`
+- los usuarios `supervisor` activos con email cargado y alcance sobre esa misma área
 
 El umbral de esa advertencia se configura globalmente desde `Notificaciones` como “faltan N cafés”. Las plantillas de email quedan fuera del panel y se ajustan desde [notificationTemplates.js](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/backend/src/config/notificationTemplates.js), para no exponer variables sensibles a usuarios funcionales.
 
@@ -391,7 +441,7 @@ GET  /api/reports/machines
 GET  /api/reports/employees/:id/machines
 
 GET  /api/admin-users           (solo gerente)
-POST /api/admin-users
+POST /api/admin-users           { username, password, role, full_name, email, department_scopes[] }
 
 GET  /api/notification-settings
 PUT  /api/notification-settings
@@ -400,6 +450,41 @@ POST /api/notification-settings/test
 GET  /api/system-settings
 PUT  /api/system-settings       { business_timezone }
 ```
+
+### Scripts DB y soporte
+
+El backend ahora trae scripts Node para operar la base y usuarios sin depender de `psql`, pensados para Windows y para soporte rápido:
+
+```bash
+cd backend
+
+npm run db:init
+npm run db:migrate:all
+npm run support:doctor
+npm run test:integration
+
+node scripts/support-user.js --username admin --password nuevaClaveSegura --role admin
+node scripts/support-user.js --username supervisor.ventas --password coffeecontrol2024 --role supervisor --full-name "Supervisor Ventas" --email supervisor@empresa.com --departments "Ventas,RRHH"
+```
+
+Qué hace cada uno:
+
+- `db:init`: aplica el estado actual de `sql/schema.sql` sobre una base vacía.
+- `db:migrate:all`: ejecuta en orden todas las migraciones `migration_v2.sql ... migration_v20.sql`.
+- `support:doctor`: valida `.env`, conexión PostgreSQL, tablas clave, SMTP y `/health` del backend.
+- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos, permisos sobre `Notificaciones`/`Auditoría`, configuración de stock, alertas de stock, reportes de stock y el rol `tecnico`.
+- `support:reset-admin`: wrapper para resetear o crear el usuario `admin` del panel.
+- `support:user`: crea o actualiza cualquier usuario del panel (`admin`, `gerente`, `supervisor`, `tecnico`). Si el rol es `supervisor`, acepta múltiples áreas con `--departments`.
+- `support:create-supervisor`: wrapper cómodo de `support:user` para supervisores; igual requiere `--username`, `--password` y opcionalmente `--departments`.
+- `support:create-technician`: wrapper cómodo de `support:user` para dar de alta un técnico operativo.
+
+Detalle importante:
+
+- las áreas de supervisor se guardan en `admin_user_departments`
+- dejar `--departments` vacío para un supervisor equivale a acceso amplio
+- estos scripts toman `DATABASE_URL` desde `backend/.env`
+- en PowerShell, para scripts con parámetros conviene usar `node scripts/...` directamente; `npm run` queda perfecto para tareas sin argumentos como `db:migrate:all` o `support:doctor`
+- si `full-name` o `departments` llevan espacios, usá la variante directa con `node scripts/support-user.js ...`
 
 ### WebSocket — `ws://host/ws`
 
@@ -420,6 +505,7 @@ Acceso:
 - el handshake del WebSocket del panel ahora exige JWT válido
 - `coffeecontrol-admin.html` conecta usando la sesión del login
 - `coffeecontrol.html` solo funciona si ya existe un token válido en `localStorage`
+- solo `gerente/admin/supervisor` pueden consumir el feed en vivo; el rol `tecnico` no se conecta al canal WS
 
 ---
 
@@ -428,7 +514,8 @@ Acceso:
 | Rol | Acceso |
 |---|---|
 | `gerente` / `admin` | Todo, incluyendo gestión de usuarios del panel |
-| `supervisor` | Dashboard, Reportes, Feed en vivo — sin configuración |
+| `supervisor` | Dashboard, Reportes y Feed en vivo, acotados a una o varias áreas asignadas — sin configuración |
+| `tecnico` | Máquinas, stock y comandos remotos; sin acceso a empleados, analítica, feed ni configuración global |
 
 ---
 
@@ -437,6 +524,11 @@ Acceso:
 - [x] Notificaciones por email configurables desde el panel
 - [x] Auditoría administrativa desde el panel
 - [x] Exportar reportes a Excel/PDF
+- [x] Control de stock V1 manual/estimado por máquina y selección
+- [x] Reportes específicos de stock para `gerente/admin`
+- [x] Perfil técnico para operar máquinas, stock y comandos remotos sin permisos gerenciales
+- [x] Scripts DB y soporte (`db:migrate:all`, `support:doctor`, reseteo/alta de usuarios del panel)
+- [x] Tests de integración mínimos (`npm run test:integration`)
 - [ ] OTA (Over The Air) — actualización de firmware desde el panel
 - [ ] Multi-tenant para modo SaaS (campo `tenant_id`, schema por empresa)
 - [ ] Mapa de máquinas con estado en tiempo real

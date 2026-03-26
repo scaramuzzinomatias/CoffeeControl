@@ -4,6 +4,7 @@ const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const pool    = require('../db/pool');
 const audit = require('../services/audit');
+const { getUserDepartmentScopes } = require('../lib/accessScope');
 
 const router  = express.Router();
 const SECRET  = process.env.JWT_SECRET || 'cc-dev-secret-change-in-prod';
@@ -30,13 +31,26 @@ router.post('/login', async (req, res) => {
         if (!valid)
             return res.status(401).json({ error: 'Credenciales incorrectas' });
 
+        const departmentScopes = await getUserDepartmentScopes(user.id, user.department);
         const token = jwt.sign(
-            { id: user.id, username: user.username, role: user.role },
+            {
+                id: user.id,
+                username: user.username,
+                role: user.role,
+                department: user.department || null,
+                department_scopes: departmentScopes
+            },
             SECRET,
             { expiresIn: '8h' }
         );
 
-        res.json({ token, username: user.username, role: user.role });
+        res.json({
+            token,
+            username: user.username,
+            role: user.role,
+            department: user.department || null,
+            department_scopes: departmentScopes
+        });
 
     } catch (err) {
         console.error('[AUTH] Error:', err.message);

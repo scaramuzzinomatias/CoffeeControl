@@ -2,6 +2,7 @@ const nodemailer = require('nodemailer');
 const pool = require('../db/pool');
 const notificationTemplates = require('../config/notificationTemplates');
 const systemSettings = require('./systemSettings');
+const { classifyStockStatus } = require('./stock');
 const {
     formatBusinessDate,
     formatDateTimeInZone
@@ -16,6 +17,7 @@ const FALLBACK_NOTIFICATION_SETTINGS = Object.freeze({
     notify_employee_limit_warning: false,
     notify_employee_daily_blocked: true,
     notify_machine_offline: true,
+    notify_stock_low: false,
     notify_machine_backend_down: false,
     employee_limit_warning_lead: 1
 });
@@ -92,6 +94,10 @@ function sanitizeNotificationSettings(raw = {}) {
             raw.notify_machine_offline,
             FALLBACK_NOTIFICATION_SETTINGS.notify_machine_offline
         ),
+        notify_stock_low: normalizeBoolean(
+            raw.notify_stock_low,
+            FALLBACK_NOTIFICATION_SETTINGS.notify_stock_low
+        ),
         notify_machine_backend_down: false,
         employee_limit_warning_lead: normalizeInteger(
             raw.employee_limit_warning_lead,
@@ -124,6 +130,7 @@ async function loadNotificationSettings(force = false) {
                     notify_employee_limit_warning,
                     notify_employee_daily_blocked,
                     notify_machine_offline,
+                    notify_stock_low,
                     notify_machine_backend_down,
                     employee_limit_warning_lead
              FROM notification_settings
@@ -180,6 +187,7 @@ async function saveNotificationSettings(input) {
     if (settings.enabled && (
         settings.notify_employee_daily_blocked
         || settings.notify_machine_offline
+        || settings.notify_stock_low
         || settings.notify_machine_backend_down
     )) {
         assertSettingsValid(settings, { requireRecipients: true });
@@ -193,17 +201,19 @@ async function saveNotificationSettings(input) {
             notify_employee_limit_warning,
             notify_employee_daily_blocked,
             notify_machine_offline,
+            notify_stock_low,
             notify_machine_backend_down,
             employee_limit_warning_lead,
             updated_at
         )
-         VALUES (1, $1, $2, $3, $4, $5, $6, $7, NOW())
+         VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, NOW())
          ON CONFLICT (id) DO UPDATE SET
             enabled = EXCLUDED.enabled,
             recipient_emails = EXCLUDED.recipient_emails,
             notify_employee_limit_warning = EXCLUDED.notify_employee_limit_warning,
             notify_employee_daily_blocked = EXCLUDED.notify_employee_daily_blocked,
             notify_machine_offline = EXCLUDED.notify_machine_offline,
+            notify_stock_low = EXCLUDED.notify_stock_low,
             notify_machine_backend_down = EXCLUDED.notify_machine_backend_down,
             employee_limit_warning_lead = EXCLUDED.employee_limit_warning_lead,
             updated_at = NOW()`,
@@ -213,6 +223,7 @@ async function saveNotificationSettings(input) {
             settings.notify_employee_limit_warning,
             settings.notify_employee_daily_blocked,
             settings.notify_machine_offline,
+            settings.notify_stock_low,
             settings.notify_machine_backend_down,
             settings.employee_limit_warning_lead
         ]
@@ -321,6 +332,7 @@ function alertTypeEnabled(settings, alertType) {
     if (alertType === 'employee_limit_warning') return settings.notify_employee_limit_warning;
     if (alertType === 'employee_daily_blocked') return settings.notify_employee_daily_blocked;
     if (alertType === 'machine_offline') return settings.notify_machine_offline;
+    if (alertType === 'stock_low') return settings.notify_stock_low;
     if (alertType === 'machine_backend_down') return false;
     return true;
 }
@@ -474,7 +486,16 @@ async function loadEmployeeWarningRecipients(employeeId) {
              WHERE active = true
                AND role = 'supervisor'
                AND email IS NOT NULL
-               AND TRIM(LOWER(department)) = TRIM(LOWER($1))`,
+               AND TRIM(LOWER(department)) = TRIM(LOWER($1))
+             UNION
+             SELECT au.email
+             FROM admin_users au
+             JOIN admin_user_departments aud
+               ON aud.admin_user_id = au.id
+             WHERE au.active = true
+               AND au.role = 'supervisor'
+               AND au.email IS NOT NULL
+               AND TRIM(LOWER(aud.department)) = TRIM(LOWER($1))`,
             [employee.department]
         );
         recipients.push(...supervisorResult.rows.map(row => row.email));
@@ -622,6 +643,84 @@ async function resolveMachineOffline(machineId) {
     return resolveAlert(`machine-offline-${machineId}`);
 }
 
+function stockAlertStatus(stockItem) {
+    if (!stockItem) return { key: 'inactive', label: 'Inactivo' };
+    if (stockItem.status && stockItem.status_label) {
+        return {
+            key: String(stockItem.status),
+            label: String(stockItem.status_label)
+        };
+    }
+    const status = classifyStockStatus(stockItem);
+    return {
+        key: status.key,
+        label: status.label
+    };
+}
+
+async function notifyStockLow({ machine, stockItem }) {
+    if (!machine || !stockItem?.id) return false;
+    const status = stockAlertStatus(stockItem);
+    if (status.key !== 'low' && status.key !== 'empty') return false;
+
+    const alertKey = `stock-low-${machine.id}-${stockItem.id}`;
+    const payload = {
+        machine_name: machine.name,
+        location: machine.location || null,
+        stock_item_id: stockItem.id,
+        item_id: stockItem.item_id,
+        product_name: stockItem.product_name || null,
+        slot_label: stockItem.slot_label || null,
+        current_units: stockItem.current_units,
+        min_units: stockItem.min_units,
+        capacity_units: stockItem.capacity_units,
+        status: status.key,
+        status_label: status.label
+    };
+    const templateValues = {
+        machine_name: machine.name,
+        location: machine.location || '—',
+        item_id: stockItem.item_id,
+        product_name: stockItem.product_name || '—',
+        slot_label: stockItem.slot_label || '—',
+        current_units: stockItem.current_units,
+        min_units: stockItem.min_units,
+        capacity_units: stockItem.capacity_units,
+        status: status.key,
+        status_label: status.label
+    };
+    const subject = renderTemplate(notificationTemplates.stockLow.subject, templateValues);
+    const text = renderTemplate(notificationTemplates.stockLow.body, templateValues);
+    const html = `
+        <h2>Stock bajo</h2>
+        <div>${textToHtml(text)}</div>
+    `;
+    return notifyIfNeeded({
+        alertKey,
+        alertType: 'stock_low',
+        machineId: machine.id,
+        payload,
+        subject,
+        text,
+        html
+    });
+}
+
+async function resolveStockLow(machineId, stockItemId) {
+    if (!machineId || !stockItemId) return false;
+    await resolveAlert(`stock-low-${machineId}-${stockItemId}`);
+    return true;
+}
+
+async function syncStockLowAlert({ machine, stockItem }) {
+    if (!machine || !stockItem?.id) return false;
+    const status = stockAlertStatus(stockItem);
+    if (status.key === 'low' || status.key === 'empty') {
+        return notifyStockLow({ machine, stockItem: { ...stockItem, status: status.key, status_label: status.label } });
+    }
+    return resolveStockLow(machine.id, stockItem.id);
+}
+
 async function checkMachineOfflineAlerts() {
     try {
         const result = await pool.query(
@@ -667,5 +766,8 @@ module.exports = {
     notifyMachineBackendDown,
     resolveMachineBackendDown,
     resolveMachineOffline,
-    checkMachineOfflineAlerts
+    checkMachineOfflineAlerts,
+    notifyStockLow,
+    resolveStockLow,
+    syncStockLowAlert
 };

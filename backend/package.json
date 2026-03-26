@@ -5,8 +5,15 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "db:init": "psql $DATABASE_URL -f sql/schema.sql",
-    "db:migrate": "psql $DATABASE_URL -f sql/migration_v2.sql"
+    "db:init": "node scripts/db-init.js",
+    "db:migrate": "node scripts/db-migrate-all.js",
+    "db:migrate:all": "node scripts/db-migrate-all.js",
+    "support:doctor": "node scripts/support-doctor.js",
+    "support:user": "node scripts/support-user.js",
+    "support:reset-admin": "node scripts/support-user.js --username admin --role admin --activate",
+    "support:create-supervisor": "node scripts/support-user.js --role supervisor --activate",
+    "support:create-technician": "node scripts/support-user.js --role tecnico --activate",
+    "test:integration": "node --test test/integration.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

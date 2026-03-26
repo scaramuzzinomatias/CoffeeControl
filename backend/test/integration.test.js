@@ -1,0 +1,833 @@
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const bcrypt = require('bcryptjs');
+const dotenv = require('dotenv');
+const { Client } = require('pg');
+
+const backendRoot = path.join(__dirname, '..');
+dotenv.config({ path: path.join(backendRoot, '.env') });
+
+const TEST_PORT = 3101;
+const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
+const TEST_PREFIX = `itest_${Date.now()}`;
+
+let serverProcess = null;
+let fixture = null;
+let adminToken = '';
+let managerToken = '';
+let technicianToken = '';
+let notificationSettingsSnapshot = null;
+
+function machineHeaders(mac) {
+    return {
+        'Content-Type': 'application/json',
+        'X-Machine-Mac': mac
+    };
+}
+
+async function requestJson(method, pathname, { token, body, headers } = {}) {
+    const finalHeaders = {
+        ...(headers || {})
+    };
+    if (body !== undefined && !finalHeaders['Content-Type']) {
+        finalHeaders['Content-Type'] = 'application/json';
+    }
+    if (token) {
+        finalHeaders.Authorization = `Bearer ${token}`;
+    }
+    const response = await fetch(`${BASE_URL}${pathname}`, {
+        method,
+        headers: finalHeaders,
+        body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    const text = await response.text();
+    let json = null;
+    if (text) {
+        try {
+            json = JSON.parse(text);
+        } catch (_) {
+            json = text;
+        }
+    }
+    return { status: response.status, json, headers: response.headers };
+}
+
+async function waitForHealth() {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+        try {
+            const response = await fetch(`${BASE_URL}/health`);
+            if (response.ok) return;
+        } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 300));
+    }
+    throw new Error('El backend de test no respondió /health a tiempo');
+}
+
+async function withDb(callback) {
+    const client = new Client({ connectionString: process.env.DATABASE_URL });
+    await client.connect();
+    try {
+        return await callback(client);
+    } finally {
+        await client.end();
+    }
+}
+
+function tempEmail(label) {
+    return `${TEST_PREFIX}.${label}@example.test`;
+}
+
+function tempUid(prefixHex) {
+    const tail = Math.floor(Math.random() * 0xffffffff).toString(16).toUpperCase().padStart(8, '0');
+    return `${prefixHex}${tail}`.slice(0, 20);
+}
+
+function tempMac() {
+    const base = Math.floor(Math.random() * 0xffffffff).toString(16).toUpperCase().padStart(8, '0');
+    return `AA55${base}`.slice(0, 12);
+}
+
+async function cleanupFixtures() {
+    await withDb(async (client) => {
+        await client.query('BEGIN');
+        try {
+            const machineIdsResult = await client.query(
+                `SELECT id FROM machines WHERE name LIKE $1`,
+                [`${TEST_PREFIX}%`]
+            );
+            const employeeIdsResult = await client.query(
+                `SELECT id FROM employees WHERE name LIKE $1 OR email LIKE $2`,
+                [`${TEST_PREFIX}%`, `${TEST_PREFIX}%@%`]
+            );
+            const machineIds = machineIdsResult.rows.map(row => row.id);
+            const employeeIds = employeeIdsResult.rows.map(row => row.id);
+
+            if (machineIds.length) {
+                await client.query('DELETE FROM machine_commands WHERE machine_id = ANY($1::int[])', [machineIds]);
+            }
+            if (employeeIds.length || machineIds.length) {
+                const clauses = [];
+                const params = [];
+                if (employeeIds.length) {
+                    params.push(employeeIds);
+                    clauses.push(`employee_id = ANY($${params.length}::int[])`);
+                }
+                if (machineIds.length) {
+                    params.push(machineIds);
+                    clauses.push(`machine_id = ANY($${params.length}::int[])`);
+                }
+                await client.query(`DELETE FROM taps WHERE ${clauses.join(' OR ')}`, params);
+            }
+
+            await client.query(
+                `DELETE FROM audit_logs
+                 WHERE actor_username LIKE $1
+                    OR entity_label LIKE $1`,
+                [`${TEST_PREFIX}%`]
+            );
+            await client.query(
+                `DELETE FROM admin_users
+                 WHERE username LIKE $1`,
+                [`${TEST_PREFIX}%`]
+            );
+            await client.query(
+                `DELETE FROM employees
+                 WHERE name LIKE $1
+                    OR email LIKE $2`,
+                [`${TEST_PREFIX}%`, `${TEST_PREFIX}%@%`]
+            );
+            await client.query(
+                `DELETE FROM machines
+                 WHERE name LIKE $1`,
+                [`${TEST_PREFIX}%`]
+            );
+            await client.query('COMMIT');
+        } catch (err) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            throw err;
+        }
+    });
+}
+
+async function loadNotificationSettingsSnapshot() {
+    return withDb(async (client) => {
+        const result = await client.query(
+            `SELECT enabled,
+                    recipient_emails,
+                    notify_employee_limit_warning,
+                    notify_employee_daily_blocked,
+                    notify_machine_offline,
+                    notify_stock_low,
+                    notify_machine_backend_down,
+                    employee_limit_warning_lead
+             FROM notification_settings
+             WHERE id = 1`
+        );
+        return result.rows[0] || null;
+    });
+}
+
+async function restoreNotificationSettingsSnapshot(snapshot) {
+    await withDb(async (client) => {
+        if (!snapshot) {
+            await client.query('DELETE FROM notification_settings WHERE id = 1');
+            return;
+        }
+        await client.query(
+            `INSERT INTO notification_settings(
+                id,
+                enabled,
+                recipient_emails,
+                notify_employee_limit_warning,
+                notify_employee_daily_blocked,
+                notify_machine_offline,
+                notify_stock_low,
+                notify_machine_backend_down,
+                employee_limit_warning_lead,
+                updated_at
+            )
+             VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, NOW())
+             ON CONFLICT (id) DO UPDATE SET
+                enabled = EXCLUDED.enabled,
+                recipient_emails = EXCLUDED.recipient_emails,
+                notify_employee_limit_warning = EXCLUDED.notify_employee_limit_warning,
+                notify_employee_daily_blocked = EXCLUDED.notify_employee_daily_blocked,
+                notify_machine_offline = EXCLUDED.notify_machine_offline,
+                notify_stock_low = EXCLUDED.notify_stock_low,
+                notify_machine_backend_down = EXCLUDED.notify_machine_backend_down,
+                employee_limit_warning_lead = EXCLUDED.employee_limit_warning_lead,
+                updated_at = NOW()`,
+            [
+                snapshot.enabled,
+                snapshot.recipient_emails,
+                snapshot.notify_employee_limit_warning,
+                snapshot.notify_employee_daily_blocked,
+                snapshot.notify_machine_offline,
+                snapshot.notify_stock_low,
+                snapshot.notify_machine_backend_down,
+                snapshot.employee_limit_warning_lead
+            ]
+        );
+    });
+}
+
+async function seedFixtures() {
+    return withDb(async (client) => {
+        await client.query('BEGIN');
+        try {
+            const deptA = `${TEST_PREFIX}_Gerencia`;
+            const deptB = `${TEST_PREFIX}_Ventas`;
+            const deptOut = `${TEST_PREFIX}_RRHH`;
+            const machineMac = tempMac();
+            const machineResult = await client.query(
+                `INSERT INTO machines(name, location, mac, secret, active, blocked, last_seen)
+                 VALUES ($1, $2, $3, $3, true, false, NOW())
+                 RETURNING id, name, mac`,
+                [`${TEST_PREFIX}_machine`, 'QA lab', machineMac]
+            );
+            const machine = machineResult.rows[0];
+
+            const employeeA = await client.query(
+                `INSERT INTO employees(name, department, email, daily_limit, daily_limit_mode, warning_enabled, active)
+                 VALUES ($1, $2, $3, 4, 'enforce', true, true)
+                 RETURNING id, name, department`,
+                [`${TEST_PREFIX}_emp_a`, deptA, tempEmail('emp_a')]
+            );
+            const employeeB = await client.query(
+                `INSERT INTO employees(name, department, email, daily_limit, daily_limit_mode, warning_enabled, active)
+                 VALUES ($1, $2, $3, 4, 'enforce', true, true)
+                 RETURNING id, name, department`,
+                [`${TEST_PREFIX}_emp_b`, deptB, tempEmail('emp_b')]
+            );
+            const employeeOut = await client.query(
+                `INSERT INTO employees(name, department, email, daily_limit, daily_limit_mode, warning_enabled, active)
+                 VALUES ($1, $2, $3, 4, 'enforce', true, true)
+                 RETURNING id, name, department`,
+                [`${TEST_PREFIX}_emp_out`, deptOut, tempEmail('emp_out')]
+            );
+
+            const lostUid = tempUid('L0');
+            const inactiveUid = tempUid('D0');
+            await client.query(
+                `INSERT INTO nfc_cards(uid, employee_id, label, status, active)
+                 VALUES
+                   ($1, $2, 'TAG perdido', 'lost', false),
+                   ($3, $4, 'TAG inactivo', 'inactive', false)`,
+                [
+                    lostUid,
+                    employeeA.rows[0].id,
+                    inactiveUid,
+                    employeeB.rows[0].id
+                ]
+            );
+
+            const passwordHash = await bcrypt.hash('coffeecontrol2024', 10);
+            const supervisorResult = await client.query(
+                `INSERT INTO admin_users(username, password_hash, role, full_name, department, email, active)
+                 VALUES ($1, $2, 'supervisor', $3, $4, $5, true)
+                 RETURNING id, username`,
+                [
+                    `${TEST_PREFIX}_sup`,
+                    passwordHash,
+                    `${TEST_PREFIX}_Supervisor`,
+                    deptA,
+                    tempEmail('sup')
+                ]
+            );
+            const supervisor = supervisorResult.rows[0];
+            await client.query(
+                `INSERT INTO admin_user_departments(admin_user_id, department)
+                 VALUES ($1, $2), ($1, $3)`,
+                [supervisor.id, deptA, deptB]
+            );
+
+            const managerResult = await client.query(
+                `INSERT INTO admin_users(username, password_hash, role, full_name, email, active)
+                 VALUES ($1, $2, 'gerente', $3, $4, true)
+                 RETURNING id, username`,
+                [
+                    `${TEST_PREFIX}_manager`,
+                    passwordHash,
+                    `${TEST_PREFIX}_Gerente`,
+                    tempEmail('manager')
+                ]
+            );
+            const manager = managerResult.rows[0];
+
+            const technicianResult = await client.query(
+                `INSERT INTO admin_users(username, password_hash, role, full_name, email, active)
+                 VALUES ($1, $2, 'tecnico', $3, $4, true)
+                 RETURNING id, username`,
+                [
+                    `${TEST_PREFIX}_tech`,
+                    passwordHash,
+                    `${TEST_PREFIX}_Tecnico`,
+                    tempEmail('tech')
+                ]
+            );
+            const technician = technicianResult.rows[0];
+
+            await client.query('COMMIT');
+            return {
+                departments: { deptA, deptB, deptOut },
+                machine,
+                employees: {
+                    a: employeeA.rows[0],
+                    b: employeeB.rows[0],
+                    out: employeeOut.rows[0]
+                },
+                cards: {
+                    lostUid,
+                    inactiveUid
+                },
+                supervisor,
+                manager,
+                technician
+            };
+        } catch (err) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            throw err;
+        }
+    });
+}
+
+before(async () => {
+    await cleanupFixtures();
+    notificationSettingsSnapshot = await loadNotificationSettingsSnapshot();
+
+    serverProcess = spawn(process.execPath, ['src/server.js'], {
+        cwd: backendRoot,
+        env: {
+            ...process.env,
+            PORT: String(TEST_PORT),
+            NODE_ENV: 'test',
+            DISABLE_ALERT_MONITOR: 'true',
+            ALERT_EMAIL_FROM: '',
+            ALERT_EMAIL_TO: '',
+            SMTP_HOST: '',
+            SMTP_PORT: '',
+            SMTP_SECURE: '',
+            SMTP_USER: '',
+            SMTP_PASS: ''
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    serverProcess.stdout.on('data', () => {});
+    serverProcess.stderr.on('data', () => {});
+
+    await waitForHealth();
+    fixture = await seedFixtures();
+
+    const login = await requestJson('POST', '/api/auth/login', {
+        body: { username: 'admin', password: 'coffeecontrol' }
+    });
+    assert.equal(login.status, 200);
+    adminToken = login.json.token;
+
+    const managerLogin = await requestJson('POST', '/api/auth/login', {
+        body: { username: fixture.manager.username, password: 'coffeecontrol2024' }
+    });
+    assert.equal(managerLogin.status, 200);
+    managerToken = managerLogin.json.token;
+
+    const technicianLogin = await requestJson('POST', '/api/auth/login', {
+        body: { username: fixture.technician.username, password: 'coffeecontrol2024' }
+    });
+    assert.equal(technicianLogin.status, 200);
+    technicianToken = technicianLogin.json.token;
+});
+
+after(async () => {
+    await restoreNotificationSettingsSnapshot(notificationSettingsSnapshot);
+    await cleanupFixtures();
+    if (serverProcess) {
+        serverProcess.kill('SIGTERM');
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (!serverProcess.killed) {
+            serverProcess.kill('SIGKILL');
+        }
+    }
+});
+
+test('login de supervisor devuelve scopes múltiples', async () => {
+    const response = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.json.role, 'supervisor');
+    assert.deepEqual(
+        [...response.json.department_scopes].sort(),
+        [fixture.departments.deptA, fixture.departments.deptB].sort()
+    );
+});
+
+test('supervisor solo ve empleados de sus áreas en lecturas y reportes', async () => {
+    const login = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+    const token = login.json.token;
+
+    const employees = await requestJson('GET', '/api/employees', { token });
+    assert.equal(employees.status, 200);
+    const departments = [...new Set(employees.json.employees.map(emp => emp.department))].sort();
+    assert.deepEqual(departments, [fixture.departments.deptA, fixture.departments.deptB].sort());
+    assert.ok(!departments.includes(fixture.departments.deptOut));
+
+    const reports = await requestJson('GET', '/api/reports/departments', { token });
+    assert.equal(reports.status, 200);
+    const reportDepartments = reports.json.departments.map(row => row.department).sort();
+    assert.deepEqual(reportDepartments, [fixture.departments.deptA, fixture.departments.deptB].sort());
+});
+
+test('supervisor recibe 403 fuera de alcance y no puede leer máquinas', async () => {
+    const login = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+    const token = login.json.token;
+
+    const outOfScope = await requestJson(
+        'GET',
+        `/api/dashboard/today?department=${encodeURIComponent(fixture.departments.deptOut)}`,
+        { token }
+    );
+    assert.equal(outOfScope.status, 403);
+
+    const machines = await requestJson('GET', '/api/machines', { token });
+    assert.equal(machines.status, 403);
+});
+
+test('TAG perdido e inactivo responden con razones explícitas en /api/tap', async () => {
+    const lost = await requestJson('POST', '/api/tap', {
+        headers: machineHeaders(fixture.machine.mac),
+        body: { nfc_uid: fixture.cards.lostUid }
+    });
+    assert.equal(lost.status, 403);
+    assert.equal(lost.json.reason, 'card_lost');
+
+    const inactive = await requestJson('POST', '/api/tap', {
+        headers: machineHeaders(fixture.machine.mac),
+        body: { nfc_uid: fixture.cards.inactiveUid }
+    });
+    assert.equal(inactive.status, 403);
+    assert.equal(inactive.json.reason, 'card_inactive');
+});
+
+test('comando remoto reboot se puede encolar, entregar y confirmar', async () => {
+    const queued = await requestJson('POST', `/api/machines/${fixture.machine.id}/commands`, {
+        token: adminToken,
+        body: { type: 'reboot' }
+    });
+    assert.equal(queued.status, 201);
+    assert.equal(queued.json.command.command_type, 'reboot');
+
+    const next = await requestJson('GET', '/api/machine-control/commands/next', {
+        headers: {
+            'X-Machine-Mac': fixture.machine.mac
+        }
+    });
+    assert.equal(next.status, 200);
+    assert.equal(next.json.command.type, 'reboot');
+
+    const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
+        headers: machineHeaders(fixture.machine.mac),
+        body: {
+            status: 'completed',
+            result: { message: 'ok' }
+        }
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(ack.json.ok, true);
+});
+
+test('supervisor no puede acceder a notificaciones ni auditoría', async () => {
+    const login = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+    const token = login.json.token;
+
+    const notificationSettings = await requestJson('GET', '/api/notification-settings', { token });
+    assert.equal(notificationSettings.status, 403);
+
+    const auditLogs = await requestJson('GET', '/api/audit-logs', { token });
+    assert.equal(auditLogs.status, 403);
+});
+
+test('gerente puede actualizar notificaciones y queda auditado', async () => {
+    const current = await requestJson('GET', '/api/notification-settings', { token: managerToken });
+    assert.equal(current.status, 200);
+
+    const nextLead = current.json.settings.employee_limit_warning_lead === 1 ? 2 : 1;
+    const updated = await requestJson('PUT', '/api/notification-settings', {
+        token: managerToken,
+        body: {
+            enabled: current.json.settings.enabled,
+            recipient_emails: current.json.settings.recipient_emails || tempEmail('alerts'),
+            notify_employee_limit_warning: current.json.settings.notify_employee_limit_warning,
+            notify_employee_daily_blocked: current.json.settings.notify_employee_daily_blocked,
+            notify_machine_offline: current.json.settings.notify_machine_offline,
+            notify_stock_low: current.json.settings.notify_stock_low,
+            employee_limit_warning_lead: nextLead
+        }
+    });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.json.settings.employee_limit_warning_lead, nextLead);
+
+    const auditLogs = await requestJson(
+        'GET',
+        `/api/audit-logs?action=notification_settings.update&q=${encodeURIComponent(fixture.manager.username)}`,
+        { token: managerToken }
+    );
+    assert.equal(auditLogs.status, 200);
+    const log = auditLogs.json.logs.find(entry => entry.actor_username === fixture.manager.username);
+    assert.ok(log, 'No se encontró el evento de auditoría para notification_settings.update');
+    assert.equal(log.action, 'notification_settings.update');
+    assert.equal(log.entity_type, 'notification_settings');
+});
+
+test('stock bajo abre y resuelve alerta operativa al cruzar el mínimo', async () => {
+    const settingsBefore = await requestJson('GET', '/api/notification-settings', { token: managerToken });
+    assert.equal(settingsBefore.status, 200);
+
+    const settingsUpdated = await requestJson('PUT', '/api/notification-settings', {
+        token: managerToken,
+        body: {
+            enabled: true,
+            recipient_emails: settingsBefore.json.settings.recipient_emails || tempEmail('stock-alerts'),
+            notify_employee_limit_warning: settingsBefore.json.settings.notify_employee_limit_warning,
+            notify_employee_daily_blocked: settingsBefore.json.settings.notify_employee_daily_blocked,
+            notify_machine_offline: settingsBefore.json.settings.notify_machine_offline,
+            notify_stock_low: true,
+            employee_limit_warning_lead: settingsBefore.json.settings.employee_limit_warning_lead
+        }
+    });
+    assert.equal(settingsUpdated.status, 200);
+    assert.equal(settingsUpdated.json.settings.notify_stock_low, true);
+
+    const itemId = Math.floor(Math.random() * 10000) + 30000;
+    const created = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock`, {
+        token: managerToken,
+        body: {
+            item_id: itemId,
+            product_name: `${TEST_PREFIX}_low_stock`,
+            slot_label: 'C3',
+            capacity_units: 8,
+            current_units: 2,
+            min_units: 3,
+            active: true
+        }
+    });
+    assert.equal(created.status, 201);
+
+    await withDb(async (client) => {
+        const alert = await client.query(
+            `SELECT status, payload
+             FROM alert_events
+             WHERE alert_key = $1`,
+            [`stock-low-${fixture.machine.id}-${created.json.stock_item.id}`]
+        );
+        assert.equal(alert.rowCount, 1);
+        assert.equal(alert.rows[0].status, 'open');
+        assert.equal(alert.rows[0].payload.status, 'low');
+    });
+
+    const restocked = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock/${created.json.stock_item.id}/restock`, {
+        token: managerToken,
+        body: {
+            quantity: 3
+        }
+    });
+    assert.equal(restocked.status, 200);
+    assert.equal(restocked.json.stock_item.current_units, 5);
+
+    await withDb(async (client) => {
+        const alert = await client.query(
+            `SELECT status, resolved_at
+             FROM alert_events
+             WHERE alert_key = $1`,
+            [`stock-low-${fixture.machine.id}-${created.json.stock_item.id}`]
+        );
+        assert.equal(alert.rowCount, 1);
+        assert.equal(alert.rows[0].status, 'resolved');
+        assert.ok(alert.rows[0].resolved_at, 'La alerta de stock bajo no quedó resuelta');
+    });
+});
+
+test('alta de empleado genera auditoría visible para gerente', async () => {
+    const created = await requestJson('POST', '/api/employees', {
+        token: managerToken,
+        body: {
+            name: `${TEST_PREFIX}_emp_audit`,
+            department: fixture.departments.deptA,
+            email: tempEmail('emp_audit'),
+            daily_limit: 4,
+            daily_limit_mode: 'enforce',
+            warning_enabled: true
+        }
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.json.employee.name, `${TEST_PREFIX}_emp_audit`);
+
+    const auditLogs = await requestJson(
+        'GET',
+        `/api/audit-logs?action=employee.create&q=${encodeURIComponent(TEST_PREFIX)}`,
+        { token: managerToken }
+    );
+    assert.equal(auditLogs.status, 200);
+    const log = auditLogs.json.logs.find(entry => entry.entity_label === `${TEST_PREFIX}_emp_audit`);
+    assert.ok(log, 'No se encontró el evento de auditoría para employee.create');
+    assert.equal(log.actor_username, fixture.manager.username);
+    assert.equal(log.action, 'employee.create');
+    assert.equal(log.entity_type, 'employee');
+});
+
+test('gerente puede configurar stock por máquina y consultarlo', async () => {
+    const itemId = Math.floor(Math.random() * 10000) + 1000;
+    const created = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock`, {
+        token: managerToken,
+        body: {
+            item_id: itemId,
+            product_name: `${TEST_PREFIX}_cafe_stock`,
+            slot_label: 'A1',
+            capacity_units: 20,
+            current_units: 12,
+            min_units: 3,
+            active: true
+        }
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.json.stock_item.item_id, itemId);
+    assert.equal(created.json.stock_item.current_units, 12);
+
+    const detail = await requestJson('GET', `/api/machines/${fixture.machine.id}/stock`, {
+        token: managerToken
+    });
+    assert.equal(detail.status, 200);
+    const stockItem = detail.json.items.find(item => item.item_id === itemId);
+    assert.ok(stockItem, 'No se encontró la selección configurada');
+    assert.equal(stockItem.product_name, `${TEST_PREFIX}_cafe_stock`);
+    assert.equal(detail.json.summary.configured_items >= 1, true);
+});
+
+test('vend_confirmed descuenta stock configurado sin romper el tap', async () => {
+    const itemId = Math.floor(Math.random() * 10000) + 20000;
+    const uid = tempUid('S0');
+
+    await withDb(async (client) => {
+        await client.query('BEGIN');
+        try {
+            await client.query(
+                `INSERT INTO nfc_cards(uid, employee_id, label, status, active)
+                 VALUES ($1, $2, 'TAG stock test', 'active', true)`,
+                [uid, fixture.employees.a.id]
+            );
+            await client.query(
+                `INSERT INTO machine_stock_items(machine_id, item_id, product_name, slot_label, capacity_units, current_units, min_units, active)
+                 VALUES ($1, $2, $3, 'B2', 10, 5, 1, true)`,
+                [fixture.machine.id, itemId, `${TEST_PREFIX}_sale_stock`]
+            );
+            await client.query(
+                `INSERT INTO taps(employee_id, machine_id, nfc_uid, approved, deny_reason, item_id, amount_cents, over_limit, confirmed, tapped_at)
+                 VALUES ($1, $2, $3, true, NULL, NULL, NULL, false, NULL, NOW())`,
+                [fixture.employees.a.id, fixture.machine.id, uid]
+            );
+            await client.query('COMMIT');
+        } catch (err) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            throw err;
+        }
+    });
+
+    const result = await requestJson('POST', '/api/tap/result', {
+        headers: machineHeaders(fixture.machine.mac),
+        body: {
+            nfc_uid: uid,
+            vend_success: true,
+            item_id: itemId,
+            amount: 150
+        }
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.json.ok, true);
+
+    const detail = await requestJson('GET', `/api/machines/${fixture.machine.id}/stock`, {
+        token: managerToken
+    });
+    assert.equal(detail.status, 200);
+    const stockItem = detail.json.items.find(item => item.item_id === itemId);
+    assert.ok(stockItem, 'No se encontró la selección descontada');
+    assert.equal(stockItem.current_units, 4);
+
+    await withDb(async (client) => {
+        const movement = await client.query(
+            `SELECT movement_type, quantity_delta
+             FROM stock_movements
+             WHERE machine_id = $1
+               AND item_id = $2
+             ORDER BY id DESC
+             LIMIT 1`,
+            [fixture.machine.id, itemId]
+        );
+        assert.equal(movement.rowCount, 1);
+        assert.equal(movement.rows[0].movement_type, 'sale');
+        assert.equal(parseInt(movement.rows[0].quantity_delta, 10), -1);
+    });
+});
+
+test('gerente puede ver reportes de stock con resumen y movimientos', async () => {
+    const itemId = Math.floor(Math.random() * 10000) + 40000;
+    const created = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock`, {
+        token: managerToken,
+        body: {
+            item_id: itemId,
+            product_name: `${TEST_PREFIX}_stock_report`,
+            slot_label: 'D4',
+            capacity_units: 10,
+            current_units: 2,
+            min_units: 3,
+            active: true
+        }
+    });
+    assert.equal(created.status, 201);
+
+    const restocked = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock/${created.json.stock_item.id}/restock`, {
+        token: managerToken,
+        body: {
+            quantity: 4,
+            note: 'Reposición de prueba'
+        }
+    });
+    assert.equal(restocked.status, 200);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const report = await requestJson('GET', `/api/reports/stock?from=${today}&to=${today}`, {
+        token: managerToken
+    });
+    assert.equal(report.status, 200);
+    assert.equal(report.json.business_timezone?.length > 0, true);
+    assert.equal(report.json.summary.configured_items >= 1, true);
+    assert.equal(report.json.summary.restocked_units >= 4, true);
+
+    const stockItem = report.json.items.find(item => Number(item.item_id) === itemId);
+    assert.ok(stockItem, 'No se encontró la selección en reportes de stock');
+    assert.equal(stockItem.product_name, `${TEST_PREFIX}_stock_report`);
+    assert.equal(['ok', 'low', 'empty', 'inactive'].includes(stockItem.status), true);
+
+    const movement = report.json.recent_movements.find(row => Number(row.item_id) === itemId);
+    assert.ok(movement, 'No se encontró movimiento reciente de stock');
+    assert.equal(movement.movement_type, 'restock');
+});
+
+test('supervisor no puede acceder a reportes de stock', async () => {
+    const login = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+    const token = login.json.token;
+
+    const report = await requestJson('GET', '/api/reports/stock', { token });
+    assert.equal(report.status, 403);
+});
+
+test('técnico puede operar máquinas y stock sin permisos gerenciales', async () => {
+    const machines = await requestJson('GET', '/api/machines', { token: technicianToken });
+    assert.equal(machines.status, 200);
+    assert.ok(Array.isArray(machines.json.machines));
+
+    const itemId = Math.floor(Math.random() * 10000) + 50000;
+    const created = await requestJson('POST', `/api/machines/${fixture.machine.id}/stock`, {
+        token: technicianToken,
+        body: {
+            item_id: itemId,
+            product_name: `${TEST_PREFIX}_tech_stock`,
+            slot_label: 'T1',
+            capacity_units: 12,
+            current_units: 6,
+            min_units: 2,
+            active: true
+        }
+    });
+    assert.equal(created.status, 201);
+
+    const command = await requestJson('POST', `/api/machines/${fixture.machine.id}/commands`, {
+        token: technicianToken,
+        body: { type: 'reboot' }
+    });
+    assert.equal(command.status, 201);
+    assert.equal(command.json.command.command_type, 'reboot');
+});
+
+test('técnico no puede acceder a empleados, analítica ni configuración global', async () => {
+    const employees = await requestJson('GET', '/api/employees', { token: technicianToken });
+    assert.equal(employees.status, 403);
+
+    const dashboard = await requestJson('GET', '/api/dashboard/today', { token: technicianToken });
+    assert.equal(dashboard.status, 403);
+
+    const reports = await requestJson('GET', '/api/reports/departments', { token: technicianToken });
+    assert.equal(reports.status, 403);
+
+    const taps = await requestJson('GET', `/api/machines/${fixture.machine.id}/taps`, { token: technicianToken });
+    assert.equal(taps.status, 403);
+
+    const notifications = await requestJson('GET', '/api/notification-settings', { token: technicianToken });
+    assert.equal(notifications.status, 403);
+});

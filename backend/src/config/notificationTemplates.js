@@ -32,5 +32,17 @@ module.exports = {
             'IP reportada: {{wifi_ip}}.',
             'Backend configurado: {{backend_url}}.'
         ].join('\n')
+    },
+    stockLow: {
+        subject: '[CoffeeControl] Stock bajo: {{machine_name}} · selección {{item_id}}',
+        body: [
+            'La selección {{item_id}} de la máquina {{machine_name}} quedó en estado {{status_label}}.',
+            'Producto: {{product_name}}.',
+            'Posición: {{slot_label}}.',
+            'Stock actual: {{current_units}} unidad(es).',
+            'Mínimo configurado: {{min_units}} unidad(es).',
+            'Capacidad: {{capacity_units}} unidad(es).',
+            'Ubicación: {{location}}.'
+        ].join('\n')
     }
 };

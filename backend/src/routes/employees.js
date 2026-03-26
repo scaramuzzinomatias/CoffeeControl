@@ -3,6 +3,7 @@ const express = require('express');
 const pool    = require('../db/pool');
 const { requireManager } = require('../middleware/roleAccess');
 const { normalizeLimitMode } = require('../lib/dailyLimit');
+const { buildDepartmentScopeClause } = require('../lib/accessScope');
 const audit = require('../services/audit');
 
 const router = express.Router();
@@ -47,9 +48,20 @@ function normalizeDailyLimit(value, { allowNull = false } = {}) {
     return parsed;
 }
 
+function departmentExpr(column) {
+    return `COALESCE(NULLIF(TRIM(${column}), ''), 'Sin área')`;
+}
+
 // GET /api/employees — listar todos con tarjetas NFC
 router.get('/', async (req, res) => {
     try {
+        const params = [];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const result = await pool.query(
             `SELECT e.*,
                 COALESCE(
@@ -60,18 +72,32 @@ router.get('/', async (req, res) => {
              FROM employees e
              LEFT JOIN nfc_cards nc ON nc.employee_id = e.id
              WHERE e.active = true
+               ${scope.sql}
              GROUP BY e.id
              ORDER BY e.name`
+            ,
+            params
         );
-        res.json({ employees: result.rows });
+        res.json({
+            employees: result.rows,
+            department: req.query.department ? String(req.query.department).trim() : null,
+            department_scopes: scope.appliedScopes
+        });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
 // GET /api/employees/:id — detalle de un empleado
 router.get('/:id', async (req, res) => {
     try {
+        const params = [req.params.id];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const emp = await pool.query(
             `SELECT e.*,
                 COALESCE(
@@ -82,8 +108,9 @@ router.get('/:id', async (req, res) => {
              FROM employees e
              LEFT JOIN nfc_cards nc ON nc.employee_id = e.id
              WHERE e.id = $1
+               ${scope.sql}
              GROUP BY e.id`,
-            [req.params.id]
+            params
         );
         if (emp.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
 
@@ -110,10 +137,12 @@ router.get('/:id', async (req, res) => {
         res.json({
             employee: emp.rows[0],
             machines_this_month: machines.rows,
-            recent_taps: taps.rows
+            recent_taps: taps.rows,
+            department: req.query.department ? String(req.query.department).trim() : null,
+            department_scopes: scope.appliedScopes
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 

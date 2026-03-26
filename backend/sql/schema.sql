@@ -65,6 +65,7 @@ CREATE TABLE notification_settings (
     notify_employee_limit_warning     BOOLEAN NOT NULL DEFAULT false,
     notify_employee_daily_blocked     BOOLEAN NOT NULL DEFAULT true,
     notify_machine_offline            BOOLEAN NOT NULL DEFAULT true,
+    notify_stock_low                  BOOLEAN NOT NULL DEFAULT false,
     notify_machine_backend_down       BOOLEAN NOT NULL DEFAULT true,
     employee_limit_warning_lead       SMALLINT NOT NULL DEFAULT 1,
     created_at                        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -79,6 +80,32 @@ CREATE TABLE system_settings (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CHECK (id = 1)
+);
+
+CREATE TABLE admin_users (
+    id            SERIAL PRIMARY KEY,
+    username      VARCHAR(60) UNIQUE NOT NULL,
+    password_hash VARCHAR(128) NOT NULL,
+    role          VARCHAR(20) NOT NULL DEFAULT 'admin',
+    department    VARCHAR(60),
+    full_name     VARCHAR(100),
+    email         VARCHAR(120),
+    active        BOOLEAN NOT NULL DEFAULT true,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (role IN ('admin', 'gerente', 'supervisor', 'tecnico'))
+);
+
+CREATE TABLE admin_user_departments (
+    admin_user_id INT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+    department    VARCHAR(60) NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (admin_user_id, department)
+);
+
+CREATE TABLE schema_migrations (
+    version     INT PRIMARY KEY,
+    filename    VARCHAR(120) NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE audit_logs (
@@ -97,6 +124,24 @@ CREATE TABLE audit_logs (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE machine_stock_items (
+    id             SERIAL PRIMARY KEY,
+    machine_id     INT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+    item_id        INT NOT NULL,
+    product_name   VARCHAR(120) NOT NULL,
+    slot_label     VARCHAR(40),
+    capacity_units INT NOT NULL DEFAULT 0,
+    current_units  INT NOT NULL DEFAULT 0,
+    min_units      INT NOT NULL DEFAULT 0,
+    active         BOOLEAN NOT NULL DEFAULT true,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (item_id >= 0),
+    CHECK (capacity_units >= 0),
+    CHECK (min_units >= 0),
+    UNIQUE (machine_id, item_id)
+);
+
 -- Registro de taps (cada vez que alguien acerca la tarjeta)
 CREATE TABLE taps (
     id          BIGSERIAL PRIMARY KEY,
@@ -113,9 +158,29 @@ CREATE TABLE taps (
 );
 
 -- ── Índices ──────────────────────────────────────────
+CREATE TABLE stock_movements (
+    id             BIGSERIAL PRIMARY KEY,
+    machine_id     INT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+    stock_item_id  INT REFERENCES machine_stock_items(id) ON DELETE SET NULL,
+    item_id        INT NOT NULL,
+    movement_type  VARCHAR(24) NOT NULL,
+    quantity_delta INT NOT NULL,
+    previous_units INT,
+    current_units  INT,
+    tap_id         BIGINT REFERENCES taps(id) ON DELETE SET NULL,
+    actor_user_id  INT REFERENCES admin_users(id) ON DELETE SET NULL,
+    note           VARCHAR(255),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (movement_type IN ('sale', 'restock', 'adjustment', 'unconfigured_sale'))
+);
+
 CREATE INDEX idx_taps_employee_date ON taps (employee_id, tapped_at);
 CREATE INDEX idx_taps_machine       ON taps (machine_id, tapped_at);
 CREATE INDEX idx_nfc_uid            ON nfc_cards (uid);
+CREATE INDEX idx_admin_user_departments_department ON admin_user_departments (department);
+CREATE INDEX idx_machine_stock_items_machine_active ON machine_stock_items (machine_id, active, item_id);
+CREATE INDEX idx_stock_movements_machine_created ON stock_movements (machine_id, created_at DESC, id DESC);
+CREATE INDEX idx_stock_movements_stock_item_created ON stock_movements (stock_item_id, created_at DESC, id DESC);
 
 -- ── Vista: consumo de hoy por empleado ───────────────
 CREATE VIEW daily_consumption AS

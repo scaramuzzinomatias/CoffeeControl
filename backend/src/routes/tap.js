@@ -5,6 +5,7 @@ const express  = require('express');
 const pool     = require('../db/pool');
 const { broadcast } = require('../ws');
 const alerts = require('../services/alerts');
+const stock = require('../services/stock');
 const systemSettings = require('../services/systemSettings');
 const {
     normalizeLimitMode,
@@ -55,7 +56,7 @@ router.post('/', async (req, res) => {
         const cardResult = await pool.query(
             `SELECT nc.id, nc.employee_id, nc.active AS card_active,
                     COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
-                    e.name, e.daily_limit, e.daily_limit_mode,
+                    e.name, e.department, e.daily_limit, e.daily_limit_mode,
                     e.warning_enabled, e.active
              FROM nfc_cards nc
              JOIN employees e ON e.id = nc.employee_id
@@ -73,6 +74,7 @@ router.post('/', async (req, res) => {
         const {
             employee_id,
             name,
+            department,
             card_active,
             card_status,
             daily_limit,
@@ -85,13 +87,13 @@ router.post('/', async (req, res) => {
 
         if (resolvedCardStatus === 'lost') {
             await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_lost' });
-            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, machine: machine.name, reason: 'card_lost' });
+            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, department, machine: machine.name, reason: 'card_lost' });
             return res.status(403).json({ error: 'TAG reportado como perdido', reason: 'card_lost' });
         }
 
         if (!card_active || resolvedCardStatus !== 'active') {
             await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_inactive' });
-            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, machine: machine.name, reason: 'card_inactive' });
+            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, department, machine: machine.name, reason: 'card_inactive' });
             return res.status(403).json({ error: 'TAG desactivado', reason: 'card_inactive' });
         }
 
@@ -120,7 +122,7 @@ router.post('/', async (req, res) => {
             console.log(`[TAP] DENEGADO — ${name} (${tapsToday}/${daily_limit} hoy)`);
 
             // Notificar al dashboard en tiempo real
-            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, tapsToday, daily_limit, machine: machine.name });
+            broadcast({ event: 'tap_denied', uid, employee: name, employee_id, department, tapsToday, daily_limit, machine: machine.name });
             alerts.notifyEmployeeDailyBlocked({
                 employeeId: employee_id,
                 employeeName: name,
@@ -177,6 +179,7 @@ router.post('/', async (req, res) => {
             uid,
             employee: name,
             employee_id,
+            department,
             tapsToday: tapsToday + 1,
             daily_limit,
             daily_limit_mode,
@@ -212,7 +215,7 @@ router.post('/result', async (req, res) => {
 
     try {
         if (vend_success) {
-            await pool.query(
+            const updateResult = await pool.query(
                 `UPDATE taps SET confirmed = true, item_id = $1, amount_cents = $2
                  WHERE id = (
                     SELECT id FROM taps
@@ -222,10 +225,39 @@ router.post('/result', async (req, res) => {
                       AND confirmed  IS NULL
                     ORDER BY tapped_at DESC
                     LIMIT 1
-                 )`,
+                 )
+                 RETURNING id, item_id, amount_cents`,
                 [item_id, amount, nfc_uid.toUpperCase(), machine.id]
             );
-            broadcast({ event: 'vend_confirmed', machine: machine.name, item_id, amount });
+            if (updateResult.rowCount > 0) {
+                const confirmedTap = updateResult.rows[0];
+                broadcast({
+                    event: 'vend_confirmed',
+                    machine: machine.name,
+                    item_id: confirmedTap.item_id,
+                    amount: confirmedTap.amount_cents
+                });
+                try {
+                    const stockResult = await stock.recordSale({
+                        machineId: machine.id,
+                        itemId: confirmedTap.item_id,
+                        tapId: confirmedTap.id
+                    });
+                    if (stockResult?.configured) {
+                        await alerts.syncStockLowAlert({
+                            machine,
+                            stockItem: stockResult.stockItem
+                        });
+                        broadcast({
+                            event: 'machine_stock_updated',
+                            machine_id: machine.id,
+                            machine: machine.name
+                        });
+                    }
+                } catch (stockErr) {
+                    console.error(`[STOCK] No se pudo descontar stock en ${machine.name}:`, stockErr.message);
+                }
+            }
         } else {
             // Revertir approved para que no cuente en el límite diario
             await pool.query(

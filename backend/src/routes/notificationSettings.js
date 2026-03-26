@@ -32,6 +32,7 @@ router.put('/', requireManager, async (req, res) => {
                     notify_employee_limit_warning: before.notify_employee_limit_warning,
                     notify_employee_daily_blocked: before.notify_employee_daily_blocked,
                     notify_machine_offline: before.notify_machine_offline,
+                    notify_stock_low: before.notify_stock_low,
                     employee_limit_warning_lead: before.employee_limit_warning_lead
                 },
                 after: {
@@ -40,6 +41,7 @@ router.put('/', requireManager, async (req, res) => {
                     notify_employee_limit_warning: settings.notify_employee_limit_warning,
                     notify_employee_daily_blocked: settings.notify_employee_daily_blocked,
                     notify_machine_offline: settings.notify_machine_offline,
+                    notify_stock_low: settings.notify_stock_low,
                     employee_limit_warning_lead: settings.employee_limit_warning_lead
                 }
             }

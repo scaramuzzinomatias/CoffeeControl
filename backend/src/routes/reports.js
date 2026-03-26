@@ -1,8 +1,12 @@
 const express = require('express');
 const pool = require('../db/pool');
 const systemSettings = require('../services/systemSettings');
+const { buildDepartmentScopeClause } = require('../lib/accessScope');
+const { requireManager, requireAnalyticsViewer } = require('../middleware/roleAccess');
+const { classifyStockStatus } = require('../services/stock');
 
 const router = express.Router();
+router.use(requireAnalyticsViewer);
 
 function normalizeDateInput(value) {
     const raw = String(value || '').trim();
@@ -17,6 +21,14 @@ function normalizeLimit(value, fallback = 20, max = 100) {
     const parsed = parseInt(value, 10);
     if (!Number.isInteger(parsed) || parsed < 1) return fallback;
     return Math.min(parsed, max);
+}
+
+function normalizeTextFilter(value, max = 120) {
+    return String(value || '').trim().slice(0, max);
+}
+
+function departmentExpr(column) {
+    return `COALESCE(NULLIF(TRIM(${column}), ''), 'Sin área')`;
 }
 
 function buildBusinessDateRangeSql(column, fromParamIndex, toParamIndex, timeZoneParamIndex) {
@@ -40,9 +52,101 @@ function reportMeta(range) {
     };
 }
 
+function toInt(value, fallback = 0) {
+    const parsed = parseInt(value, 10);
+    return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+function serializeStockReportItem(row) {
+    const base = {
+        id: toInt(row.id, 0),
+        machine_id: toInt(row.machine_id, 0),
+        item_id: toInt(row.item_id, 0),
+        product_name: row.product_name || '',
+        slot_label: row.slot_label || null,
+        capacity_units: toInt(row.capacity_units, 0),
+        current_units: toInt(row.current_units, 0),
+        min_units: toInt(row.min_units, 0),
+        active: row.active !== false,
+    };
+    const status = classifyStockStatus(base);
+    const fillPct = base.capacity_units > 0
+        ? Math.round((Math.max(base.current_units, 0) / base.capacity_units) * 100)
+        : null;
+    return {
+        ...base,
+        machine_name: row.machine_name || '',
+        location: row.location || null,
+        status: status.key,
+        status_label: status.label,
+        status_badge: status.badge,
+        fill_pct: fillPct,
+        sales_units: toInt(row.sales_units, 0),
+        restocked_units: toInt(row.restocked_units, 0),
+        adjustment_delta: toInt(row.adjustment_delta, 0),
+        last_movement_at: row.last_movement_at || null,
+        last_sale_at: row.last_sale_at || null,
+        last_restock_at: row.last_restock_at || null,
+        updated_at: row.updated_at || null
+    };
+}
+
+function serializeStockReportMovement(row) {
+    return {
+        id: toInt(row.id, 0),
+        machine_id: toInt(row.machine_id, 0),
+        stock_item_id: toInt(row.stock_item_id, null),
+        item_id: toInt(row.item_id, 0),
+        machine_name: row.machine_name || '',
+        location: row.location || null,
+        product_name: row.product_name || `Selección ${row.item_id || 's/d'}`,
+        slot_label: row.slot_label || null,
+        movement_type: row.movement_type || '',
+        quantity_delta: toInt(row.quantity_delta, 0),
+        previous_units: toInt(row.previous_units, null),
+        current_units: toInt(row.current_units, null),
+        actor_username: row.actor_username || null,
+        note: row.note || null,
+        created_at: row.created_at || null
+    };
+}
+
+function buildStockReportSummary(items, movementSummaryRow) {
+    const activeItems = items.filter(item => item.active);
+    return {
+        configured_items: activeItems.length,
+        machines_with_stock: new Set(activeItems.map(item => item.machine_id)).size,
+        low_items: activeItems.filter(item => item.status === 'low').length,
+        empty_items: activeItems.filter(item => item.status === 'empty').length,
+        inactive_items: items.filter(item => !item.active).length,
+        total_units: activeItems.reduce((acc, item) => acc + (item.current_units || 0), 0),
+        sales_units: toInt(movementSummaryRow?.sales_units, 0),
+        restocked_units: toInt(movementSummaryRow?.restocked_units, 0),
+        adjustment_delta: toInt(movementSummaryRow?.adjustment_delta, 0),
+        unconfigured_sales: toInt(movementSummaryRow?.unconfigured_sales, 0),
+        total_movements: toInt(movementSummaryRow?.total_movements, 0),
+        last_movement_at: movementSummaryRow?.last_movement_at || null
+    };
+}
+
 router.get('/overview', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const params = [range.from, range.to, range.timeZone];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e_filter.department')
+        });
+        const departmentClause = scope.sql
+            ? ` AND EXISTS (
+                    SELECT 1
+                    FROM employees e_filter
+                    WHERE e_filter.id = t.employee_id
+                      ${scope.sql}
+                )`
+            : '';
         const summaryResult = await pool.query(
             `SELECT
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS approved_taps,
@@ -52,8 +156,9 @@ router.get('/overview', async (req, res) => {
                 COUNT(DISTINCT t.machine_id) FILTER (WHERE t.approved = true) AS machines_with_sales,
                 COUNT(DISTINCT t.employee_id) FILTER (WHERE t.approved = true) AS employees_with_sales
              FROM taps t
-             WHERE ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}`,
-            [range.from, range.to, range.timeZone]
+             WHERE ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
+               ${departmentClause}`,
+            params
         );
 
         const seriesResult = await pool.query(
@@ -68,19 +173,22 @@ router.get('/overview', async (req, res) => {
              FROM days
              LEFT JOIN taps t
                ON t.tapped_at >= (days.business_day::timestamp AT TIME ZONE $3)
-              AND t.tapped_at < (((days.business_day + INTERVAL '1 day')::timestamp) AT TIME ZONE $3)
-             GROUP BY days.business_day
-             ORDER BY days.business_day`,
-            [range.from, range.to, range.timeZone]
+               AND t.tapped_at < (((days.business_day + INTERVAL '1 day')::timestamp) AT TIME ZONE $3)
+               ${departmentClause}
+              GROUP BY days.business_day
+              ORDER BY days.business_day`,
+            params
         );
 
         return res.json({
             ...reportMeta(range),
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
             summary: summaryResult.rows[0],
             by_day: seriesResult.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -88,12 +196,13 @@ router.get('/overview', async (req, res) => {
 router.get('/machines', async (req, res) => {
     try {
         const range = await getReportRange(req);
-        const department = String(req.query.department || '').trim();
         const params = [range.from, range.to, range.timeZone];
-        const departmentClause = department
-            ? `AND COALESCE(NULLIF(TRIM(e_filter.department), ''), 'Sin área') = $4`
-            : '';
-        if (department) params.push(department);
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e_filter.department')
+        });
         const result = await pool.query(
             `SELECT
                 m.id,
@@ -110,7 +219,7 @@ router.get('/machines', async (req, res) => {
               AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              LEFT JOIN employees e_filter ON e_filter.id = t.employee_id
              WHERE m.active = true
-               ${departmentClause}
+               ${scope.sql}
              GROUP BY m.id, m.name, m.location
              ORDER BY spent_cents DESC, taps_count DESC, m.name`,
             params
@@ -118,11 +227,12 @@ router.get('/machines', async (req, res) => {
 
         return res.json({
             ...reportMeta(range),
-            department: department || null,
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
             machines: result.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -130,6 +240,13 @@ router.get('/machines', async (req, res) => {
 router.get('/machines/:id/employees', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const params = [req.params.id, range.from, range.to, range.timeZone];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const result = await pool.query(
             `SELECT
                 e.id,
@@ -143,16 +260,19 @@ router.get('/machines/:id/employees', async (req, res) => {
              JOIN employees e ON e.id = t.employee_id
              WHERE t.machine_id = $1
                AND ${buildBusinessDateRangeSql('t.tapped_at', 2, 3, 4)}
+               ${scope.sql}
              GROUP BY e.id, e.name, e.legajo, e.department
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
-            [req.params.id, range.from, range.to, range.timeZone]
+            params
         );
         return res.json({
             ...reportMeta(range),
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
             employees: result.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -160,12 +280,26 @@ router.get('/machines/:id/employees', async (req, res) => {
 router.get('/employees', async (req, res) => {
     try {
         const range = await getReportRange(req);
-        const department = String(req.query.department || '').trim();
+        const employeeSearch = normalizeTextFilter(req.query.employee_search, 120);
         const params = [range.from, range.to, range.timeZone];
-        const departmentClause = department
-            ? `AND COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área') = $4`
-            : '';
-        if (department) params.push(department);
+        const whereClauses = ['e.active = true'];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
+        if (scope.sql) whereClauses.push(scope.sql.replace(/^ AND /, ''));
+        if (employeeSearch) {
+            params.push(`%${employeeSearch}%`);
+            whereClauses.push(`(
+                e.name ILIKE $${params.length}
+                OR COALESCE(e.legajo, '') ILIKE $${params.length}
+                OR COALESCE(e.email, '') ILIKE $${params.length}
+                OR COALESCE(e.dni, '') ILIKE $${params.length}
+                OR COALESCE(e.phone, '') ILIKE $${params.length}
+            )`);
+        }
 
         const result = await pool.query(
             `SELECT
@@ -183,9 +317,8 @@ router.get('/employees', async (req, res) => {
              FROM employees e
              LEFT JOIN taps t
                ON t.employee_id = e.id
-              AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
-             WHERE e.active = true
-               ${departmentClause}
+               AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
+             WHERE ${whereClauses.join(' AND ')}
              GROUP BY e.id, e.name, e.legajo, e.department, e.daily_limit, e.daily_limit_mode
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
             params
@@ -193,11 +326,13 @@ router.get('/employees', async (req, res) => {
 
         return res.json({
             ...reportMeta(range),
-            department: department || null,
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
+            employee_search: employeeSearch || null,
             employees: result.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -205,6 +340,13 @@ router.get('/employees', async (req, res) => {
 router.get('/employees/:id/machines', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const params = [req.params.id, range.from, range.to, range.timeZone];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const result = await pool.query(
             `SELECT
                 m.id,
@@ -215,19 +357,23 @@ router.get('/employees/:id/machines', async (req, res) => {
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents,
                 MAX(t.tapped_at) AS last_tap_at
              FROM taps t
+             JOIN employees e ON e.id = t.employee_id
              JOIN machines m ON m.id = t.machine_id
              WHERE t.employee_id = $1
                AND ${buildBusinessDateRangeSql('t.tapped_at', 2, 3, 4)}
+               ${scope.sql}
              GROUP BY m.id, m.name, m.location
              ORDER BY spent_cents DESC, taps_count DESC, m.name`,
-            [req.params.id, range.from, range.to, range.timeZone]
+            params
         );
         return res.json({
             ...reportMeta(range),
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
             machines: result.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -235,6 +381,15 @@ router.get('/employees/:id/machines', async (req, res) => {
 router.get('/departments', async (req, res) => {
     try {
         const range = await getReportRange(req);
+        const params = [range.from, range.to, range.timeZone];
+        const whereClauses = ['e.active = true'];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
+        if (scope.sql) whereClauses.push(scope.sql.replace(/^ AND /, ''));
         const result = await pool.query(
             `SELECT
                 COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área') AS department,
@@ -246,18 +401,20 @@ router.get('/departments', async (req, res) => {
              FROM employees e
              LEFT JOIN taps t
                ON t.employee_id = e.id
-              AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
-             WHERE e.active = true
+               AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
+             WHERE ${whereClauses.join(' AND ')}
              GROUP BY COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área')
              ORDER BY spent_cents DESC, taps_count DESC, department`,
-            [range.from, range.to, range.timeZone]
+            params
         );
         return res.json({
             ...reportMeta(range),
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
             departments: result.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });
@@ -268,10 +425,16 @@ router.get('/recent-taps', async (req, res) => {
         const limit = normalizeLimit(req.query.limit, 30, 100);
         const machineId = parseInt(req.query.machine_id, 10);
         const employeeId = parseInt(req.query.employee_id, 10);
-        const department = String(req.query.department || '').trim();
 
         const clauses = [buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)];
         const params = [range.from, range.to, range.timeZone];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
+        if (scope.sql) clauses.push(scope.sql.replace(/^ AND /, ''));
 
         if (Number.isInteger(machineId)) {
             params.push(machineId);
@@ -280,10 +443,6 @@ router.get('/recent-taps', async (req, res) => {
         if (Number.isInteger(employeeId)) {
             params.push(employeeId);
             clauses.push(`t.employee_id = $${params.length}`);
-        }
-        if (department) {
-            params.push(department);
-            clauses.push(`COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área') = $${params.length}`);
         }
 
         params.push(limit);
@@ -311,10 +470,124 @@ router.get('/recent-taps', async (req, res) => {
 
         return res.json({
             ...reportMeta(range),
+            department: req.query.department ? normalizeTextFilter(req.query.department, 80) : null,
+            department_scopes: scope.appliedScopes,
             taps: result.rows
         });
     } catch (err) {
-        const status = err.message?.startsWith('Fecha inválida') ? 400 : 500;
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
+        return res.status(status).json({ error: err.message });
+    }
+});
+
+router.get('/stock', requireManager, async (req, res) => {
+    try {
+        const range = await getReportRange(req);
+        const params = [range.from, range.to, range.timeZone];
+        const movementRangeSql = buildBusinessDateRangeSql('sm.created_at', 1, 2, 3);
+
+        const itemsResult = await pool.query(
+            `WITH movement_summary AS (
+                SELECT
+                    sm.stock_item_id,
+                    COALESCE(SUM(CASE WHEN sm.movement_type = 'sale' THEN ABS(sm.quantity_delta) ELSE 0 END), 0) AS sales_units,
+                    COALESCE(SUM(CASE WHEN sm.movement_type = 'restock' THEN GREATEST(sm.quantity_delta, 0) ELSE 0 END), 0) AS restocked_units,
+                    COALESCE(SUM(CASE WHEN sm.movement_type = 'adjustment' THEN sm.quantity_delta ELSE 0 END), 0) AS adjustment_delta,
+                    MAX(sm.created_at) AS last_movement_at,
+                    MAX(sm.created_at) FILTER (WHERE sm.movement_type = 'sale') AS last_sale_at,
+                    MAX(sm.created_at) FILTER (WHERE sm.movement_type = 'restock') AS last_restock_at
+                FROM stock_movements sm
+                WHERE ${movementRangeSql}
+                  AND sm.stock_item_id IS NOT NULL
+                GROUP BY sm.stock_item_id
+            )
+            SELECT
+                si.id,
+                si.machine_id,
+                si.item_id,
+                si.product_name,
+                si.slot_label,
+                si.capacity_units,
+                si.current_units,
+                si.min_units,
+                si.active,
+                si.updated_at,
+                m.name AS machine_name,
+                m.location,
+                ms.sales_units,
+                ms.restocked_units,
+                ms.adjustment_delta,
+                ms.last_movement_at,
+                ms.last_sale_at,
+                ms.last_restock_at
+             FROM machine_stock_items si
+             JOIN machines m ON m.id = si.machine_id
+             LEFT JOIN movement_summary ms ON ms.stock_item_id = si.id
+             WHERE m.active = true
+             ORDER BY
+                CASE
+                    WHEN si.active = false THEN 3
+                    WHEN si.current_units <= 0 THEN 0
+                    WHEN si.current_units <= si.min_units THEN 1
+                    ELSE 2
+                END,
+                si.current_units ASC,
+                m.name ASC,
+                si.item_id ASC`,
+            params
+        );
+
+        const movementSummaryResult = await pool.query(
+            `SELECT
+                COALESCE(SUM(CASE WHEN movement_type = 'sale' THEN ABS(quantity_delta) ELSE 0 END), 0) AS sales_units,
+                COALESCE(SUM(CASE WHEN movement_type = 'restock' THEN GREATEST(quantity_delta, 0) ELSE 0 END), 0) AS restocked_units,
+                COALESCE(SUM(CASE WHEN movement_type = 'adjustment' THEN quantity_delta ELSE 0 END), 0) AS adjustment_delta,
+                COALESCE(SUM(CASE WHEN movement_type = 'unconfigured_sale' THEN ABS(quantity_delta) ELSE 0 END), 0) AS unconfigured_sales,
+                COUNT(*) AS total_movements,
+                MAX(created_at) AS last_movement_at
+             FROM stock_movements
+             WHERE ${buildBusinessDateRangeSql('created_at', 1, 2, 3)}`,
+            params
+        );
+
+        const recentMovementsResult = await pool.query(
+            `SELECT
+                sm.id,
+                sm.machine_id,
+                sm.stock_item_id,
+                sm.item_id,
+                sm.movement_type,
+                sm.quantity_delta,
+                sm.previous_units,
+                sm.current_units,
+                sm.note,
+                sm.created_at,
+                m.name AS machine_name,
+                m.location,
+                au.username AS actor_username,
+                COALESCE(si.product_name, CONCAT('Selección ', sm.item_id::text)) AS product_name,
+                si.slot_label
+             FROM stock_movements sm
+             JOIN machines m ON m.id = sm.machine_id
+             LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
+             LEFT JOIN admin_users au ON au.id = sm.actor_user_id
+             WHERE ${buildBusinessDateRangeSql('sm.created_at', 1, 2, 3)}
+             ORDER BY sm.created_at DESC, sm.id DESC
+             LIMIT 40`,
+            params
+        );
+
+        const items = itemsResult.rows.map(serializeStockReportItem);
+        const summary = buildStockReportSummary(items, movementSummaryResult.rows[0]);
+        return res.json({
+            ...reportMeta(range),
+            summary,
+            critical_items: items.filter(item => item.status === 'empty' || item.status === 'low').slice(0, 12),
+            items,
+            recent_movements: recentMovementsResult.rows.map(serializeStockReportMovement)
+        });
+    } catch (err) {
+        const status = err.status || (err.message?.startsWith('Fecha inválida') ? 400 : 500);
         return res.status(status).json({ error: err.message });
     }
 });

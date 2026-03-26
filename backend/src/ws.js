@@ -3,6 +3,12 @@
 
 const { WebSocketServer } = require('ws');
 const jwt = require('jsonwebtoken');
+const {
+    isManagerRole,
+    canViewAnalytics,
+    normalizeDepartmentList,
+    departmentsEqual
+} = require('./lib/accessScope');
 
 const SECRET = process.env.JWT_SECRET || 'cc-dev-secret-change-in-prod';
 
@@ -45,6 +51,11 @@ function initWebSocket(server) {
         } catch (err) {
             console.warn('[WS] Handshake rechazado: token inválido o expirado');
             return rejectUpgrade(socket, 401, 'Unauthorized');
+        }
+
+        if (!canViewAnalytics(user?.role)) {
+            console.warn(`[WS] Handshake rechazado: rol sin acceso al feed (${user?.role || 'sin rol'})`);
+            return rejectUpgrade(socket, 403, 'Forbidden');
         }
 
         wss.handleUpgrade(req, socket, head, (ws) => {
@@ -90,12 +101,22 @@ function initWebSocket(server) {
     console.log('[WS] Servidor WebSocket listo en /ws');
 }
 
+function canReceiveBroadcast(user, data) {
+    if (!canViewAnalytics(user?.role)) return false;
+    if (isManagerRole(user?.role)) return true;
+    const scopes = normalizeDepartmentList(user?.department_scopes || []);
+    if (!scopes.length) return true;
+    const eventDepartment = String(data?.department || '').trim();
+    if (!eventDepartment) return false;
+    return scopes.some(scope => departmentsEqual(scope, eventDepartment));
+}
+
 // Enviar un mensaje a todos los clientes conectados al dashboard
 function broadcast(data) {
     if (!wss) return;
     const msg = JSON.stringify(data);
     wss.clients.forEach(client => {
-        if (client.readyState === 1) { // OPEN
+        if (client.readyState === 1 && canReceiveBroadcast(client.user, data)) { // OPEN
             client.send(msg);
         }
     });

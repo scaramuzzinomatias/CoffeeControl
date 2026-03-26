@@ -1,9 +1,10 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { broadcast } = require('../ws');
-const { requireManager } = require('../middleware/roleAccess');
+const { requireManager, requireMachineOperator } = require('../middleware/roleAccess');
 const alerts = require('../services/alerts');
 const audit = require('../services/audit');
+const stock = require('../services/stock');
 
 const router = express.Router();
 const MACHINE_ONLINE_WINDOW_MS = 180000;
@@ -24,6 +25,27 @@ function normalizeOptionalInteger(value) {
     if (value === null || value === undefined || value === '') return null;
     const parsed = parseInt(value, 10);
     return Number.isInteger(parsed) ? parsed : null;
+}
+
+function parseMachineId(value) {
+    const parsed = parseInt(value, 10);
+    return Number.isInteger(parsed) ? parsed : null;
+}
+
+async function getActiveMachineById(machineId) {
+    const result = await pool.query(
+        `SELECT id, name, location, last_seen
+         FROM machines
+         WHERE id = $1
+           AND active = true`,
+        [machineId]
+    );
+    return result.rows[0] || null;
+}
+
+function syncStockAlert(machine, stockItem) {
+    return alerts.syncStockLowAlert({ machine, stockItem })
+        .catch(err => console.error(`[ALERT] Error stock bajo ${machine?.name || machine?.id || '?'}/${stockItem?.id || '?'}:`, err.message));
 }
 
 function normalizeCommandPayload(type, payload) {
@@ -202,13 +224,21 @@ router.post('/pending/:id/reject', requireManager, async (req, res) => {
     }
 });
 
-router.get('/', async (req, res) => {
+router.get('/', requireMachineOperator, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM machine_status WHERE active = true ORDER BY id');
+        const stockSummaryMap = await stock.getMachineStockSummaryMap(result.rows.map(row => row.id));
         const now = Date.now();
         const machines = result.rows.map(machine => ({
             ...machine,
             online: machine.last_seen ? (now - new Date(machine.last_seen).getTime()) < 180000 : false,
+            stock_summary: stockSummaryMap.get(machine.id) || {
+                configured_items: 0,
+                low_items: 0,
+                empty_items: 0,
+                inactive_items: 0,
+                total_units: 0
+            }
         }));
         res.json({ machines });
     } catch (err) {
@@ -280,7 +310,7 @@ router.patch('/:id', requireManager, async (req, res) => {
     }
 });
 
-router.post('/:id/commands', requireManager, async (req, res) => {
+router.post('/:id/commands', requireMachineOperator, async (req, res) => {
     const { type, payload } = req.body || {};
     const machineId = parseInt(req.params.id, 10);
 
@@ -364,7 +394,7 @@ router.post('/:id/commands', requireManager, async (req, res) => {
     }
 });
 
-router.get('/:id/commands/:commandId', requireManager, async (req, res) => {
+router.get('/:id/commands/:commandId', requireMachineOperator, async (req, res) => {
     const machineId = parseInt(req.params.id, 10);
     const commandId = parseInt(req.params.commandId, 10);
     if (!Number.isInteger(machineId) || !Number.isInteger(commandId)) {
@@ -469,7 +499,215 @@ router.delete('/:id', requireManager, async (req, res) => {
     }
 });
 
-router.get('/:id/taps', async (req, res) => {
+router.get('/:id/stock', requireMachineOperator, async (req, res) => {
+    const machineId = parseMachineId(req.params.id);
+    if (!machineId) {
+        return res.status(400).json({ error: 'ID de máquina inválido' });
+    }
+    try {
+        const machine = await getActiveMachineById(machineId);
+        if (!machine) return res.status(404).json({ error: 'No encontrada' });
+        const data = await stock.getMachineStock(machineId);
+        return res.json({
+            machine: {
+                id: machine.id,
+                name: machine.name,
+                location: machine.location
+            },
+            summary: data.summary,
+            items: data.items,
+            movements: data.movements
+        });
+    } catch (err) {
+        return res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.post('/:id/stock', requireMachineOperator, async (req, res) => {
+    const machineId = parseMachineId(req.params.id);
+    if (!machineId) {
+        return res.status(400).json({ error: 'ID de máquina inválido' });
+    }
+    try {
+        const machine = await getActiveMachineById(machineId);
+        if (!machine) return res.status(404).json({ error: 'No encontrada' });
+        const created = await stock.createStockItem({
+            machineId,
+            itemId: req.body?.item_id,
+            productName: req.body?.product_name,
+            slotLabel: req.body?.slot_label,
+            capacityUnits: req.body?.capacity_units,
+            currentUnits: req.body?.current_units,
+            minUnits: req.body?.min_units,
+            active: req.body?.active !== false,
+            actorUserId: req.user?.id || null,
+            note: req.body?.note
+        });
+        await audit.logAuditEvent({
+            req,
+            action: 'stock_item.create',
+            entityType: 'stock_item',
+            entityId: created.stockItem.id,
+            entityLabel: `${machine.name} · selección ${created.stockItem.item_id}`,
+            summary: `Configuró stock para ${machine.name} · selección ${created.stockItem.item_id}`,
+            details: {
+                machine_id: machine.id,
+                machine_name: machine.name,
+                after: created.stockItem
+            }
+        });
+        await syncStockAlert(machine, created.stockItem);
+        broadcast({
+            event: 'machine_stock_updated',
+            machine_id: machine.id,
+            machine: machine.name
+        });
+        return res.status(201).json({ stock_item: created.stockItem });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'La selección ya tiene stock configurado para esta máquina.' });
+        }
+        return res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.patch('/:id/stock/:stockItemId', requireMachineOperator, async (req, res) => {
+    const machineId = parseMachineId(req.params.id);
+    const stockItemId = parseInt(req.params.stockItemId, 10);
+    if (!machineId || !Number.isInteger(stockItemId)) {
+        return res.status(400).json({ error: 'ID inválido' });
+    }
+    try {
+        const machine = await getActiveMachineById(machineId);
+        if (!machine) return res.status(404).json({ error: 'No encontrada' });
+        const result = await stock.updateStockItem({
+            machineId,
+            stockItemId,
+            itemId: req.body?.item_id,
+            productName: req.body?.product_name,
+            slotLabel: req.body?.slot_label,
+            capacityUnits: req.body?.capacity_units,
+            currentUnits: req.body?.current_units,
+            minUnits: req.body?.min_units,
+            active: req.body?.active,
+            actorUserId: req.user?.id || null,
+            note: req.body?.note
+        });
+        await audit.logAuditEvent({
+            req,
+            action: 'stock_item.update',
+            entityType: 'stock_item',
+            entityId: result.stockItem.id,
+            entityLabel: `${machine.name} · selección ${result.stockItem.item_id}`,
+            summary: `Actualizó stock en ${machine.name} · selección ${result.stockItem.item_id}`,
+            details: {
+                machine_id: machine.id,
+                machine_name: machine.name,
+                before: result.before,
+                after: result.stockItem
+            }
+        });
+        await syncStockAlert(machine, result.stockItem);
+        broadcast({
+            event: 'machine_stock_updated',
+            machine_id: machine.id,
+            machine: machine.name
+        });
+        return res.json({ stock_item: result.stockItem });
+    } catch (err) {
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'La selección ya está en uso por otra configuración de esta máquina.' });
+        }
+        return res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.post('/:id/stock/:stockItemId/restock', requireMachineOperator, async (req, res) => {
+    const machineId = parseMachineId(req.params.id);
+    const stockItemId = parseInt(req.params.stockItemId, 10);
+    if (!machineId || !Number.isInteger(stockItemId)) {
+        return res.status(400).json({ error: 'ID inválido' });
+    }
+    try {
+        const machine = await getActiveMachineById(machineId);
+        if (!machine) return res.status(404).json({ error: 'No encontrada' });
+        const result = await stock.restockStockItem({
+            machineId,
+            stockItemId,
+            quantity: req.body?.quantity,
+            actorUserId: req.user?.id || null,
+            note: req.body?.note
+        });
+        await audit.logAuditEvent({
+            req,
+            action: 'stock_item.restock',
+            entityType: 'stock_item',
+            entityId: result.stockItem.id,
+            entityLabel: `${machine.name} · selección ${result.stockItem.item_id}`,
+            summary: `Repuso stock en ${machine.name} · selección ${result.stockItem.item_id}`,
+            details: {
+                machine_id: machine.id,
+                machine_name: machine.name,
+                quantity: req.body?.quantity,
+                before: result.before,
+                after: result.stockItem
+            }
+        });
+        await syncStockAlert(machine, result.stockItem);
+        broadcast({
+            event: 'machine_stock_updated',
+            machine_id: machine.id,
+            machine: machine.name
+        });
+        return res.json({ stock_item: result.stockItem });
+    } catch (err) {
+        return res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.post('/:id/stock/:stockItemId/adjust', requireMachineOperator, async (req, res) => {
+    const machineId = parseMachineId(req.params.id);
+    const stockItemId = parseInt(req.params.stockItemId, 10);
+    if (!machineId || !Number.isInteger(stockItemId)) {
+        return res.status(400).json({ error: 'ID inválido' });
+    }
+    try {
+        const machine = await getActiveMachineById(machineId);
+        if (!machine) return res.status(404).json({ error: 'No encontrada' });
+        const result = await stock.adjustStockItem({
+            machineId,
+            stockItemId,
+            currentUnits: req.body?.current_units,
+            actorUserId: req.user?.id || null,
+            note: req.body?.note
+        });
+        await audit.logAuditEvent({
+            req,
+            action: 'stock_item.adjust',
+            entityType: 'stock_item',
+            entityId: result.stockItem.id,
+            entityLabel: `${machine.name} · selección ${result.stockItem.item_id}`,
+            summary: `Ajustó stock en ${machine.name} · selección ${result.stockItem.item_id}`,
+            details: {
+                machine_id: machine.id,
+                machine_name: machine.name,
+                before: result.before,
+                after: result.stockItem
+            }
+        });
+        await syncStockAlert(machine, result.stockItem);
+        broadcast({
+            event: 'machine_stock_updated',
+            machine_id: machine.id,
+            machine: machine.name
+        });
+        return res.json({ stock_item: result.stockItem });
+    } catch (err) {
+        return res.status(err.statusCode || 500).json({ error: err.message });
+    }
+});
+
+router.get('/:id/taps', requireManager, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
     try {
         const result = await pool.query(

@@ -76,7 +76,9 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 initWebSocket(server);
 server.listen(PORT, '0.0.0.0', () => {
-    startAlertMonitor();
+    if (process.env.DISABLE_ALERT_MONITOR !== 'true') {
+        startAlertMonitor();
+    }
     console.log(`\n CoffeeControl v2 en http://localhost:${PORT}`);
     console.log(` Red local:    http://192.168.1.76:${PORT}`);
     console.log(` Panel admin:  http://localhost:${PORT}/`);

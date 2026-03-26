@@ -5,14 +5,20 @@ const express = require('express');
 const pool    = require('../db/pool');
 const alerts  = require('../services/alerts');
 const systemSettings = require('../services/systemSettings');
-const { requireManager } = require('../middleware/roleAccess');
+const { requireManager, requireAnalyticsViewer } = require('../middleware/roleAccess');
 const { statusFromUsage } = require('../lib/dailyLimit');
+const { buildDepartmentScopeClause } = require('../lib/accessScope');
 const {
     buildBusinessDayRangeSql,
     buildBusinessMonthRangeSql
 } = require('../lib/businessTime');
 
 const router = express.Router();
+router.use(requireAnalyticsViewer);
+
+function departmentExpr(column) {
+    return `COALESCE(NULLIF(TRIM(${column}), ''), 'Sin área')`;
+}
 
 // ── GET /api/dashboard/today ──────────────────────────
 // Resumen del día: métricas + ranking + alertas
@@ -20,6 +26,13 @@ router.get('/today', async (req, res) => {
     try {
         const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
         const warningLead = await alerts.getEmployeeLimitWarningLead();
+        const params = [timeZone, businessDate];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const result = await pool.query(
             `SELECT
                 e.id AS employee_id,
@@ -36,10 +49,11 @@ router.get('/today', async (req, res) => {
                 ON t.employee_id = e.id
                AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
              WHERE e.active = true
+               ${scope.sql}
              GROUP BY e.id, e.name, e.department, e.daily_limit, e.daily_limit_mode, e.warning_enabled
              ORDER BY taps_today DESC`
             ,
-            [timeZone, businessDate]
+            params
         );
 
         const employees = result.rows.map(row => ({
@@ -60,6 +74,7 @@ router.get('/today', async (req, res) => {
         res.json({
             business_date: businessDate,
             business_timezone: timeZone,
+            department_scopes: scope.appliedScopes,
             summary: {
                 total_taps_today:   totalTaps,
                 total_spent_cents:  totalCents,
@@ -71,7 +86,7 @@ router.get('/today', async (req, res) => {
 
     } catch (err) {
         console.error('[DASHBOARD] Error:', err.message);
-        res.status(500).json({ error: 'Error interno' });
+        res.status(err.status || 500).json({ error: err.status ? err.message : 'Error interno' });
     }
 });
 
@@ -80,6 +95,13 @@ router.get('/today', async (req, res) => {
 router.get('/monthly', async (req, res) => {
     try {
         const { timeZone, monthStart } = await systemSettings.getBusinessTimeContext();
+        const params = [timeZone, monthStart];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const result = await pool.query(
             `SELECT
                 e.id AS employee_id,
@@ -93,10 +115,11 @@ router.get('/monthly', async (req, res) => {
                AND t.approved = true
                AND ${buildBusinessMonthRangeSql('t.tapped_at', 1, 2)}
              WHERE e.active = true
+               ${scope.sql}
              GROUP BY e.id, e.name, e.department
              ORDER BY taps_total DESC`
             ,
-            [timeZone, monthStart]
+            params
         );
 
         const totalCents = result.rows.reduce((s, e) => s + parseInt(e.spent_cents), 0);
@@ -104,13 +127,14 @@ router.get('/monthly', async (req, res) => {
         res.json({
             month: monthStart.slice(0, 7),
             business_timezone: timeZone,
+            department_scopes: scope.appliedScopes,
             total_spent_cents: totalCents,
             employees:     result.rows
         });
 
     } catch (err) {
         console.error('[MONTHLY] Error:', err.message);
-        res.status(500).json({ error: 'Error interno' });
+        res.status(err.status || 500).json({ error: err.status ? err.message : 'Error interno' });
     }
 });
 
@@ -119,6 +143,13 @@ router.get('/monthly', async (req, res) => {
 router.get('/feed', async (req, res) => {
     try {
         const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
+        const params = [timeZone, businessDate];
+        const scope = buildDepartmentScopeClause({
+            user: req.user,
+            requestedDepartment: req.query.department,
+            params,
+            column: departmentExpr('e.department')
+        });
         const result = await pool.query(
             `SELECT
                 t.id,
@@ -134,17 +165,18 @@ router.get('/feed', async (req, res) => {
              LEFT JOIN employees e ON e.id = t.employee_id
              JOIN machines  m ON m.id = t.machine_id
              WHERE ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
+               ${scope.sql}
              ORDER BY t.tapped_at DESC
              LIMIT 50`
             ,
-            [timeZone, businessDate]
+            params
         );
 
-        res.json({ taps: result.rows });
+        res.json({ taps: result.rows, department_scopes: scope.appliedScopes });
 
     } catch (err) {
         console.error('[FEED] Error:', err.message);
-        res.status(500).json({ error: 'Error interno' });
+        res.status(err.status || 500).json({ error: err.status ? err.message : 'Error interno' });
     }
 });
 

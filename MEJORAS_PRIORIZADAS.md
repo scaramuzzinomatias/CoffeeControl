@@ -229,6 +229,7 @@ Estado actual:
   - advertencia preventiva de límite diario al empleado y supervisores activos de su área
   - empleado bloqueado por límite diario
   - máquina offline
+  - stock bajo / sin stock por selección configurada
 - Configuración desde `Panel admin > Notificaciones`:
   - destinatarios
   - activación general
@@ -260,7 +261,6 @@ Avance implementado:
 
 Pendiente de esta mejora:
 - WhatsApp.
-- Alertas de stock bajo.
 
 ### 15. Control de stock por máquina
 Origen: pedido usuario
@@ -281,6 +281,19 @@ Dependencias:
 
 Nota técnica:
 - Es una mejora de alto valor, pero de complejidad media/alta porque depende de protocolo y compatibilidad real por máquina.
+
+Avance implementado:
+- V1 manual/estimada activa en `Máquinas > Stock`.
+- Modelo por `machine + item_id`, con producto, slot opcional, capacidad, stock actual, mínimo y estado.
+- Acciones disponibles: alta de selección, edición, reposición, ajuste, baja/reactivación.
+- Historial de movimientos (`sale`, `restock`, `adjustment`, `unconfigured_sale`).
+- Descuento automático de stock cuando `POST /api/tap/result` confirma una venta.
+- Si la selección no está configurada, la venta no se rompe; se deja trazabilidad como `unconfigured_sale`.
+- `Panel admin > Reportes` ya incluye reportes específicos de stock para `gerente/admin`, con estado actual por máquina, movimientos del rango y exportación Excel/PDF.
+
+Pendiente de esta mejora:
+- Integración DEX/UCS como V2.
+- Refinar más adelante permisos finos si el rol técnico crece a instalación o mantenimiento avanzado.
 
 ### 16. Acceso premium por jerarquía
 Origen: pedido usuario
@@ -374,11 +387,15 @@ Implementado:
 Origen: sugerido
 
 Estado:
-- Ya se cerró lectura vs gestión.
-- Falta aplicar filtro por `department`.
+- Resuelto.
 
 Resultado esperado:
-- Un supervisor ve solo su área cuando corresponda.
+- Un supervisor ve solo sus áreas asignadas cuando corresponda.
+
+Implementado:
+- tabla `admin_user_departments` para asignar una o varias áreas por supervisor
+- dashboard, feed, reportes, WebSocket y lecturas de empleados respetan ese alcance
+- el panel de usuarios ya permite cargar múltiples áreas por supervisor
 
 ### 22. Revisar o retirar `coffeecontrol.html`
 Origen: sugerido
@@ -393,13 +410,26 @@ Resultado esperado:
 ### 23. Scripts claros de base de datos y soporte
 Origen: sugerido
 
+Estado:
+- Resuelto.
+
 Resultado esperado:
 - Script para migraciones completas.
-- Script para seed.
 - Script para reset de password admin.
+- Script para crear/actualizar usuarios del panel.
+- Script de diagnóstico rápido.
+
+Implementado:
+- `backend/scripts/db-init.js`
+- `backend/scripts/db-migrate-all.js`
+- `backend/scripts/support-doctor.js`
+- `backend/scripts/support-user.js`
 
 ### 24. Tests de integración mínimos
 Origen: sugerido
+
+Estado:
+- Resuelto.
 
 Casos base:
 - login
@@ -407,6 +437,11 @@ Casos base:
 - registro de máquinas
 - tap aprobado / rechazado
 - cola offline
+
+Implementado:
+- `backend/test/integration.test.js`
+- `npm run test:integration`
+- cubre login, supervisor multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos de `Notificaciones` / `Auditoría` y registro de auditoría
 
 ### 25. Limpieza de logs y mensajes de arranque
 Origen: sugerido
@@ -428,7 +463,34 @@ Resultado esperado:
 - Posibilidad de abrir y exportar un recorte puntual sin recorrer rankings completos.
 
 Estado:
-- pendiente
+- realizado (v1)
+
+Implementado:
+- filtro global por área / departamento dentro de `Reportes`
+- búsqueda rápida por empleado (nombre, legajo, email o DNI)
+- detalle y exportación respetando el recorte actual sin tener que recorrer rankings completos
+
+Pendiente fino:
+- más recortes específicos para escenarios muy grandes
+- paginado o búsqueda incremental si el volumen crece mucho más
+
+### 27. Perfil técnico para operación de máquinas y stock
+Origen: sugerido durante la definición de stock
+
+Estado:
+- Resuelto.
+
+Resultado esperado:
+- Separar operación técnica de la gestión gerencial.
+- Permitir trabajo sobre máquinas, stock y comandos remotos sin exponer consumo nominal ni configuración global.
+
+Implementado:
+- nuevo rol `tecnico` en usuarios del panel
+- acceso a `Máquinas`, stock y comandos remotos
+- sin acceso a `Dashboard`, `Reportes`, `Feed`, `Empleados`, `Notificaciones`, `Sistema`, `Auditoría` ni `Usuarios`
+- detalle técnico de máquina sin consumo por empleado ni taps nominales
+- backend endurecido para que los permisos no dependan solo de la UI
+- cobertura incluida en `npm run test:integration`
 
 ## Orden recomendado de implementación
 
@@ -453,7 +515,7 @@ Estado:
 
 ### Fase D — Alertas, stock y negocio
 14. [x] Notificaciones automáticas.
-15. Control de stock por máquina.
+15. [x] Control de stock por máquina (V1 manual/estimada).
 16. Acceso premium por jerarquía.
 
 ### Fase E — Seguridad y robustez
@@ -463,12 +525,13 @@ Estado:
 20. [x] Auditoría administrativa.
 
 ### Fase F — Calidad y mantenimiento
-21. Scope por área para supervisor.
+21. [x] Scope por área para supervisor.
 22. Resolver `coffeecontrol.html`.
-23. Scripts DB y soporte.
-24. Tests de integración.
+23. [x] Scripts DB y soporte.
+24. [x] Tests de integración.
 25. Limpieza final de logs y startup.
-26. Filtros avanzados en reportes para alto volumen.
+26. [x] Filtros avanzados en reportes para alto volumen (v1).
+27. [x] Perfil técnico para operar máquinas y stock.
 
 ## Recomendación práctica
 
@@ -484,11 +547,11 @@ Ese bloque da mucho valor rápido y prepara bien el terreno para la reconfigurac
 ## Próximo bloque sugerido
 
 Si retomamos desde donde quedó el proyecto, el orden que más sentido tiene sería:
-1. Filtros avanzados en `Reportes` para búsqueda rápida por empleado y área.
-2. Scope por área para supervisor.
-3. Scripts DB y soporte.
-4. Tests de integración.
+1. Integración DEX/UCS como V2 de stock.
+2. Resolver `coffeecontrol.html`.
+3. Refinar filtros/paginado de `Reportes` si el volumen real lo pide.
+4. Acceso premium por jerarquía.
 
 Razón:
-- Reportes y exportaciones ya están fuertes; el siguiente cuello de botella real es encontrar rápido casos puntuales en empresas grandes.
-- El alcance por área cierra coherencia entre permisos, alertas y reportes.
+- Reportes, exportaciones y stock ya quedaron fuertes para operar y llevar a reunión.
+- El siguiente salto de valor está en profundizar stock con telemetría real y seguir cerrando frentes operativos pendientes.
