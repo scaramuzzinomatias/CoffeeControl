@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 26/03/2026 — panel/admin, notificaciones, control remoto, WebSocket JWT, zona horaria operativa global, auditoría administrativa, stock V1, alertas de stock bajo, reportes específicos de stock, perfil técnico, jerarquías de acceso, launcher de mantenimiento Windows y documentación de salida a piloto activos en el repo canónico.
+> Última actualización: 27/03/2026 — backend móvil fase 1 (`mobile-auth` + `mobile-tech`) y app técnico Android nativa ya compilando con `Gradle 8.13` y validada en teléfono real para login, biometría, máquinas, stock y TAGs; además suma `WiFi remoto` y `Pendientes` en el repo canónico, sobre el milestone consolidado de panel/admin, stock, auditoría, jerarquías, roles operativos y salida a piloto.
 >
 > **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
@@ -102,6 +102,8 @@ Se subió código de **VMflow.xyz** (ESP32-S3 + MDB + BLE + MQTT). Decisión: no
 - `CHECKLIST_PILOTO.md`
 - `PROTOCOLO_PRUEBAS.md`
 - `GUIA_SOPORTE.md`
+- `MODELO_OPERATIVO_CLIENTES.md`
+- `ARQUITECTURA_APP_TECNICO_ANDROID.md`
 
 Usarlos como referencia principal para instalación, validación online/offline y soporte en campo.
 
@@ -142,6 +144,8 @@ backend/
 
 coffeecontrol.html          ← Monitor operativo liviano (solo lectura, misma sesión JWT)
 coffeecontrol-admin.html    ← Panel de administración completo
+coffeecontrol-tecnico.html  ← PWA técnica móvil (prototipo / herramienta secundaria)
+coffeecontrol-tecnico-android/ ← Base Android nativa para técnico (NFC + biometría)
 ```
 
 ---
@@ -355,7 +359,10 @@ Total pines usados: 10 de 11 disponibles
   - Gestión de usuarios del panel con roles (`gerente`, `supervisor`, `tecnico`, `distribuidor`) y soporte para cuentas protegidas
   - **Perfil técnico operativo**: acceso a `Máquinas`, stock y comandos remotos, sin analítica ni configuración global; el detalle de máquina evita exponer consumo nominal de empleados
   - **Perfil distribuidor operativo**: onboarding/configuración de máquinas pendientes, más acceso técnico a máquinas, stock y comandos remotos, sin acceso a analítica ni gestión de empleados/usuarios
-  - `backend/test/integration.test.js` cubre login, scope multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos/auditoría de `Notificaciones`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alerta de stock bajo, reportes de stock, descuento automático en `vend_confirmed`, permisos de los roles `tecnico` / `distribuidor` y bloqueo de edición/cambio de contraseña para cuentas protegidas
+  - **App técnico PWA** (`coffeecontrol-tecnico.html`): login móvil propio, máquinas, detalle técnico, WiFi remoto, reinicio, stock y onboarding para trabajo de campo
+    - backend móvil fase 1 listo para Android nativo: `mobile_sessions`, `mobile-auth` con refresh/logout y `mobile-tech` para búsqueda/asignación/reasignación de TAGs
+    - app Android nativa en `coffeecontrol-tecnico-android/`: biometría + NFC + máquinas + stock + TAGs ya validados en teléfono real; `WiFi remoto` y `Pendientes` integrados y compilando, pendientes de validación en vivo según disponibilidad de equipos
+  - `backend/test/integration.test.js` cubre login, scope multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos/auditoría de `Notificaciones`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alerta de stock bajo, reportes de stock, descuento automático en `vend_confirmed`, permisos de los roles `tecnico` / `distribuidor`, cuentas protegidas y capa móvil (`mobile-auth` + `mobile-tech`)
 - Monitor operativo liviano (`coffeecontrol.html`) con WebSocket y sin configuración administrativa
 - Repositorio git inicializado; checkpoint `a25148b` representa este estado
 

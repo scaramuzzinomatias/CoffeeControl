@@ -1139,6 +1139,145 @@ test('distribuidor no puede acceder a analítica, empleados ni configuración gl
     assert.equal(block.status, 403);
 });
 
+test('mobile-auth permite técnico con refresh/logout y revoca la sesión al cerrar', async () => {
+    const login = await requestJson('POST', '/api/mobile-auth/login', {
+        body: {
+            username: fixture.technician.username,
+            password: 'coffeecontrol2024',
+            device_name: 'Pixel QA',
+            platform: 'android'
+        }
+    });
+    assert.equal(login.status, 200);
+    assert.equal(login.json.user.role, 'tecnico');
+    assert.ok(login.json.access_token);
+    assert.ok(login.json.refresh_token);
+    assert.equal(login.json.session.platform, 'android');
+
+    const machines = await requestJson('GET', '/api/machines', {
+        token: login.json.access_token
+    });
+    assert.equal(machines.status, 200);
+
+    const refresh = await requestJson('POST', '/api/mobile-auth/refresh', {
+        body: {
+            refresh_token: login.json.refresh_token
+        }
+    });
+    assert.equal(refresh.status, 200);
+    assert.ok(refresh.json.refresh_token);
+    assert.notEqual(refresh.json.refresh_token, login.json.refresh_token);
+
+    const logout = await requestJson('POST', '/api/mobile-auth/logout', {
+        body: {
+            refresh_token: refresh.json.refresh_token
+        }
+    });
+    assert.equal(logout.status, 200);
+    assert.equal(logout.json.ok, true);
+
+    const afterLogout = await requestJson('GET', '/api/machines', {
+        token: refresh.json.access_token
+    });
+    assert.equal(afterLogout.status, 401);
+});
+
+test('mobile-auth bloquea supervisor y mobile-tech exige rol operador de tarjetas', async () => {
+    const mobileLogin = await requestJson('POST', '/api/mobile-auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024',
+            device_name: 'Supervisor Phone',
+            platform: 'android'
+        }
+    });
+    assert.equal(mobileLogin.status, 403);
+
+    const supervisorLogin = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+    assert.equal(supervisorLogin.status, 200);
+
+    const search = await requestJson('GET', `/api/mobile-tech/employees/search?q=${encodeURIComponent(TEST_PREFIX)}`, {
+        token: supervisorLogin.json.token
+    });
+    assert.equal(search.status, 403);
+});
+
+test('mobile-tech permite buscar empleados, consultar un TAG y asignar/reasignar credenciales', async () => {
+    const mobileLogin = await requestJson('POST', '/api/mobile-auth/login', {
+        body: {
+            username: fixture.technician.username,
+            password: 'coffeecontrol2024',
+            device_name: 'Moto G',
+            platform: 'android'
+        }
+    });
+    assert.equal(mobileLogin.status, 200);
+    const mobileToken = mobileLogin.json.access_token;
+
+    const search = await requestJson(
+        'GET',
+        `/api/mobile-tech/employees/search?q=${encodeURIComponent(`${TEST_PREFIX}_emp`)}`,
+        { token: mobileToken }
+    );
+    assert.equal(search.status, 200);
+    assert.ok(search.json.employees.some(employee => employee.id === fixture.employees.a.id));
+
+    const lostLookup = await requestJson('GET', `/api/mobile-tech/cards/lookup/${fixture.cards.lostUid}`, {
+        token: mobileToken
+    });
+    assert.equal(lostLookup.status, 200);
+    assert.equal(lostLookup.json.found, true);
+    assert.equal(lostLookup.json.card.status, 'lost');
+
+    const newUid = tempUid('B0');
+    const assigned = await requestJson('POST', `/api/mobile-tech/employees/${fixture.employees.b.id}/cards`, {
+        token: mobileToken,
+        body: {
+            uid: newUid,
+            label: 'TAG Android'
+        }
+    });
+    assert.equal(assigned.status, 201);
+    assert.equal(assigned.json.card.employee_id, fixture.employees.b.id);
+
+    const lookupAssigned = await requestJson('GET', `/api/mobile-tech/cards/lookup/${newUid}`, {
+        token: mobileToken
+    });
+    assert.equal(lookupAssigned.status, 200);
+    assert.equal(lookupAssigned.json.card.employee_id, fixture.employees.b.id);
+
+    const reassigned = await requestJson('PATCH', `/api/mobile-tech/employees/${fixture.employees.a.id}/cards/${assigned.json.card.id}`, {
+        token: mobileToken,
+        body: {
+            employee_id: fixture.employees.a.id,
+            status: 'active',
+            label: 'TAG reasignado'
+        }
+    });
+    assert.equal(reassigned.status, 200);
+    assert.equal(reassigned.json.card.employee_id, fixture.employees.a.id);
+    assert.equal(reassigned.json.card.label, 'TAG reasignado');
+
+    const auditLogs = await requestJson(
+        'GET',
+        `/api/audit-logs?action=nfc_card.update&q=${encodeURIComponent(newUid)}`,
+        { token: adminToken }
+    );
+    assert.equal(auditLogs.status, 200);
+    assert.ok(
+        auditLogs.json.logs.some(entry =>
+            entry.actor_username === fixture.technician.username &&
+            entry.entity_label === newUid
+        ),
+        'No se encontró la auditoría de reasignación desde mobile-tech'
+    );
+});
+
 test('cuenta protegida no puede editarse ni desactivarse desde el panel', async () => {
     const users = await requestJson('GET', '/api/admin-users', { token: managerToken });
     assert.equal(users.status, 200);

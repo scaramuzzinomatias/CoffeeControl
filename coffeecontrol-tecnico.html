@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0ea5e9">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>CoffeeControl Tecnico</title>
+  <link rel="manifest" href="/coffeecontrol-tecnico.webmanifest">
+  <link rel="icon" href="/coffeecontrol-tecnico-icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/coffeecontrol-tecnico-icon.svg">
+  <link rel="stylesheet" href="/coffeecontrol-tecnico.css">
+</head>
+<body>
+  <div id="loginScreen" class="auth-shell">
+    <div class="auth-panel">
+      <section class="auth-brand">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">Q</div>
+          <div>
+            <div class="eyebrow">SmartQ</div>
+            <h1>CoffeeControl Tecnico</h1>
+            <p>Operacion movil para tecnico y distribuidor. Maquinas, WiFi, stock y onboarding en una sola app.</p>
+          </div>
+        </div>
+        <div class="feature-list">
+          <div class="feature-item">
+            <strong>Campo real</strong>
+            <span>Disenada para trabajar al lado de la maquina, no como una copia del dashboard de escritorio.</span>
+          </div>
+          <div class="feature-item">
+            <strong>Acciones remotas</strong>
+            <span>Reinicio, actualizacion WiFi y escaneo de redes reutilizando el backend actual.</span>
+          </div>
+          <div class="feature-item">
+            <strong>Stock operativo</strong>
+            <span>Alta, reposicion, ajuste y seguimiento de movimientos sin salir del celular.</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="auth-card">
+        <div class="card-heading">
+          <div class="eyebrow">Ingreso tecnico</div>
+          <h2>Conectar con la instalacion</h2>
+          <p>Usa credenciales de tecnico, distribuidor o una cuenta gerencial que necesite operar maquinas.</p>
+        </div>
+
+        <label class="field">
+          <span>Backend</span>
+          <input id="loginUrl" type="url" placeholder="http://localhost:3000" autocomplete="url">
+        </label>
+
+        <label class="field">
+          <span>Usuario</span>
+          <input id="loginUser" type="text" placeholder="tecnico01" autocomplete="username">
+        </label>
+
+        <label class="field">
+          <span>Contrasena</span>
+          <input id="loginPass" type="password" placeholder="********" autocomplete="current-password">
+        </label>
+
+        <label class="toggle-inline">
+          <input id="showLoginPass" type="checkbox">
+          <span>Mostrar contrasena</span>
+        </label>
+
+        <div id="loginErr" class="inline-banner hidden"></div>
+
+        <div class="auth-actions">
+          <button class="btn btn-primary" type="button" onclick="doLogin()">Entrar</button>
+          <button class="btn btn-ghost" type="button" onclick="openAdminPanel()">Abrir panel web</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="appShell" class="app-shell hidden">
+    <header class="app-header">
+      <div class="app-heading">
+        <div class="brand-mark small" aria-hidden="true">Q</div>
+        <div>
+          <div class="eyebrow">SmartQ · Operacion de campo</div>
+          <h1>CoffeeControl Tecnico</h1>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="installBtn" class="btn btn-ghost hidden" type="button" onclick="installApp()">Instalar</button>
+        <button class="btn btn-ghost" type="button" onclick="refreshAllData(false)">Actualizar</button>
+      </div>
+    </header>
+
+    <section class="status-strip">
+      <div id="statusBackend" class="status-pill">Backend</div>
+      <div id="statusUser" class="status-pill">Usuario</div>
+      <div id="statusRefresh" class="status-pill">Sincronizacion</div>
+    </section>
+
+    <main id="view" class="view"></main>
+    <nav id="tabbar" class="tabbar" aria-label="Navegacion principal"></nav>
+  </div>
+
+  <div id="sheet" class="sheet hidden" aria-hidden="true">
+    <button class="sheet-backdrop" type="button" aria-label="Cerrar" onclick="closeSheet()"></button>
+    <section class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="sheet-header">
+        <div>
+          <div id="sheetEyebrow" class="sheet-eyebrow"></div>
+          <h2 id="sheetTitle">Detalle</h2>
+        </div>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="closeSheet()">Cerrar</button>
+      </div>
+      <div id="sheetBody" class="sheet-body"></div>
+      <div id="sheetFooter" class="sheet-footer"></div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="/coffeecontrol-tecnico.js"></script>
+</body>
+</html>

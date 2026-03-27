@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CoffeeControl Mobile Mockups</title>
+  <style>
+    :root{
+      --bg:#efe8dc;
+      --panel:#faf6ef;
+      --ink:#1d2c34;
+      --muted:#69737a;
+      --line:rgba(29,44,52,.12);
+      --brand:#1389d5;
+      --brand-dark:#0e5e99;
+      --accent:#efb64f;
+      --ok:#2f9d62;
+      --warn:#d8821c;
+      --soft:#e4f0f9;
+      --danger:#b94e3c;
+      --shadow:0 18px 50px rgba(20,32,40,.16);
+      --font:Inter, "Segoe UI", system-ui, sans-serif;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:var(--font);
+      color:var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(19,137,213,.20), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(239,182,79,.18), transparent 24%),
+        linear-gradient(135deg,#f2ede4,#ebe4d7 52%,#e6ddd1);
+      min-height:100vh;
+    }
+    .wrap{
+      max-width:1440px;
+      margin:0 auto;
+      padding:48px 36px 60px;
+    }
+    .hero{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-end;
+      gap:24px;
+      margin-bottom:28px;
+    }
+    .eyebrow{
+      display:inline-block;
+      padding:8px 12px;
+      border-radius:999px;
+      background:rgba(19,137,213,.10);
+      color:var(--brand-dark);
+      font-weight:700;
+      font-size:12px;
+      letter-spacing:.08em;
+      text-transform:uppercase;
+      margin-bottom:12px;
+    }
+    h1{
+      margin:0 0 8px;
+      font-size:46px;
+      line-height:1.02;
+      letter-spacing:-.04em;
+      max-width:760px;
+    }
+    .sub{
+      margin:0;
+      max-width:760px;
+      color:var(--muted);
+      font-size:18px;
+      line-height:1.55;
+    }
+    .legend{
+      display:flex;
+      gap:12px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+    }
+    .pill{
+      background:rgba(255,255,255,.58);
+      border:1px solid rgba(29,44,52,.10);
+      border-radius:999px;
+      padding:10px 14px;
+      font-size:13px;
+      color:var(--muted);
+      backdrop-filter:blur(10px);
+    }
+    .stage{
+      display:grid;
+      grid-template-columns:repeat(2,minmax(320px,1fr));
+      gap:34px;
+      align-items:start;
+    }
+    .panel{
+      background:rgba(255,255,255,.42);
+      border:1px solid rgba(255,255,255,.45);
+      border-radius:36px;
+      padding:30px;
+      box-shadow:var(--shadow);
+      backdrop-filter:blur(10px);
+    }
+    .panel-head{
+      display:flex;
+      align-items:end;
+      justify-content:space-between;
+      gap:18px;
+      margin-bottom:22px;
+    }
+    .panel-head h2{
+      margin:0 0 6px;
+      font-size:28px;
+      letter-spacing:-.03em;
+    }
+    .panel-head p{
+      margin:0;
+      color:var(--muted);
+      font-size:14px;
+      line-height:1.5;
+      max-width:340px;
+    }
+    .phone{
+      width:100%;
+      max-width:360px;
+      margin:0 auto;
+      background:#0e1620;
+      border-radius:34px;
+      padding:12px;
+      box-shadow:
+        0 10px 30px rgba(12,20,28,.26),
+        inset 0 0 0 1px rgba(255,255,255,.08);
+    }
+    .screen{
+      min-height:720px;
+      border-radius:24px;
+      overflow:hidden;
+      background:var(--panel);
+      position:relative;
+    }
+    .status{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      padding:14px 18px 6px;
+      font-size:12px;
+      font-weight:700;
+      color:#31414d;
+    }
+    .notch{
+      width:118px;
+      height:26px;
+      border-radius:999px;
+      background:#0d1218;
+      margin:0 auto -18px;
+      position:relative;
+      z-index:2;
+    }
+    .screen-body{
+      padding:22px 18px 20px;
+    }
+    .brand{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:14px;
+      margin-bottom:18px;
+    }
+    .brand-mark{
+      width:46px;
+      height:46px;
+      border-radius:16px;
+      background:linear-gradient(135deg,var(--brand-dark),var(--brand));
+      color:#fff;
+      display:grid;
+      place-items:center;
+      font-size:24px;
+      font-weight:800;
+      box-shadow:0 10px 22px rgba(19,137,213,.28);
+    }
+    .brand small{
+      display:block;
+      color:var(--brand-dark);
+      font-weight:700;
+      letter-spacing:.08em;
+      text-transform:uppercase;
+      font-size:11px;
+      margin-bottom:4px;
+    }
+    .brand h3{
+      margin:0;
+      font-size:26px;
+      line-height:1.06;
+      letter-spacing:-.04em;
+    }
+    .muted{
+      color:var(--muted);
+    }
+    .card{
+      background:#fff;
+      border:1px solid var(--line);
+      border-radius:22px;
+      padding:16px;
+      box-shadow:0 8px 18px rgba(30,43,52,.06);
+      margin-bottom:14px;
+    }
+    .hero-card{
+      background:linear-gradient(160deg,#153649,#102734);
+      color:#f6f8fa;
+      border:none;
+      padding:18px;
+    }
+    .hero-card .muted{color:rgba(255,255,255,.74)}
+    .kpis{
+      display:grid;
+      grid-template-columns:repeat(3,1fr);
+      gap:10px;
+      margin-top:14px;
+    }
+    .mini{
+      border-radius:18px;
+      padding:12px;
+      background:rgba(255,255,255,.08);
+      border:1px solid rgba(255,255,255,.08);
+    }
+    .mini strong{
+      display:block;
+      font-size:22px;
+      margin-top:6px;
+      line-height:1;
+    }
+    .section-title{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      margin-bottom:10px;
+    }
+    .section-title h4{
+      margin:0;
+      font-size:16px;
+      letter-spacing:-.02em;
+    }
+    .section-title span{
+      color:var(--brand-dark);
+      font-size:12px;
+      font-weight:700;
+    }
+    .progress{
+      height:12px;
+      background:#e8edf1;
+      border-radius:999px;
+      overflow:hidden;
+      margin:10px 0 8px;
+    }
+    .progress > div{
+      height:100%;
+      width:80%;
+      background:linear-gradient(90deg,var(--accent),#eb8f3a);
+      border-radius:999px;
+    }
+    .rows{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .row{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+    }
+    .row strong{
+      display:block;
+      font-size:14px;
+    }
+    .row small{
+      color:var(--muted);
+      font-size:12px;
+    }
+    .tag{
+      padding:7px 10px;
+      border-radius:999px;
+      font-size:11px;
+      font-weight:700;
+      white-space:nowrap;
+    }
+    .tag.ok{background:#e3f5ea;color:#206b46}
+    .tag.warn{background:#fff1da;color:#9a620c}
+    .tag.off{background:#ebf1f6;color:#4a5d6b}
+    .tag.live{background:#dff2ff;color:#09619b}
+    .graph{
+      height:138px;
+      border-radius:18px;
+      background:
+        linear-gradient(to top, rgba(19,137,213,.14), rgba(19,137,213,0)),
+        linear-gradient(transparent 79%, rgba(29,44,52,.08) 80%),
+        linear-gradient(90deg, rgba(29,44,52,.05) 1px, transparent 1px);
+      background-size:100% 100%,100% 34px,42px 100%;
+      position:relative;
+      overflow:hidden;
+    }
+    .graph svg{
+      position:absolute;
+      inset:0;
+    }
+    .cta{
+      display:flex;
+      gap:10px;
+      margin-top:12px;
+    }
+    .btn{
+      flex:1;
+      border:none;
+      border-radius:16px;
+      padding:12px 14px;
+      font-weight:700;
+      font-size:13px;
+    }
+    .btn.primary{background:var(--brand);color:#fff}
+    .btn.ghost{background:#edf3f7;color:var(--brand-dark)}
+    .nav{
+      position:absolute;
+      left:14px;
+      right:14px;
+      bottom:14px;
+      display:flex;
+      justify-content:space-around;
+      background:rgba(255,255,255,.88);
+      border:1px solid rgba(29,44,52,.10);
+      border-radius:20px;
+      padding:10px 8px;
+      backdrop-filter:blur(10px);
+    }
+    .nav span{
+      font-size:11px;
+      color:var(--muted);
+      text-align:center;
+    }
+    .nav strong{
+      display:block;
+      font-size:18px;
+      margin-bottom:5px;
+      color:#73808a;
+    }
+    .nav .active strong,
+    .nav .active span{
+      color:var(--brand-dark);
+    }
+    .employee-accent{
+      background:
+        radial-gradient(circle at top right, rgba(19,137,213,.12), transparent 28%),
+        linear-gradient(180deg,#fbf7f0,#f5efe6);
+    }
+    .manager-accent{
+      background:
+        radial-gradient(circle at top left, rgba(239,182,79,.14), transparent 30%),
+        linear-gradient(180deg,#fbf7f0,#f4efe7);
+    }
+    .qr{
+      display:grid;
+      grid-template-columns:repeat(5,1fr);
+      gap:4px;
+      width:76px;
+      aspect-ratio:1;
+      margin-left:auto;
+    }
+    .qr div{
+      background:#fff;
+      border-radius:3px;
+      opacity:.18;
+    }
+    .qr div:nth-child(1),
+    .qr div:nth-child(2),
+    .qr div:nth-child(5),
+    .qr div:nth-child(7),
+    .qr div:nth-child(9),
+    .qr div:nth-child(12),
+    .qr div:nth-child(15),
+    .qr div:nth-child(18),
+    .qr div:nth-child(19),
+    .qr div:nth-child(21),
+    .qr div:nth-child(24){
+      opacity:1;
+    }
+    .metric-grid{
+      display:grid;
+      grid-template-columns:repeat(2,1fr);
+      gap:10px;
+    }
+    .metric{
+      border-radius:18px;
+      background:#f4f7f9;
+      padding:13px;
+      border:1px solid var(--line);
+    }
+    .metric strong{
+      display:block;
+      font-size:24px;
+      margin-top:4px;
+      line-height:1;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <div class="eyebrow">Preview conceptual</div>
+        <h1>Dos apps separadas: una para el empleado y otra para el gerente.</h1>
+        <p class="sub">
+          Esta preview no representa una app ya construida: muestra una dirección visual posible para discutir
+          producto, jerarquía de información y experiencia móvil antes de programar.
+        </p>
+      </div>
+      <div class="legend">
+        <div class="pill">Empleado: registro, consumo, límite, historial</div>
+        <div class="pill">Gerente: dashboard, máquinas, alertas, acción rápida</div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>App Empleado</h2>
+            <p>Identidad personal, consumo del día, estado de límite, historial reciente y una futura credencial digital.</p>
+          </div>
+        </div>
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="screen employee-accent">
+            <div class="status">
+              <span>9:41</span>
+              <span>5G 82%</span>
+            </div>
+            <div class="screen-body">
+              <div class="brand">
+                <div style="display:flex;gap:12px;align-items:flex-start">
+                  <div class="brand-mark">Q</div>
+                  <div>
+                    <small>SmartQ</small>
+                    <h3>CoffeeControl</h3>
+                    <div class="muted" style="font-size:13px;margin-top:6px">Hola, Matías. Este es tu estado de consumo de hoy.</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card hero-card">
+                <div style="display:flex;justify-content:space-between;gap:14px;align-items:flex-start">
+                  <div>
+                    <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;font-weight:700">Credencial digital</div>
+                    <div style="font-size:28px;font-weight:800;line-height:1.05;margin-top:6px">Lista para usar</div>
+                    <div class="muted" style="font-size:13px;margin-top:8px;max-width:170px">Pensada para una fase futura con validación segura desde el teléfono.</div>
+                  </div>
+                  <div class="qr" aria-hidden="true">
+                    <div></div><div></div><div></div><div></div><div></div>
+                    <div></div><div></div><div></div><div></div><div></div>
+                    <div></div><div></div><div></div><div></div><div></div>
+                    <div></div><div></div><div></div><div></div><div></div>
+                    <div></div><div></div><div></div><div></div><div></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Límite diario</h4>
+                  <span>4 / 5 cafés</span>
+                </div>
+                <div class="progress"><div></div></div>
+                <div class="muted" style="font-size:12px">Te queda 1 café antes de llegar al umbral configurado para hoy.</div>
+                <div class="kpis">
+                  <div class="mini">
+                    <small>Hoy</small>
+                    <strong>4</strong>
+                  </div>
+                  <div class="mini">
+                    <small>Mes</small>
+                    <strong>39</strong>
+                  </div>
+                  <div class="mini">
+                    <small>Estado</small>
+                    <strong style="font-size:17px;margin-top:10px">Activo</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Consumos recientes</h4>
+                  <span>Ver todo</span>
+                </div>
+                <div class="rows">
+                  <div class="row">
+                    <div>
+                      <strong>Máquina Piso 1</strong>
+                      <small>Hoy · 09:12</small>
+                    </div>
+                    <span class="tag ok">Aprobado</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Máquina Reunión</strong>
+                      <small>Hoy · 08:31</small>
+                    </div>
+                    <span class="tag ok">Aprobado</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Máquina Piso 1</strong>
+                      <small>Ayer · 17:46</small>
+                    </div>
+                    <span class="tag warn">Advertencia</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="cta">
+                <button class="btn primary">Mi historial</button>
+                <button class="btn ghost">Datos personales</button>
+              </div>
+            </div>
+            <div class="nav">
+              <div class="active"><strong>◐</strong><span>Inicio</span></div>
+              <div><strong>≣</strong><span>Historial</span></div>
+              <div><strong>⌁</strong><span>Credencial</span></div>
+              <div><strong>◎</strong><span>Perfil</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>App Gerente</h2>
+            <p>Una vista móvil enfocada en lo importante: estado del día, máquinas, alertas y acción inmediata.</p>
+          </div>
+        </div>
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="screen manager-accent">
+            <div class="status">
+              <span>9:41</span>
+              <span>WiFi 76%</span>
+            </div>
+            <div class="screen-body">
+              <div class="brand">
+                <div style="display:flex;gap:12px;align-items:flex-start">
+                  <div class="brand-mark" style="background:linear-gradient(135deg,#2d3942,#101820)">Q</div>
+                  <div>
+                    <small>Panel móvil</small>
+                    <h3>Gerencia</h3>
+                    <div class="muted" style="font-size:13px;margin-top:6px">Resumen operativo de McCain · hoy</div>
+                  </div>
+                </div>
+                <span class="tag live">En vivo</span>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Resumen del día</h4>
+                  <span>26/03</span>
+                </div>
+                <div class="metric-grid">
+                  <div class="metric">
+                    <small>Consumos</small>
+                    <strong>128</strong>
+                  </div>
+                  <div class="metric">
+                    <small>Empleados</small>
+                    <strong>67</strong>
+                  </div>
+                  <div class="metric">
+                    <small>Máquinas online</small>
+                    <strong>5/6</strong>
+                  </div>
+                  <div class="metric">
+                    <small>Alertas abiertas</small>
+                    <strong>3</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Evolución del consumo</h4>
+                  <span>Últimos 7 días</span>
+                </div>
+                <div class="graph">
+                  <svg viewBox="0 0 320 140" preserveAspectRatio="none" aria-hidden="true">
+                    <path d="M0,105 C28,92 42,94 60,85 C88,72 104,70 124,77 C148,86 168,58 194,50 C224,42 238,60 264,47 C286,36 304,34 320,22"
+                          fill="none" stroke="#1389d5" stroke-width="4" stroke-linecap="round"/>
+                    <path d="M0,105 C28,92 42,94 60,85 C88,72 104,70 124,77 C148,86 168,58 194,50 C224,42 238,60 264,47 C286,36 304,34 320,22 L320,140 L0,140 Z"
+                          fill="rgba(19,137,213,.18)"/>
+                  </svg>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Máquinas</h4>
+                  <span>Ver todas</span>
+                </div>
+                <div class="rows">
+                  <div class="row">
+                    <div>
+                      <strong>Piso 1</strong>
+                      <small>Online · RSSI -62 · stock normal</small>
+                    </div>
+                    <span class="tag ok">OK</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Reunión Norte</strong>
+                      <small>Online · RSSI -75 · stock bajo</small>
+                    </div>
+                    <span class="tag warn">Bajo</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Planta 2</strong>
+                      <small>Sin heartbeat reciente</small>
+                    </div>
+                    <span class="tag off">Offline</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="cta">
+                <button class="btn primary">Ver reportes</button>
+                <button class="btn ghost">Alertas</button>
+              </div>
+            </div>
+            <div class="nav">
+              <div class="active"><strong>◐</strong><span>Inicio</span></div>
+              <div><strong>▣</strong><span>Máquinas</span></div>
+              <div><strong>◫</strong><span>Reportes</span></div>
+              <div><strong>⚑</strong><span>Alertas</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>

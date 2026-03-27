@@ -5,6 +5,11 @@ const { requireManager } = require('../middleware/roleAccess');
 const { normalizeLimitMode } = require('../lib/dailyLimit');
 const { buildDepartmentScopeClause } = require('../lib/accessScope');
 const { normalizeAccessLevelId } = require('../lib/accessLevels');
+const {
+    registerOrAssignCard,
+    updateCardAssignment,
+    deactivateCard
+} = require('../lib/nfcCards');
 const audit = require('../services/audit');
 
 const router = express.Router();
@@ -20,22 +25,6 @@ function normalizeOptionalBoolean(value) {
     if (value === 'true') return true;
     if (value === 'false') return false;
     return null;
-}
-
-function normalizeCardStatus(value, { allowNull = false } = {}) {
-    if (value === null || value === undefined || value === '') {
-        return allowNull ? null : 'active';
-    }
-    const normalized = String(value).trim().toLowerCase();
-    if (['active', 'inactive', 'lost'].includes(normalized)) return normalized;
-    throw new Error('Estado de TAG NFC inválido');
-}
-
-function cardStatusFromLegacy(active, status = null) {
-    if (status && ['active', 'inactive', 'lost'].includes(String(status).trim().toLowerCase())) {
-        return String(status).trim().toLowerCase();
-    }
-    return active ? 'active' : 'inactive';
 }
 
 function normalizeDailyLimit(value, { allowNull = false } = {}) {
@@ -381,35 +370,16 @@ router.post('/:id/cards', requireManager, async (req, res) => {
     const { uid, label } = req.body;
     if (!uid) return res.status(400).json({ error: 'uid requerido' });
     try {
-        const employee = await pool.query(
-            'SELECT id, name FROM employees WHERE id = $1',
-            [req.params.id]
-        );
-        if (employee.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
-        const result = await pool.query(
-            `INSERT INTO nfc_cards (uid, employee_id, label)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (uid) DO UPDATE SET employee_id=$2, label=$3, active=true, status='active'
-             RETURNING *`,
-            [uid.toUpperCase().trim(), req.params.id, label||'Tarjeta']
-        );
-        await audit.logAuditEvent({
+        const result = await registerOrAssignCard({
             req,
-            action: 'nfc_card.create',
-            entityType: 'nfc_card',
-            entityId: result.rows[0].id,
-            entityLabel: result.rows[0].uid,
-            summary: `Asoció el TAG ${result.rows[0].uid} a ${employee.rows[0].name}`,
-            details: {
-                employee_id: employee.rows[0].id,
-                employee_name: employee.rows[0].name,
-                label: result.rows[0].label,
-                status: result.rows[0].status
-            }
+            employeeId: Number.parseInt(req.params.id, 10),
+            uid,
+            label,
+            source: 'panel'
         });
-        res.status(201).json({ card: result.rows[0] });
+        res.status(201).json(result);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -457,125 +427,33 @@ router.delete('/:id', requireManager, async (req, res) => {
 router.patch('/:id/cards/:cardId', requireManager, async (req, res) => {
     const { active, label, employee_id, status } = req.body;
     try {
-        const before = await pool.query(
-            `SELECT nc.id, nc.uid, nc.label, nc.employee_id, nc.active,
-                    COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS status,
-                    e.name AS employee_name
-             FROM nfc_cards nc
-             LEFT JOIN employees e ON e.id = nc.employee_id
-             WHERE nc.id = $1`,
-            [req.params.cardId]
-        );
-        if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
-        const normalizedActive = normalizeOptionalBoolean(active);
-        const reassignedEmployeeId = employee_id ?? null;
-        const normalizedStatus = status === undefined
-            ? null
-            : normalizeCardStatus(status, { allowNull: true });
-        const finalStatus = normalizedStatus !== null
-            ? normalizedStatus
-            : reassignedEmployeeId !== null
-                ? 'active'
-                : normalizedActive === null
-                    ? null
-                    : normalizedActive
-                        ? 'active'
-                        : 'inactive';
-
-        const result = await pool.query(
-            `UPDATE nfc_cards SET
-                status      = COALESCE($1, status, CASE WHEN active THEN 'active' ELSE 'inactive' END),
-                active      = CASE
-                                WHEN COALESCE($1, status, CASE WHEN active THEN 'active' ELSE 'inactive' END) = 'active' THEN true
-                                ELSE false
-                              END,
-                label       = COALESCE($2, label),
-                employee_id = COALESCE($3::int, employee_id)
-             WHERE id = $4 RETURNING *`,
-            [
-                finalStatus,
-                label ?? null,
-                reassignedEmployeeId,
-                req.params.cardId
-            ]
-        );
-        const employeeResult = await pool.query(
-            'SELECT id, name FROM employees WHERE id = $1',
-            [result.rows[0].employee_id]
-        );
-        const card = {
-            ...result.rows[0],
-            status: cardStatusFromLegacy(result.rows[0].active, result.rows[0].status)
-        };
-        const targetEmployee = employeeResult.rows[0] || null;
-        const action = reassignedEmployeeId !== null
-            ? 'nfc_card.update'
-            : card.status === 'lost'
-                ? 'nfc_card.update'
-                : card.status === 'inactive'
-                    ? 'nfc_card.deactivate'
-                    : 'nfc_card.update';
-        await audit.logAuditEvent({
+        const result = await updateCardAssignment({
             req,
-            action,
-            entityType: 'nfc_card',
-            entityId: card.id,
-            entityLabel: card.uid,
-            summary: reassignedEmployeeId !== null
-                ? `Reasignó el TAG ${card.uid} a ${targetEmployee?.name || `empleado ${card.employee_id}`}`
-                : card.status === 'lost'
-                    ? `Marcó el TAG ${card.uid} como perdido`
-                    : card.status === 'inactive'
-                        ? `Dio de baja el TAG ${card.uid}`
-                        : `Actualizó el TAG ${card.uid}`,
-            details: {
-                before: before.rows[0],
-                after: {
-                    id: card.id,
-                    uid: card.uid,
-                    label: card.label,
-                    employee_id: card.employee_id,
-                    employee_name: targetEmployee?.name || null,
-                    status: card.status,
-                    active: card.active
-                }
-            }
+            cardId: Number.parseInt(req.params.cardId, 10),
+            label,
+            employeeId: employee_id ?? null,
+            status,
+            active,
+            source: 'panel'
         });
-        res.json({ card });
+        res.json(result);
     } catch (err) {
-        if (err.message === 'Estado de TAG NFC inválido') {
-            return res.status(400).json({ error: err.message });
-        }
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
 // DELETE /api/employees/:id/cards/:cardId — desactivar tarjeta
 router.delete('/:id/cards/:cardId', requireManager, async (req, res) => {
     try {
-        const result = await pool.query(
-            `UPDATE nfc_cards
-             SET active=false, status='inactive'
-             WHERE id=$1 AND employee_id=$2
-             RETURNING id, uid, label, employee_id`,
-            [req.params.cardId, req.params.id]
-        );
-        if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
-        await audit.logAuditEvent({
+        await deactivateCard({
             req,
-            action: 'nfc_card.deactivate',
-            entityType: 'nfc_card',
-            entityId: result.rows[0].id,
-            entityLabel: result.rows[0].uid,
-            summary: `Dio de baja el TAG ${result.rows[0].uid}`,
-            details: {
-                employee_id: result.rows[0].employee_id,
-                label: result.rows[0].label
-            }
+            cardId: Number.parseInt(req.params.cardId, 10),
+            employeeId: Number.parseInt(req.params.id, 10),
+            source: 'panel'
         });
         res.json({ ok: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 

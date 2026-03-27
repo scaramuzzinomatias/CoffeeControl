@@ -1,0 +1,18 @@
+{
+  "name": "CoffeeControl Tecnico",
+  "short_name": "CC Tecnico",
+  "description": "Operacion movil para tecnico y distribuidor en CoffeeControl.",
+  "start_url": "/coffeecontrol-tecnico.html",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#08111f",
+  "theme_color": "#0ea5e9",
+  "icons": [
+    {
+      "src": "/coffeecontrol-tecnico-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

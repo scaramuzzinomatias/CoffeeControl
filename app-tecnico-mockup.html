@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CoffeeControl - App Técnico Mockup</title>
+  <style>
+    :root{
+      --bg:#10181d;
+      --surface:#f7f6f1;
+      --surface-2:#ffffff;
+      --ink:#1c2b31;
+      --muted:#68747d;
+      --line:rgba(28,43,49,.12);
+      --brand:#1591d7;
+      --brand-dark:#0c557f;
+      --accent:#ffbf59;
+      --ok:#2e9e69;
+      --warn:#d4861f;
+      --danger:#bf4e43;
+      --soft:#e9f4fb;
+      --soft-2:#eef4ef;
+      --shadow:0 22px 55px rgba(11,19,24,.22);
+      --font:Inter,"Segoe UI",system-ui,sans-serif;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      min-height:100vh;
+      color:#f1f4f5;
+      font-family:var(--font);
+      background:
+        radial-gradient(circle at top left, rgba(21,145,215,.22), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(255,191,89,.14), transparent 28%),
+        linear-gradient(145deg,#11191f,#0a1015 58%,#10171d);
+    }
+    .wrap{
+      max-width:1680px;
+      margin:0 auto;
+      padding:42px 36px 54px;
+    }
+    .hero{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-end;
+      gap:28px;
+      margin-bottom:30px;
+    }
+    .eyebrow{
+      display:inline-block;
+      background:rgba(21,145,215,.15);
+      border:1px solid rgba(21,145,215,.26);
+      color:#8bcaef;
+      border-radius:999px;
+      padding:8px 12px;
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:.09em;
+      text-transform:uppercase;
+      margin-bottom:12px;
+    }
+    h1{
+      margin:0 0 8px;
+      font-size:48px;
+      line-height:1.02;
+      letter-spacing:-.04em;
+      max-width:840px;
+    }
+    .sub{
+      margin:0;
+      max-width:860px;
+      color:#aeb9bf;
+      font-size:18px;
+      line-height:1.55;
+    }
+    .legend{
+      display:flex;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+      gap:10px;
+      max-width:450px;
+    }
+    .pill{
+      padding:10px 14px;
+      border-radius:999px;
+      background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.10);
+      color:#c8d3d8;
+      font-size:13px;
+      backdrop-filter:blur(8px);
+    }
+    .stage{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(300px,1fr));
+      gap:26px;
+      align-items:start;
+    }
+    .panel{
+      background:rgba(255,255,255,.05);
+      border:1px solid rgba(255,255,255,.08);
+      border-radius:34px;
+      padding:24px;
+      box-shadow:var(--shadow);
+      backdrop-filter:blur(10px);
+    }
+    .panel-head{
+      margin-bottom:18px;
+    }
+    .panel-head h2{
+      margin:0 0 6px;
+      font-size:26px;
+      letter-spacing:-.03em;
+    }
+    .panel-head p{
+      margin:0;
+      color:#aab6bc;
+      font-size:14px;
+      line-height:1.5;
+    }
+    .phone{
+      width:100%;
+      max-width:368px;
+      margin:0 auto;
+      border-radius:36px;
+      background:#0d1218;
+      padding:12px;
+      box-shadow:
+        0 14px 35px rgba(0,0,0,.35),
+        inset 0 0 0 1px rgba(255,255,255,.06);
+    }
+    .notch{
+      width:122px;
+      height:26px;
+      border-radius:999px;
+      background:#040709;
+      margin:0 auto -18px;
+      position:relative;
+      z-index:2;
+    }
+    .screen{
+      min-height:760px;
+      border-radius:26px;
+      overflow:hidden;
+      background:var(--surface);
+      color:var(--ink);
+      position:relative;
+    }
+    .screen-top{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      padding:14px 18px 6px;
+      font-size:12px;
+      font-weight:700;
+      color:#36444c;
+    }
+    .screen-body{padding:22px 18px 94px}
+    .brand{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:14px;
+      margin-bottom:18px;
+    }
+    .brand-left{
+      display:flex;
+      gap:12px;
+      align-items:flex-start;
+    }
+    .mark{
+      width:46px;
+      height:46px;
+      border-radius:16px;
+      display:grid;
+      place-items:center;
+      font-size:24px;
+      font-weight:800;
+      color:#fff;
+      background:linear-gradient(145deg,#0c5d90,#1aa7ea);
+      box-shadow:0 10px 22px rgba(21,145,215,.28);
+    }
+    .brand small{
+      display:block;
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.09em;
+      font-weight:800;
+      color:var(--brand-dark);
+      margin-bottom:4px;
+    }
+    .brand h3{
+      margin:0;
+      font-size:24px;
+      line-height:1.04;
+      letter-spacing:-.04em;
+    }
+    .brand .muted{font-size:13px;margin-top:6px}
+    .muted{color:var(--muted)}
+    .chip{
+      padding:8px 10px;
+      border-radius:999px;
+      font-size:11px;
+      font-weight:700;
+      white-space:nowrap;
+    }
+    .chip.live{background:#dff1ff;color:#0e618e}
+    .chip.warn{background:#fff2dd;color:#97600c}
+    .chip.off{background:#eef1f4;color:#5a6974}
+    .chip.ok{background:#e4f6eb;color:#1f6f46}
+    .chip.danger{background:#fdeae7;color:#984034}
+    .card{
+      background:var(--surface-2);
+      border:1px solid var(--line);
+      border-radius:22px;
+      padding:16px;
+      box-shadow:0 8px 20px rgba(16,27,34,.06);
+      margin-bottom:14px;
+    }
+    .dark-card{
+      background:linear-gradient(160deg,#143445,#0e212c);
+      color:#f8fbfc;
+      border:none;
+    }
+    .dark-card .muted{color:rgba(255,255,255,.72)}
+    .section-title{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:12px;
+      margin-bottom:10px;
+    }
+    .section-title h4{
+      margin:0;
+      font-size:16px;
+      letter-spacing:-.02em;
+    }
+    .section-title span{
+      color:var(--brand-dark);
+      font-size:12px;
+      font-weight:800;
+    }
+    .metric-grid{
+      display:grid;
+      grid-template-columns:repeat(2,1fr);
+      gap:10px;
+      margin-top:12px;
+    }
+    .metric{
+      padding:12px;
+      border-radius:18px;
+      background:#f4f7f9;
+      border:1px solid var(--line);
+    }
+    .metric strong{
+      display:block;
+      margin-top:6px;
+      font-size:24px;
+      line-height:1;
+    }
+    .rows{display:flex;flex-direction:column;gap:10px}
+    .row{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+    }
+    .row strong{display:block;font-size:14px}
+    .row small{font-size:12px;color:var(--muted)}
+    .btn-grid{
+      display:grid;
+      grid-template-columns:repeat(2,1fr);
+      gap:10px;
+      margin-top:14px;
+    }
+    .btn{
+      border:none;
+      border-radius:16px;
+      padding:12px 14px;
+      font-weight:800;
+      font-size:13px;
+      text-align:center;
+    }
+    .btn.primary{background:var(--brand);color:#fff}
+    .btn.ghost{background:#edf3f7;color:var(--brand-dark)}
+    .btn.warn{background:#fff1dc;color:#9a610d}
+    .btn.dark{background:#173040;color:#cfe7f5}
+    .stack{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .kv{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      align-items:center;
+      padding:10px 12px;
+      background:#f5f8fa;
+      border:1px solid var(--line);
+      border-radius:16px;
+      font-size:13px;
+    }
+    .barcode{
+      display:flex;
+      gap:3px;
+      align-items:end;
+      height:36px;
+      margin-top:10px;
+    }
+    .barcode span{
+      width:4px;
+      border-radius:2px;
+      background:#0f2531;
+    }
+    .barcode span:nth-child(odd){height:90%}
+    .barcode span:nth-child(even){height:62%}
+    .barcode span:nth-child(5n){height:100%}
+    .nav{
+      position:absolute;
+      left:14px;
+      right:14px;
+      bottom:14px;
+      display:flex;
+      justify-content:space-around;
+      gap:8px;
+      background:rgba(255,255,255,.92);
+      border:1px solid rgba(28,43,49,.10);
+      border-radius:22px;
+      padding:10px 8px;
+      backdrop-filter:blur(10px);
+    }
+    .nav div{text-align:center}
+    .nav strong{
+      display:block;
+      font-size:18px;
+      margin-bottom:4px;
+      color:#73808a;
+    }
+    .nav span{
+      font-size:11px;
+      color:var(--muted);
+    }
+    .nav .active strong,
+    .nav .active span{
+      color:var(--brand-dark);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <div class="eyebrow">Mockup conceptual</div>
+        <h1>App Técnico para instalación, soporte, stock y gestión de TAGs en campo.</h1>
+        <p class="sub">
+          Pensada para el rol operativo real: diagnosticar máquinas, reconfigurar WiFi, reponer stock y registrar o reemplazar tags
+          sin exponer reportes sensibles ni administración gerencial.
+        </p>
+      </div>
+      <div class="legend">
+        <div class="pill">Máquinas y onboarding</div>
+        <div class="pill">Comandos remotos y red</div>
+        <div class="pill">Stock y credenciales</div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Inicio operativo</h2>
+          <p>Resumen rápido de pendientes, alertas técnicas y máquinas críticas para arrancar la jornada.</p>
+        </div>
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="screen">
+            <div class="screen-top"><span>9:41</span><span>5G 81%</span></div>
+            <div class="screen-body">
+              <div class="brand">
+                <div class="brand-left">
+                  <div class="mark">Q</div>
+                  <div>
+                    <small>SmartQ técnico</small>
+                    <h3>Hola, Percam</h3>
+                    <div class="muted">Soporte de campo · 6 máquinas bajo tu radio hoy</div>
+                  </div>
+                </div>
+                <span class="chip live">En línea</span>
+              </div>
+
+              <div class="card dark-card">
+                <div style="display:flex;justify-content:space-between;gap:12px;align-items:start">
+                  <div>
+                    <div style="font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800">Tareas del día</div>
+                    <div style="font-size:30px;font-weight:900;line-height:1;margin-top:8px">3 pendientes</div>
+                    <div class="muted" style="margin-top:8px;font-size:13px">Una máquina offline, una con stock bajo y una pendiente de aprobación.</div>
+                  </div>
+                  <div class="chip warn">Atención</div>
+                </div>
+                <div class="metric-grid">
+                  <div class="metric" style="background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.08)">
+                    <small style="color:rgba(255,255,255,.66)">Online</small>
+                    <strong style="color:#fff">5/6</strong>
+                  </div>
+                  <div class="metric" style="background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.08)">
+                    <small style="color:rgba(255,255,255,.66)">Pendientes</small>
+                    <strong style="color:#fff">1</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Prioridad inmediata</h4>
+                  <span>Ver mapa</span>
+                </div>
+                <div class="rows">
+                  <div class="row">
+                    <div>
+                      <strong>Máquina Planta 2</strong>
+                      <small>Sin heartbeat desde hace 8 min</small>
+                    </div>
+                    <span class="chip off">Offline</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Pendiente de aprobación</strong>
+                      <small>MAC 10:00:3B:AF:88:3C</small>
+                    </div>
+                    <span class="chip warn">Alta</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Stock bajo</strong>
+                      <small>Reunión Norte · item 1</small>
+                    </div>
+                    <span class="chip danger">Reposición</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="btn-grid">
+                <button class="btn primary">Abrir máquinas</button>
+                <button class="btn ghost">Pendientes</button>
+                <button class="btn warn">Ver stock</button>
+                <button class="btn dark">Escanear tag</button>
+              </div>
+            </div>
+            <div class="nav">
+              <div class="active"><strong>◐</strong><span>Inicio</span></div>
+              <div><strong>▣</strong><span>Máquinas</span></div>
+              <div><strong>◫</strong><span>Stock</span></div>
+              <div><strong>⌁</strong><span>Tags</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Detalle de máquina</h2>
+          <p>Estado técnico, conectividad y comandos remotos pensados para resolver en sitio o desde soporte.</p>
+        </div>
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="screen">
+            <div class="screen-top"><span>9:41</span><span>WiFi 73%</span></div>
+            <div class="screen-body">
+              <div class="brand">
+                <div class="brand-left">
+                  <div class="mark" style="background:linear-gradient(145deg,#243844,#112028)">⌘</div>
+                  <div>
+                    <small>Máquinas</small>
+                    <h3>Planta 2</h3>
+                    <div class="muted">Piso 1 · sector entrada</div>
+                  </div>
+                </div>
+                <span class="chip off">Offline</span>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Estado de red</h4>
+                  <span>Último ping 8 min</span>
+                </div>
+                <div class="stack">
+                  <div class="kv"><span>SSID</span><strong>Tiziana</strong></div>
+                  <div class="kv"><span>IP</span><strong>192.168.1.93</strong></div>
+                  <div class="kv"><span>RSSI</span><strong>-84 dBm</strong></div>
+                  <div class="kv"><span>Backend</span><strong style="color:var(--danger)">Sin respuesta</strong></div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Acciones remotas</h4>
+                  <span>Online requerido</span>
+                </div>
+                <div class="btn-grid">
+                  <button class="btn primary">Reiniciar</button>
+                  <button class="btn ghost">Cambiar WiFi</button>
+                  <button class="btn warn">Escanear redes</button>
+                  <button class="btn dark">Ver logs</button>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Onboarding</h4>
+                  <span>Distribuidor</span>
+                </div>
+                <div class="rows">
+                  <div class="row">
+                    <div>
+                      <strong>MAC</strong>
+                      <small>10:00:3B:AF:88:3C</small>
+                    </div>
+                    <span class="chip ok">Detectada</span>
+                  </div>
+                  <div class="row">
+                    <div>
+                      <strong>Firmware</strong>
+                      <small>v3 · ESP32-C3</small>
+                    </div>
+                    <span class="chip live">OK</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="nav">
+              <div><strong>◐</strong><span>Inicio</span></div>
+              <div class="active"><strong>▣</strong><span>Máquinas</span></div>
+              <div><strong>◫</strong><span>Stock</span></div>
+              <div><strong>⌁</strong><span>Tags</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Stock y credenciales</h2>
+          <p>La parte más operativa del trabajo de campo: reponer, ajustar y registrar tags o llaveros desde el teléfono.</p>
+        </div>
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="screen">
+            <div class="screen-top"><span>9:41</span><span>NFC activo</span></div>
+            <div class="screen-body">
+              <div class="brand">
+                <div class="brand-left">
+                  <div class="mark" style="background:linear-gradient(145deg,#2d6f52,#34aa73)">◫</div>
+                  <div>
+                    <small>Stock y tags</small>
+                    <h3>Reunión Norte</h3>
+                    <div class="muted">Última reposición · hoy 08:22</div>
+                  </div>
+                </div>
+                <span class="chip warn">Stock bajo</span>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Selección principal</h4>
+                  <span>Item 1</span>
+                </div>
+                <div class="kv"><span>Producto</span><strong>Café</strong></div>
+                <div class="kv"><span>Actual / mínimo</span><strong>3 / 5</strong></div>
+                <div class="btn-grid" style="margin-top:12px">
+                  <button class="btn primary">Reponer +10</button>
+                  <button class="btn ghost">Ajustar</button>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="section-title">
+                  <h4>Registrar TAG</h4>
+                  <span>NFC</span>
+                </div>
+                <div class="rows">
+                  <div class="row">
+                    <div>
+                      <strong>Empleado</strong>
+                      <small>Matías Scaramuzzino · Legajo 184</small>
+                    </div>
+                    <span class="chip ok">Activo</span>
+                  </div>
+                </div>
+                <div class="barcode" aria-hidden="true">
+                  <span></span><span></span><span></span><span></span><span></span>
+                  <span></span><span></span><span></span><span></span><span></span>
+                  <span></span><span></span><span></span><span></span><span></span>
+                </div>
+                <div class="muted" style="font-size:12px;margin-top:10px;line-height:1.5">
+                  Acercá la tarjeta o llavero al teléfono para leerla y asignarla con auditoría al empleado correcto.
+                </div>
+                <div class="btn-grid" style="margin-top:12px">
+                  <button class="btn primary">Escanear tag</button>
+                  <button class="btn ghost">Reemplazar perdido</button>
+                </div>
+              </div>
+            </div>
+            <div class="nav">
+              <div><strong>◐</strong><span>Inicio</span></div>
+              <div><strong>▣</strong><span>Máquinas</span></div>
+              <div class="active"><strong>◫</strong><span>Stock</span></div>
+              <div><strong>⌁</strong><span>Tags</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>

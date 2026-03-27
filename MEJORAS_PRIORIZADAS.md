@@ -559,6 +559,89 @@ Implementado:
 - wrapper de soporte `support:create-distributor`
 - cobertura incluida en `npm run test:integration`
 
+### 30. App móvil para técnico
+Origen: necesidad operativa para trabajo de campo sobre máquinas, stock y onboarding sin depender del panel de escritorio
+
+Estado:
+- Resuelto en primera versión web.
+- En progreso como versión final Android nativa.
+
+Resultado esperado:
+- Operar máquinas desde el celular con una interfaz pensada para campo.
+- Resolver tareas técnicas sin exponer analítica ni configuración gerencial.
+
+Implementado:
+- login propio con URL de backend configurable
+- acceso móvil para `tecnico`, `distribuidor` y operación rápida desde `gerente/admin`
+- backend móvil fase 1 con `mobile_sessions`, `mobile-auth` (`login`, `refresh`, `logout`) y revocación inmediata de sesión
+- endpoints `mobile-tech` para buscar empleados, consultar TAGs y asignar/reasignar credenciales desde la futura app Android
+- listado de máquinas con búsqueda y filtros rápidos
+- detalle técnico de máquina con red, backend y estado operativo
+- reinicio remoto
+- cambio remoto de WiFi y escaneo de redes visibles
+- stock por máquina con alta, edición, reposición, ajuste y baja/reactivación
+- onboarding de máquinas pendientes para `distribuidor` / `gerente` / `admin`
+- PWA con `coffeecontrol-tecnico.webmanifest`, `coffeecontrol-tecnico-sw.js` y `coffeecontrol-tecnico-icon.svg`
+- arquitectura objetivo Android nativa documentada en `ARQUITECTURA_APP_TECNICO_ANDROID.md`
+- base real de Android nativa creada en `coffeecontrol-tecnico-android/` con:
+  - Kotlin + Jetpack Compose
+  - sesión segura
+  - desbloqueo biométrico
+  - máquinas + stock
+  - flujo NFC para TAGs contra `mobile-tech`
+  - WiFi remoto con escaneo de redes visibles
+  - onboarding / pendientes por rol
+- validación real ya hecha en teléfono Android para:
+  - login
+  - biometría
+  - máquinas
+  - stock
+  - lectura NFC
+  - asignación / reasignación de TAGs
+
+Pendiente de esta mejora:
+- cerrar la UX nativa final y decidir si la PWA queda como herramienta secundaria o se retira
+- validar en vivo `WiFi remoto` con una máquina online
+- validar en vivo `Pendientes` con al menos una máquina sin aprobar
+### 31. App móvil para gerente
+Origen: necesidad de consultar y operar el sistema desde celular sin depender del panel de escritorio
+
+Estado:
+- Pendiente.
+- Mockup conceptual preparado en `app-mobile-mockups.html/.png/.pdf`.
+
+Resultado esperado:
+- Acceso móvil al resumen del día.
+- Vista de máquinas, alertas y reportes rápidos.
+- Experiencia pensada para teléfono, no como copia 1:1 del panel de PC.
+
+Enfoque recomendado:
+- primera etapa como PWA o app móvil liviana
+- reutilizando backend, JWT y lógica de roles ya existente
+- foco en consulta y operación rápida, no en administración completa
+
+### 32. App móvil para empleado
+Origen: necesidad de que el empleado tenga experiencia digital propia y, más adelante, eventualmente reemplace el TAG físico
+
+Estado:
+- Pendiente.
+- Mockup conceptual preparado en `app-mobile-mockups.html/.png/.pdf`.
+
+Resultado esperado:
+- Registro o vinculación del empleado con sus datos.
+- Consulta de consumo diario/mensual, historial y estado de límite.
+- Canal futuro para credencial digital desde el celular.
+
+Enfoque recomendado:
+- fase 1: app companion (registro, perfil, historial, avisos)
+- fase 2: evaluar credencial móvil
+
+Nota técnica importante:
+- reemplazar el TAG por NFC móvil no es inmediato
+- el sistema actual está centrado en `UID` físico (`RC522` + backend por `nfc_uid`)
+- si se avanza en esta línea, conviene ensayar más adelante con hardware más apto como `PN532`
+- y probablemente empezar con Android antes de prometer compatibilidad universal
+
 ## Orden recomendado de implementación
 
 ### Fase A — Rápidas y de alto valor
@@ -602,6 +685,10 @@ Implementado:
 28. [x] Cuenta maestra protegida del panel.
 29. [x] Rol distribuidor para instalación y soporte.
 
+### Fase G — Movilidad
+30. [ ] App móvil para gerente.
+31. [ ] App móvil para empleado.
+
 ## Recomendación práctica
 
 Si vamos de a una, sugiero arrancar así:
@@ -616,11 +703,12 @@ Ese bloque da mucho valor rápido y prepara bien el terreno para la reconfigurac
 ## Próximo bloque sugerido
 
 Si retomamos desde donde quedó el proyecto, el orden que más sentido tiene sería:
-1. Integración DEX/UCS como V2 de stock.
-2. Resolver `coffeecontrol.html`.
-3. Refinar filtros/paginado de `Reportes` si el volumen real lo pide.
-4. Extender jerarquías a catálogo/productos/subsidios cuando exista modelo global de productos.
+1. Validación de piloto en campo con `CHECKLIST_PILOTO.md` y `PROTOCOLO_PRUEBAS.md`.
+2. Definir alcance y arquitectura de la app móvil para gerente.
+3. Definir alcance de la app móvil para empleado fase 1.
+4. Dejar el reemplazo del TAG por credencial móvil como laboratorio posterior.
 
 Razón:
-- Reportes, exportaciones y stock ya quedaron fuertes para operar y llevar a reunión.
-- El siguiente salto de valor está en profundizar stock con telemetría real y seguir cerrando frentes operativos pendientes.
+- El producto actual ya cubre bien el escenario objetivo de piloto.
+- El mayor valor inmediato está en validar uso real y, en paralelo, diseñar bien la capa móvil.
+- El reemplazo del TAG por NFC móvil requiere otro tipo de arquitectura y no conviene mezclarlo con el cierre del piloto.

@@ -9,6 +9,7 @@ const machineAuth  = require('./middleware/machineAuth');
 const authJwt      = require('./middleware/authJwt');
 
 const authRoutes       = require('./routes/auth');
+const mobileAuthRoutes = require('./routes/mobileAuth');
 const tapRoutes        = require('./routes/tap');
 const dashboardRoutes  = require('./routes/dashboard');
 const employeeRoutes   = require('./routes/employees');
@@ -21,6 +22,7 @@ const accessLevelsRoutes = require('./routes/accessLevels');
 const notificationSettingsRoutes = require('./routes/notificationSettings');
 const systemSettingsRoutes = require('./routes/systemSettings');
 const auditLogsRoutes = require('./routes/auditLogs');
+const mobileTechRoutes = require('./routes/mobileTech');
 
 const app = express();
 app.use(express.json());
@@ -35,6 +37,7 @@ app.use((req, res, next) => { console.log(`${new Date().toISOString()} ${req.met
 
 // Rutas públicas
 app.use('/api/auth', authRoutes);
+app.use('/api/mobile-auth', mobileAuthRoutes);
 
 // Rutas ESP8266 (secret de máquina)
 app.use('/api/tap', machineAuth, tapRoutes);
@@ -61,6 +64,7 @@ app.use('/api/access-levels', authJwt, accessLevelsRoutes);
 app.use('/api/notification-settings', authJwt, notificationSettingsRoutes);
 app.use('/api/system-settings', authJwt, systemSettingsRoutes);
 app.use('/api/audit-logs', authJwt, auditLogsRoutes);
+app.use('/api/mobile-tech', authJwt, mobileTechRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 

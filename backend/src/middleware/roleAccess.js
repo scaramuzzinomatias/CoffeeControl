@@ -3,6 +3,7 @@ const {
     isTechnicalRole,
     canManageMachineSetup,
     canOperateMachines,
+    canOperateCards,
     canViewAnalytics
 } = require('../lib/accessScope');
 
@@ -21,6 +22,11 @@ function requireMachineSetup(req, res, next) {
     return res.status(403).json({ error: 'Acceso solo para gerente/admin/distribuidor' });
 }
 
+function requireCardOperator(req, res, next) {
+    if (canOperateCards(req.user?.role)) return next();
+    return res.status(403).json({ error: 'Acceso solo para gerente/admin/técnico/distribuidor' });
+}
+
 function requireAnalyticsViewer(req, res, next) {
     if (canViewAnalytics(req.user?.role)) return next();
     return res.status(403).json({ error: 'Acceso solo para gerente/admin/supervisor' });
@@ -32,5 +38,6 @@ module.exports = {
     requireManager,
     requireMachineOperator,
     requireMachineSetup,
+    requireCardOperator,
     requireAnalyticsViewer,
 };

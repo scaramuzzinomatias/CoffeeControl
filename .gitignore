@@ -15,3 +15,9 @@ backend/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Android tecnico nativo
+coffeecontrol-tecnico-android/.gradle/
+coffeecontrol-tecnico-android/**/build/
+coffeecontrol-tecnico-android/local.properties
+coffeecontrol-tecnico-android/.idea/

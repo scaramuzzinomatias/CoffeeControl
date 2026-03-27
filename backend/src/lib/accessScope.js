@@ -21,6 +21,10 @@ function canOperateMachines(role) {
     return isManagerRole(role) || isTechnicalRole(role);
 }
 
+function canOperateCards(role) {
+    return isManagerRole(role) || isTechnicalRole(role);
+}
+
 function canViewAnalytics(role) {
     return ANALYTICS_ROLES.has(role);
 }
@@ -119,6 +123,7 @@ module.exports = {
     isTechnicalRole,
     canManageMachineSetup,
     canOperateMachines,
+    canOperateCards,
     canViewAnalytics,
     normalizeDepartmentName,
     normalizeDepartmentList,

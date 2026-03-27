@@ -74,6 +74,8 @@ backend/
 
 coffeecontrol-admin.html    ← Panel de administración completo
 coffeecontrol.html          ← Monitor operativo liviano (solo lectura, sesión compartida)
+coffeecontrol-tecnico.html  ← App técnico PWA móvil (máquinas, stock, WiFi, onboarding)
+coffeecontrol-tecnico-android/ ← App técnico Android nativa (base real para NFC + biometría)
 ```
 
 ---
@@ -150,6 +152,10 @@ psql $DATABASE_URL -f sql/migration_v17.sql
 psql $DATABASE_URL -f sql/migration_v18.sql
 psql $DATABASE_URL -f sql/migration_v19.sql
 psql $DATABASE_URL -f sql/migration_v20.sql
+psql $DATABASE_URL -f sql/migration_v21.sql
+psql $DATABASE_URL -f sql/migration_v22.sql
+psql $DATABASE_URL -f sql/migration_v23.sql
+psql $DATABASE_URL -f sql/migration_v24.sql
 ```
 
 Configurar variables de entorno (crear `.env` en `backend/`):
@@ -265,6 +271,50 @@ Importante:
 - si el usuario es `tecnico`, el panel aterriza en `Máquinas` y no puede acceder a dashboard, reportes, feed ni configuración global
 - si el usuario es `distribuidor`, el panel aterriza en `Máquinas`, puede gestionar onboarding/configuración de máquinas y no accede a analítica, empleados ni configuración global
 - el bloque de **stock** es global por máquina y en esta V1 no se recorta por área
+
+### App técnico móvil
+
+Abrir `http://<ip-servidor>:3000/coffeecontrol-tecnico.html` desde el celular.
+
+Esta app se publica como PWA móvil y reutiliza el backend actual con JWT. Está pensada para `tecnico`, `distribuidor` y, si hace falta, también para operación rápida desde cuentas `gerente/admin`.
+
+Incluye:
+
+- login propio con URL de backend configurable
+- backend móvil fase 1 listo para Android nativo: `POST /api/mobile-auth/login|refresh|logout`
+- sesiones móviles persistidas con revocación inmediata al logout
+- endpoints técnicos `mobile-tech` para buscar empleados, consultar TAGs y asignar/reasignar credenciales
+- listado móvil de máquinas con búsqueda y filtros rápidos
+- detalle técnico de máquina con red, backend y estado operativo
+- reinicio remoto
+- cambio remoto de WiFi y escaneo de redes visibles
+- stock por máquina con alta, edición, reposición, ajuste y baja/reactivación
+- onboarding de máquinas pendientes para `distribuidor` / `gerente` / `admin`
+- instalación como PWA con `coffeecontrol-tecnico.webmanifest` y `coffeecontrol-tecnico-sw.js`
+
+### App técnico Android nativa
+
+Además de la PWA, el repo ya incluye una base **Android nativa** en [coffeecontrol-tecnico-android/](C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/coffeecontrol-tecnico-android/), pensada como la app final de campo cuando el técnico necesita:
+
+- login móvil dedicado con `mobile-auth`
+- desbloqueo biométrico del dispositivo
+- lectura NFC real de los mismos TAGs que hoy usa el `RC522`
+- operación técnica de máquinas, stock y gestión de credenciales
+- WiFi remoto con escaneo de redes visibles
+- onboarding de máquinas pendientes para `distribuidor` / `gerente` / `admin`
+
+Estado actual:
+
+- el backend móvil fase 1 ya está activo (`/api/mobile-auth/*` y `/api/mobile-tech/*`)
+- la app Android ya tiene sesión segura, biometría, máquinas, stock, flujo de TAGs, WiFi remoto y pendientes
+- el proyecto ya compila en esta máquina con `Gradle 8.13` y el toolchain de Android Studio
+- el APK debug se genera en `coffeecontrol-tecnico-android/app/build/outputs/apk/debug/app-debug.apk`
+- la validación real en teléfono Android ya confirmó login, biometría, máquinas, stock y flujo NFC/TAGs
+- `WiFi remoto` y `Pendientes` quedaron integrados y compilando; su validación en vivo depende de tener una máquina online y/o pendientes reales
+
+Referencia técnica:
+
+- [ARQUITECTURA_APP_TECNICO_ANDROID.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/ARQUITECTURA_APP_TECNICO_ANDROID.md)
 
 ### Estado de red por máquina
 
@@ -507,7 +557,7 @@ Qué hace cada uno:
 - `db:restore`: restaura un backup `.sql` o `.dump`; acepta `--recreate` para reconstruir la base antes de restaurar.
 - `db:rebuild`: reconstruye la base desde cero usando `schema.sql` y luego aplica las migraciones faltantes del repo.
 - `support:doctor`: valida `.env`, conexión PostgreSQL, tablas clave, SMTP y `/health` del backend.
-- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos, permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor` y cuentas protegidas.
+- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos, permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor`, cuentas protegidas y la capa móvil (`mobile-auth` + `mobile-tech`).
 - `support:reset-admin`: wrapper para resetear o crear el usuario `admin` del panel.
 - `support:user`: crea o actualiza cualquier usuario del panel (`admin`, `gerente`, `supervisor`, `tecnico`, `distribuidor`). Si el rol es `supervisor`, acepta múltiples áreas con `--departments`. También permite marcar o desmarcar cuentas protegidas con `--protected` / `--unprotect`.
 - `support:create-supervisor`: wrapper cómodo de `support:user` para supervisores; igual requiere `--username`, `--password` y opcionalmente `--departments`.
@@ -617,6 +667,8 @@ Acceso:
 - [CHECKLIST_PILOTO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/CHECKLIST_PILOTO.md)
 - [PROTOCOLO_PRUEBAS.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_PRUEBAS.md)
 - [GUIA_SOPORTE.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/GUIA_SOPORTE.md)
+- [MODELO_OPERATIVO_CLIENTES.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/MODELO_OPERATIVO_CLIENTES.md)
+- [ARQUITECTURA_APP_TECNICO_ANDROID.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/ARQUITECTURA_APP_TECNICO_ANDROID.md)
 
 ---
 
@@ -628,9 +680,11 @@ Acceso:
 - [x] Control de stock V1 manual/estimado por máquina y selección
 - [x] Reportes específicos de stock para `gerente/admin`
 - [x] Perfil técnico para operar máquinas, stock y comandos remotos sin permisos gerenciales
+- [x] App técnico PWA para máquinas, stock, WiFi remoto y onboarding
 - [x] Jerarquías de acceso reutilizables con política efectiva online/offline y filtro en reportes
 - [x] Scripts DB y soporte (`db:migrate:all`, `support:doctor`, reseteo/alta de usuarios del panel)
 - [x] Tests de integración mínimos (`npm run test:integration`)
+- [~] App técnico Android nativa (operativa en teléfono real; falta pulido UX y validación en vivo de WiFi/pending)
 - [ ] OTA (Over The Air) — actualización de firmware desde el panel
 - [ ] Multi-tenant para modo SaaS (campo `tenant_id`, schema por empresa)
 - [ ] Mapa de máquinas con estado en tiempo real
