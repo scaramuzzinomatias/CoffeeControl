@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 27/03/2026 — backend móvil fase 1 (`mobile-auth` + `mobile-tech`) y app técnico Android nativa ya compilando con `Gradle 8.13` y validada en teléfono real para login, biometría, máquinas, stock y TAGs; además suma `WiFi remoto` y `Pendientes` en el repo canónico, sobre el milestone consolidado de panel/admin, stock, auditoría, jerarquías, roles operativos y salida a piloto.
+> Última actualización: 27/03/2026 — backend móvil fase 1 (`mobile-auth` + `mobile-tech`) y app técnico Android nativa ya compilando con `Gradle 8.13` y validada en teléfono real para login, biometría, máquinas, stock y TAGs; además suma `WiFi remoto` y `Pendientes`, y ahora también existe la **app gerente PWA** con selector de empresa, `Inicio / Máquinas / Reportes / Alertas` y ruta backend read-only `GET /api/alerts/active`. Esa PWA queda como prototipo funcional; la dirección de producto consensuada pasa a una futura **app gerente nativa**.
 >
 > **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 
@@ -104,6 +104,7 @@ Se subió código de **VMflow.xyz** (ESP32-S3 + MDB + BLE + MQTT). Decisión: no
 - `GUIA_SOPORTE.md`
 - `MODELO_OPERATIVO_CLIENTES.md`
 - `ARQUITECTURA_APP_TECNICO_ANDROID.md`
+- `ARQUITECTURA_APP_GERENTE_MOVIL.md`
 
 Usarlos como referencia principal para instalación, validación online/offline y soporte en campo.
 
@@ -362,7 +363,11 @@ Total pines usados: 10 de 11 disponibles
   - **App técnico PWA** (`coffeecontrol-tecnico.html`): login móvil propio, máquinas, detalle técnico, WiFi remoto, reinicio, stock y onboarding para trabajo de campo
     - backend móvil fase 1 listo para Android nativo: `mobile_sessions`, `mobile-auth` con refresh/logout y `mobile-tech` para búsqueda/asignación/reasignación de TAGs
     - app Android nativa en `coffeecontrol-tecnico-android/`: biometría + NFC + máquinas + stock + TAGs ya validados en teléfono real; `WiFi remoto` y `Pendientes` integrados y compilando, pendientes de validación en vivo según disponibilidad de equipos
-  - `backend/test/integration.test.js` cubre login, scope multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos/auditoría de `Notificaciones`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alerta de stock bajo, reportes de stock, descuento automático en `vend_confirmed`, permisos de los roles `tecnico` / `distribuidor`, cuentas protegidas y capa móvil (`mobile-auth` + `mobile-tech`)
+  - **App gerente móvil** (`coffeecontrol-gerente.html`): PWA ejecutiva para `admin` / `gerente` / `supervisor`, con selector de empresa antes del login, sesión local por backend, tabs `Inicio`, `Máquinas`, `Reportes`, `Alertas` y hoja de sesión separada
+    - se apoya en `dashboard`, `reports`, `machines` y la nueva ruta read-only `GET /api/alerts/active`
+    - `app-gerente-mockup.html` y `ARQUITECTURA_APP_GERENTE_MOVIL.md` quedan como referencia de diseño y evolución
+    - decisión actual: usar esta PWA como referencia/prototipo y avanzar después a una versión nativa
+  - `backend/test/integration.test.js` cubre login, scope multi-área, `403` fuera de alcance, estados `card_lost` / `card_inactive`, comandos remotos, permisos/auditoría de `Notificaciones`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alerta de stock bajo, reportes de stock, descuento automático en `vend_confirmed`, alertas activas con scope por rol, permisos de los roles `tecnico` / `distribuidor`, cuentas protegidas y capa móvil (`mobile-auth` + `mobile-tech`)
 - Monitor operativo liviano (`coffeecontrol.html`) con WebSocket y sin configuración administrativa
 - Repositorio git inicializado; checkpoint `a25148b` representa este estado
 
@@ -392,7 +397,7 @@ Total pines usados: 10 de 11 disponibles
 - [ ] **Multi-tenant** para modo SaaS (campo `tenant_id` en todas las tablas, schema separado por empresa)
 - [ ] **OTA (Over The Air)** actualización de firmware desde el panel
 - [ ] **Mapa de máquinas** con estado en tiempo real (verde/amarillo/rojo)
-- [ ] **App móvil** para el gerente (o PWA del panel existente)
+- [~] **App gerente móvil**: PWA V1 implementada como prototipo; siguiente paso recomendado, versión nativa
 - [ ] **Seguridad del payload MDB**: implementar XOR + timestamp como VMflow para evitar replay attacks
 
 ---

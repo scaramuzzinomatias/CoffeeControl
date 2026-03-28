@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1389d5">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>CoffeeControl Gerente</title>
+  <link rel="manifest" href="coffeecontrol-gerente.webmanifest?v=2">
+  <link rel="icon" href="coffeecontrol-gerente-icon.svg?v=2" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="coffeecontrol-gerente-icon.svg?v=2">
+  <style>
+    :root{--bg:#efe8dc;--bg-deep:#e8decf;--ink:#1d2c34;--muted:#69737a;--line:rgba(29,44,52,.12);--brand:#1389d5;--brand-dark:#0e5e99;--danger:#b94e3c;--ok:#2f9d62;--shadow:0 22px 50px rgba(20,32,40,.14);--radius-xl:32px;--font:"Segoe UI",system-ui,-apple-system,sans-serif}
+    *{box-sizing:border-box}html,body{margin:0;min-height:100%}body{font-family:var(--font);color:var(--ink);background:radial-gradient(circle at top left, rgba(19,137,213,.20), transparent 28%),radial-gradient(circle at bottom right, rgba(239,182,79,.16), transparent 24%),linear-gradient(135deg,var(--bg),var(--bg-deep))}
+    .hidden{display:none!important}.auth-shell{min-height:100vh;display:grid;place-items:center;padding:28px 18px}.auth-layout{width:min(1120px,100%);display:grid;grid-template-columns:1.1fr .9fr;gap:24px;align-items:stretch}.company-layout{grid-template-columns:1fr 1fr}
+    .hero-panel,.login-panel,.app-header,.status-strip,.dashboard-hero,.section-card,.machine-card,.alert-card,.report-card,.summary-card,.sheet-panel,.company-card,.selected-company-card{border:1px solid rgba(255,255,255,.54);background:rgba(255,255,255,.52);backdrop-filter:blur(14px);box-shadow:var(--shadow)}
+    .hero-panel,.login-panel{border-radius:var(--radius-xl);padding:28px}.brand-line,.app-brand{display:flex;gap:16px;align-items:flex-start}.brand-mark{width:64px;height:64px;border-radius:22px;display:grid;place-items:center;background:linear-gradient(160deg,var(--brand-dark),var(--brand));color:#fff;font-size:38px;font-weight:900}.brand-mark.small{width:46px;height:46px;border-radius:16px;font-size:26px}
+    .hero-panel h1,.app-brand h1{margin:8px 0 10px;font-size:clamp(30px,4vw,46px);line-height:1.02;letter-spacing:-.04em}.eyebrow,.sheet-eyebrow{display:inline-block;color:var(--brand-dark);font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase}.hero-panel p,.login-panel p,.muted{margin:0;color:var(--muted);line-height:1.6}
+    .hero-grid,.company-list{display:grid;gap:14px}.hero-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.feature-card,.company-card{background:#fff;border:1px solid var(--line);border-radius:22px;padding:16px}.feature-card strong,.company-card strong{display:block}
+    .panel-head{display:grid;gap:8px}.panel-head h2{margin:0;font-size:30px;letter-spacing:-.03em}.panel-head h3{margin:0;font-size:18px}.divider{height:1px;background:linear-gradient(90deg,transparent,rgba(29,44,52,.18),transparent);margin:2px 0}
+    .field{display:flex;flex-direction:column;gap:8px}.field span{color:var(--muted);font-size:13px;font-weight:700}.field input{width:100%;border:none;outline:none;border-radius:16px;padding:15px 16px;background:rgba(255,255,255,.92);color:var(--ink);border:1px solid rgba(29,44,52,.10)}
+    .inline-actions,.meta-row{display:flex;gap:10px;flex-wrap:wrap}.meta-row{justify-content:space-between;align-items:flex-start}.btn{border:none;border-radius:16px;padding:13px 16px;font-weight:800}.btn-primary{background:linear-gradient(180deg,var(--brand),var(--brand-dark));color:#fff}.btn-ghost{background:rgba(255,255,255,.72);color:var(--ink);border:1px solid rgba(29,44,52,.10)}.btn-danger{background:rgba(185,78,60,.15);color:var(--danger);border:1px solid rgba(185,78,60,.16)}.btn-sm{padding:10px 12px;border-radius:14px;font-size:13px}
+    .badge{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;border-radius:999px;padding:8px 10px;font-size:12px;font-weight:800;border:1px solid transparent;background:rgba(29,44,52,.08);color:var(--ink)}.badge.ok{background:rgba(47,157,98,.15);color:var(--ok)}.empty-state{padding:22px;border-radius:22px;background:rgba(255,255,255,.72);border:1px dashed rgba(29,44,52,.14);color:var(--muted)}
+    @media (max-width:980px){.auth-layout,.company-layout,.hero-grid{grid-template-columns:1fr}}
+  </style>
+  <link rel="stylesheet" href="coffeecontrol-gerente.css?v=2">
+</head>
+<body>
+  <div id="companyScreen" class="auth-shell">
+    <div class="auth-layout company-layout">
+      <section class="hero-panel">
+        <div class="brand-line">
+          <div class="brand-mark" aria-hidden="true">Q</div>
+          <div>
+            <div class="eyebrow">SmartQ</div>
+            <h1>CoffeeControl Gerente</h1>
+            <p>Resumen ejecutivo móvil para seguir consumo, máquinas, reportes y alertas sin depender del escritorio.</p>
+          </div>
+        </div>
+        <div class="hero-grid">
+          <article class="feature-card">
+            <strong>Visión clara</strong>
+            <span>Inicio pensado para decidir rápido: consumo del día, alertas abiertas, máquinas offline y focos de gestión.</span>
+          </article>
+          <article class="feature-card">
+            <strong>Una empresa por instalación</strong>
+            <span>Elegís la empresa antes de entrar, y la app ya apunta al backend correcto sin mezclar contextos.</span>
+          </article>
+          <article class="feature-card">
+            <strong>Reportes móviles</strong>
+            <span>Rango de fechas, top máquinas, empleados y áreas con foco ejecutivo y lectura cómoda desde el teléfono.</span>
+          </article>
+        </div>
+      </section>
+
+      <section class="login-panel">
+        <div class="panel-head">
+          <div class="eyebrow">Empresas</div>
+          <h2>Elegí el contexto</h2>
+          <p>La sesión y los datos quedan asociados a la empresa seleccionada.</p>
+        </div>
+        <div id="companyErr" class="inline-banner hidden"></div>
+        <div id="companyList" class="company-list"></div>
+
+        <div class="divider"></div>
+
+        <div class="panel-head compact">
+          <div>
+            <div class="eyebrow">Alta rápida</div>
+            <h3>Agregar empresa</h3>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>Nombre visible</span>
+          <input id="companyName" type="text" placeholder="PepsiCo" autocomplete="organization">
+        </label>
+        <label class="field">
+          <span>Backend</span>
+          <input id="companyUrl" type="url" placeholder="https://pepsico.tudominio.com" autocomplete="url">
+        </label>
+        <div class="inline-actions">
+          <button class="btn btn-primary" type="button" onclick="saveCompany()">Guardar empresa</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="loginScreen" class="auth-shell hidden">
+    <div class="auth-layout">
+      <section class="hero-panel compact">
+        <div class="brand-line">
+          <div class="brand-mark" aria-hidden="true">Q</div>
+          <div>
+            <div class="eyebrow">Ingreso ejecutivo</div>
+            <h1>Operación y consumo en un solo lugar</h1>
+            <p>Usá una cuenta con rol <strong>admin</strong>, <strong>gerente</strong> o <strong>supervisor</strong>. La app técnico queda separada.</p>
+          </div>
+        </div>
+        <div id="selectedCompanyCard" class="selected-company-card"></div>
+      </section>
+
+      <section class="login-panel">
+        <div class="panel-head">
+          <div class="eyebrow">Acceso</div>
+          <h2>Entrar a la empresa</h2>
+          <p>Si ya tenés una sesión válida en esta empresa, la app la reutiliza automáticamente.</p>
+        </div>
+
+        <label class="field">
+          <span>Usuario</span>
+          <input id="loginUser" type="text" placeholder="gerencia" autocomplete="username">
+        </label>
+
+        <label class="field">
+          <span>Contraseña</span>
+          <input id="loginPass" type="password" placeholder="********" autocomplete="current-password">
+        </label>
+
+        <label class="toggle-inline">
+          <input id="showLoginPass" type="checkbox">
+          <span>Mostrar contraseña</span>
+        </label>
+
+        <div id="loginErr" class="inline-banner hidden"></div>
+
+        <div class="inline-actions">
+          <button class="btn btn-primary" type="button" onclick="doLogin()">Entrar</button>
+          <button class="btn btn-ghost" type="button" onclick="backToCompanies()">Cambiar empresa</button>
+          <button class="btn btn-ghost" type="button" onclick="openAdminPanel()">Abrir panel web</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="appShell" class="app-shell hidden">
+    <header class="app-header">
+      <div class="app-brand">
+        <div class="brand-mark small" aria-hidden="true">Q</div>
+        <div>
+          <div class="eyebrow">SmartQ · Control ejecutivo</div>
+          <h1>CoffeeControl Gerente</h1>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="installBtn" class="btn btn-ghost hidden" type="button" onclick="installApp()">Instalar</button>
+        <button class="btn btn-ghost" type="button" onclick="refreshAllData(false)">Actualizar</button>
+        <button class="btn btn-ghost" type="button" onclick="openSessionSheet()">Sesión</button>
+      </div>
+    </header>
+
+    <section class="status-strip">
+      <div id="statusCompany" class="status-pill">Empresa</div>
+      <div id="statusBackend" class="status-pill">Backend</div>
+      <div id="statusUser" class="status-pill">Usuario</div>
+      <div id="statusRefresh" class="status-pill">Sincronización</div>
+    </section>
+
+    <main id="view" class="view"></main>
+    <nav id="tabbar" class="tabbar" aria-label="Navegación principal"></nav>
+  </div>
+
+  <div id="sheet" class="sheet hidden" aria-hidden="true">
+    <button class="sheet-backdrop" type="button" aria-label="Cerrar" onclick="closeSheet()"></button>
+    <section class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="sheet-header">
+        <div>
+          <div id="sheetEyebrow" class="sheet-eyebrow"></div>
+          <h2 id="sheetTitle">Detalle</h2>
+        </div>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="closeSheet()">Cerrar</button>
+      </div>
+      <div id="sheetBody" class="sheet-body"></div>
+      <div id="sheetFooter" class="sheet-footer"></div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="coffeecontrol-gerente.js?v=2"></script>
+</body>
+</html>

@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.ieasrl.coffeecontrol.tecnico.BuildConfig
 import com.ieasrl.coffeecontrol.tecnico.data.BackendException
 import com.ieasrl.coffeecontrol.tecnico.data.CardLookupResponse
+import com.ieasrl.coffeecontrol.tecnico.data.CompanyProfile
 import com.ieasrl.coffeecontrol.tecnico.data.EmployeeSearchItemDto
 import com.ieasrl.coffeecontrol.tecnico.data.MachineStockResponse
 import com.ieasrl.coffeecontrol.tecnico.data.MachineSummaryDto
@@ -19,6 +20,7 @@ import com.ieasrl.coffeecontrol.tecnico.data.TechnicianBackend
 import com.ieasrl.coffeecontrol.tecnico.data.WifiScanNetworkDto
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 sealed interface AuthState {
     data object Loading : AuthState
@@ -34,9 +36,12 @@ enum class TagScanMode {
 
 data class TechnicianAppState(
     val authState: AuthState = AuthState.Loading,
+    val companies: List<CompanyProfile> = emptyList(),
+    val selectedCompanyId: String? = null,
     val baseUrl: String = BuildConfig.DEFAULT_BACKEND_URL,
     val loginUsername: String = "",
     val loginPassword: String = "",
+    val loginPasswordVisible: Boolean = false,
     val biometricsAvailable: Boolean = false,
     val enableBiometrics: Boolean = true,
     val isBusy: Boolean = false,
@@ -87,8 +92,70 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
         state = state.copy(loginPassword = value)
     }
 
+    fun toggleLoginPasswordVisibility() {
+        state = state.copy(loginPasswordVisible = !state.loginPasswordVisible)
+    }
+
     fun updateBaseUrl(value: String) {
         state = state.copy(baseUrl = value)
+    }
+
+    fun selectCompany(companyId: String) {
+        val company = state.companies.find { it.id == companyId } ?: return
+        sessionStore.saveSelectedCompanyId(company.id)
+        state = state.copy(
+            selectedCompanyId = company.id,
+            baseUrl = company.baseUrl
+        )
+    }
+
+    fun addCompany(name: String, baseUrl: String) {
+        val trimmedName = name.trim()
+        val trimmedBaseUrl = baseUrl.trim()
+        if (trimmedName.isBlank() || trimmedBaseUrl.isBlank()) {
+            state = state.copy(errorMessage = "Completá nombre y backend de la empresa")
+            return
+        }
+        viewModelScope.launch {
+            val profile = CompanyProfile(
+                id = UUID.randomUUID().toString(),
+                name = trimmedName,
+                baseUrl = trimmedBaseUrl
+            )
+            val updated = (state.companies + profile).sortedBy { it.name.lowercase() }
+            sessionStore.saveCompanies(updated)
+            sessionStore.saveSelectedCompanyId(profile.id)
+            backend.rememberBackendUrl(profile.baseUrl)
+            state = state.copy(
+                companies = updated,
+                selectedCompanyId = profile.id,
+                baseUrl = profile.baseUrl,
+                infoMessage = "Empresa ${profile.name} agregada"
+            )
+        }
+    }
+
+    fun switchCompanyContext() {
+        viewModelScope.launch {
+            runCatching { backend.logoutCurrent() }
+            state = state.copy(
+                authState = AuthState.LoggedOut,
+                machines = emptyList(),
+                pendingMachines = emptyList(),
+                selectedMachine = null,
+                machineStock = null,
+                remoteWifiNetworks = emptyList(),
+                remoteWifiStatus = null,
+                remoteWifiBusy = false,
+                employeeResults = emptyList(),
+                selectedEmployee = null,
+                tagLookup = null,
+                lastScannedUid = null,
+                loginPassword = "",
+                loginPasswordVisible = false,
+                infoMessage = "Seleccioná la empresa a atender"
+            )
+        }
     }
 
     fun setMachineSearch(value: String) {
@@ -123,9 +190,14 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
     fun login() {
         val username = state.loginUsername.trim()
         val password = state.loginPassword
-        val baseUrl = state.baseUrl.trim()
+        val company = selectedCompany()
+        val baseUrl = company?.baseUrl?.trim().orEmpty()
+        if (company == null) {
+            state = state.copy(errorMessage = "Seleccioná una empresa antes de ingresar")
+            return
+        }
         if (username.isBlank() || password.isBlank() || baseUrl.isBlank()) {
-            state = state.copy(errorMessage = "Completá backend, usuario y contraseña")
+            state = state.copy(errorMessage = "Completá usuario y contraseña")
             return
         }
 
@@ -135,11 +207,15 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
                     baseUrl = baseUrl,
                     username = username,
                     password = password,
+                    companyId = company.id,
+                    companyName = company.name,
                     biometricEnabled = state.enableBiometrics && state.biometricsAvailable
                 )
+                sessionStore.saveSelectedCompanyId(company.id)
                 state = state.copy(
                     authState = AuthState.Authenticated(session),
                     loginPassword = "",
+                    loginPasswordVisible = false,
                     infoMessage = "Sesión iniciada"
                 )
                 loadMachines()
@@ -166,7 +242,8 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
                 machineStock = null,
                 remoteWifiNetworks = emptyList(),
                 remoteWifiStatus = null,
-                remoteWifiBusy = false
+                remoteWifiBusy = false,
+                loginPasswordVisible = false
             )
         }
     }
@@ -188,6 +265,7 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
                     selectedEmployee = null,
                     tagLookup = null,
                     lastScannedUid = null,
+                    loginPasswordVisible = false,
                     infoMessage = "Sesión cerrada"
                 )
             }
@@ -476,9 +554,12 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
 
     private suspend fun restoreSession() {
         val session = backend.restoreStoredSession()
-        val lastUrl = backend.lastBackendUrl() ?: BuildConfig.DEFAULT_BACKEND_URL
+        val companies = ensureCompanies(session)
+        val selectedCompany = resolveSelectedCompany(companies, session)
         state = state.copy(
-            baseUrl = session?.baseUrl ?: lastUrl,
+            companies = companies,
+            selectedCompanyId = selectedCompany?.id,
+            baseUrl = selectedCompany?.baseUrl ?: session?.baseUrl ?: BuildConfig.DEFAULT_BACKEND_URL,
             authState = when {
                 session == null -> AuthState.LoggedOut
                 session.biometricEnabled -> AuthState.Locked(session)
@@ -552,6 +633,38 @@ class TechnicianAppViewModel(application: Application) : AndroidViewModel(applic
         is AuthState.Locked -> auth.session.user.role
         else -> null
     }
+
+    private suspend fun ensureCompanies(session: StoredSession?): List<CompanyProfile> {
+        val existing = sessionStore.loadCompanies()
+        if (existing.isNotEmpty()) {
+            return existing
+        }
+
+        val fallbackUrl = session?.baseUrl ?: backend.lastBackendUrl() ?: BuildConfig.DEFAULT_BACKEND_URL
+        val bootstrap = listOf(
+            CompanyProfile(
+                id = "default",
+                name = session?.companyName ?: "Instancia principal",
+                baseUrl = fallbackUrl
+            )
+        )
+        sessionStore.saveCompanies(bootstrap)
+        sessionStore.saveSelectedCompanyId(bootstrap.first().id)
+        return bootstrap
+    }
+
+    private fun resolveSelectedCompany(
+        companies: List<CompanyProfile>,
+        session: StoredSession?
+    ): CompanyProfile? {
+        val preferredId = session?.companyId ?: sessionStore.loadSelectedCompanyId()
+        val selected = companies.find { it.id == preferredId } ?: companies.firstOrNull()
+        sessionStore.saveSelectedCompanyId(selected?.id)
+        return selected
+    }
+
+    private fun selectedCompany(): CompanyProfile? =
+        state.companies.find { it.id == state.selectedCompanyId }
 
     private fun canManagePending(role: String?): Boolean =
         role == "admin" || role == "gerente" || role == "distribuidor"

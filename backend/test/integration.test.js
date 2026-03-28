@@ -126,6 +126,7 @@ async function cleanupFixtures() {
                     clauses.push(`machine_id = ANY($${params.length}::int[])`);
                 }
                 await client.query(`DELETE FROM taps WHERE ${clauses.join(' OR ')}`, params);
+                await client.query(`DELETE FROM alert_events WHERE ${clauses.join(' OR ')}`, params);
             }
 
             await client.query(
@@ -561,6 +562,59 @@ test('supervisor no puede acceder a notificaciones ni auditoría', async () => {
     assert.equal(auditLogs.status, 403);
 });
 
+test('alertas activas respetan el alcance de gerente y supervisor', async () => {
+    await withDb(async (client) => {
+        await client.query(
+            `INSERT INTO alert_events(alert_key, alert_type, status, machine_id, employee_id, payload)
+             VALUES
+                ($1, 'employee_limit_warning', 'open', $4, $5, $7::jsonb),
+                ($2, 'employee_daily_blocked', 'open', $4, $6, $8::jsonb),
+                ($3, 'machine_offline', 'open', $4, NULL, $9::jsonb)
+             ON CONFLICT (alert_key) DO UPDATE SET
+                status = EXCLUDED.status,
+                machine_id = EXCLUDED.machine_id,
+                employee_id = EXCLUDED.employee_id,
+                payload = EXCLUDED.payload,
+                last_seen_at = NOW(),
+                resolved_at = NULL`,
+            [
+                `${TEST_PREFIX}_alert_in_scope`,
+                `${TEST_PREFIX}_alert_out_scope`,
+                `${TEST_PREFIX}_alert_machine`,
+                fixture.machine.id,
+                fixture.employees.a.id,
+                fixture.employees.out.id,
+                JSON.stringify({ taps_today: 3, daily_limit: 4, progress_label: '3 / 4' }),
+                JSON.stringify({ deny_reason: 'limit_reached' }),
+                JSON.stringify({ reason: 'test' })
+            ]
+        );
+    });
+
+    const managerAlerts = await requestJson('GET', '/api/alerts/active?limit=10', {
+        token: managerToken
+    });
+    assert.equal(managerAlerts.status, 200);
+    assert.ok(managerAlerts.json.summary.total_open >= 3);
+    assert.ok(managerAlerts.json.alerts.some(alert => alert.alert_key === `${TEST_PREFIX}_alert_in_scope`));
+    assert.ok(managerAlerts.json.alerts.some(alert => alert.alert_key === `${TEST_PREFIX}_alert_out_scope`));
+    assert.ok(managerAlerts.json.alerts.some(alert => alert.alert_key === `${TEST_PREFIX}_alert_machine`));
+
+    const supervisorLogin = await requestJson('POST', '/api/auth/login', {
+        body: {
+            username: fixture.supervisor.username,
+            password: 'coffeecontrol2024'
+        }
+    });
+    const supervisorAlerts = await requestJson('GET', '/api/alerts/active?limit=10', {
+        token: supervisorLogin.json.token
+    });
+    assert.equal(supervisorAlerts.status, 200);
+    assert.ok(supervisorAlerts.json.alerts.some(alert => alert.alert_key === `${TEST_PREFIX}_alert_in_scope`));
+    assert.ok(!supervisorAlerts.json.alerts.some(alert => alert.alert_key === `${TEST_PREFIX}_alert_out_scope`));
+    assert.ok(!supervisorAlerts.json.alerts.some(alert => alert.alert_key === `${TEST_PREFIX}_alert_machine`));
+});
+
 test('gerente puede actualizar notificaciones y queda auditado', async () => {
     const current = await requestJson('GET', '/api/notification-settings', { token: managerToken });
     assert.equal(current.status, 200);
@@ -990,7 +1044,11 @@ test('gerente puede ver reportes de stock con resumen y movimientos', async () =
     });
     assert.equal(restocked.status, 200);
 
-    const today = new Date().toISOString().slice(0, 10);
+    const dashboardToday = await requestJson('GET', '/api/dashboard/today', {
+        token: managerToken
+    });
+    assert.equal(dashboardToday.status, 200);
+    const today = dashboardToday.json.business_date;
     const report = await requestJson('GET', `/api/reports/stock?from=${today}&to=${today}`, {
         token: managerToken
     });

@@ -75,7 +75,11 @@ backend/
 coffeecontrol-admin.html    ← Panel de administración completo
 coffeecontrol.html          ← Monitor operativo liviano (solo lectura, sesión compartida)
 coffeecontrol-tecnico.html  ← App técnico PWA móvil (máquinas, stock, WiFi, onboarding)
+coffeecontrol-gerente.html  ← App gerente PWA móvil (inicio, máquinas, reportes, alertas)
 coffeecontrol-tecnico-android/ ← App técnico Android nativa (base real para NFC + biometría)
+coffeecontrol-gerente.js/css/webmanifest/sw/icon.svg ← Assets de la app gerente PWA
+app-gerente-mockup.html     ← Mockup dedicado de la app gerente móvil
+ARQUITECTURA_APP_GERENTE_MOVIL.md ← Alcance y arquitectura V1 para la app gerente
 ```
 
 ---
@@ -315,6 +319,34 @@ Estado actual:
 Referencia técnica:
 
 - [ARQUITECTURA_APP_TECNICO_ANDROID.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/ARQUITECTURA_APP_TECNICO_ANDROID.md)
+
+### App gerente móvil
+
+Abrir `http://<ip-servidor>:3000/coffeecontrol-gerente.html` desde el celular.
+
+Esta app ya existe como **PWA móvil ejecutiva** para `admin`, `gerente` y `supervisor`, separada de la operación técnica.
+Hoy queda como **prototipo funcional / referencia de producto**, no como dirección final cerrada.
+
+Incluye:
+
+- selector de empresa antes del login, con perfiles locales por backend/cliente
+- sesión recordada por empresa
+- mostrar / ocultar contraseña en login
+- tabs `Inicio`, `Máquinas`, `Reportes` y `Alertas`
+- pantalla `Inicio` con resumen del día, alertas abiertas, focos operativos y consumo destacado
+- `Máquinas` con búsqueda, filtros y detalle ejecutivo
+- `Reportes` rápidos por rango usando los endpoints ya existentes
+- `Alertas` activas usando `GET /api/alerts/active`
+- `Sesión` para cambiar empresa, abrir el panel web o cerrar sesión
+- estética móvil clara y ejecutiva, distinta de la app técnico
+
+Importante:
+
+- no copia 1:1 el panel de PC
+- no mezcla stock, TAGs ni soporte técnico de campo
+- la operación de máquinas, stock, WiFi y credenciales sigue quedando en la app técnico
+- el mockup dedicado en [app-gerente-mockup.html](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/app-gerente-mockup.html) y la arquitectura en [ARQUITECTURA_APP_GERENTE_MOVIL.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/ARQUITECTURA_APP_GERENTE_MOVIL.md) quedan como referencia de diseño/evolución
+- decisión actual: la experiencia objetivo para gerente debería evolucionar a **app nativa**, no quedarse en PWA
 
 ### Estado de red por máquina
 
@@ -685,10 +717,10 @@ Acceso:
 - [x] Scripts DB y soporte (`db:migrate:all`, `support:doctor`, reseteo/alta de usuarios del panel)
 - [x] Tests de integración mínimos (`npm run test:integration`)
 - [~] App técnico Android nativa (operativa en teléfono real; falta pulido UX y validación en vivo de WiFi/pending)
+- [~] App gerente móvil: PWA V1 implementada como prototipo; siguiente dirección recomendada, app nativa
 - [ ] OTA (Over The Air) — actualización de firmware desde el panel
 - [ ] Multi-tenant para modo SaaS (campo `tenant_id`, schema por empresa)
 - [ ] Mapa de máquinas con estado en tiempo real
-- [ ] PWA / app móvil para el gerente
 - [ ] Seguridad payload MDB: XOR + timestamp contra replay attacks
 
 ---

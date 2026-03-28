@@ -24,6 +24,8 @@ data class SessionUser(
 
 @Serializable
 data class StoredSession(
+    val companyId: String? = null,
+    val companyName: String? = null,
     val baseUrl: String,
     val accessToken: String,
     val refreshToken: String,
@@ -31,6 +33,13 @@ data class StoredSession(
     val lastAuthenticatedAt: Long,
     val biometricEnabled: Boolean,
     val user: SessionUser
+)
+
+@Serializable
+data class CompanyProfile(
+    val id: String,
+    val name: String,
+    val baseUrl: String
 )
 
 class SecureSessionStore(private val context: Context) {
@@ -56,11 +65,26 @@ class SecureSessionStore(private val context: Context) {
         prefs.edit().remove(KEY_SESSION).apply()
     }
 
+    suspend fun loadCompanies(): List<CompanyProfile> = withContext(Dispatchers.IO) {
+        val raw = prefs.getString(KEY_COMPANIES, null) ?: return@withContext emptyList()
+        runCatching { json.decodeFromString<List<CompanyProfile>>(raw) }.getOrDefault(emptyList())
+    }
+
+    suspend fun saveCompanies(companies: List<CompanyProfile>) = withContext(Dispatchers.IO) {
+        prefs.edit().putString(KEY_COMPANIES, json.encodeToString(companies)).apply()
+    }
+
     fun saveLastBackendUrl(baseUrl: String) {
         prefs.edit().putString(KEY_LAST_BASE_URL, baseUrl).apply()
     }
 
     fun loadLastBackendUrl(): String? = prefs.getString(KEY_LAST_BASE_URL, null)
+
+    fun saveSelectedCompanyId(companyId: String?) {
+        prefs.edit().putString(KEY_SELECTED_COMPANY_ID, companyId).apply()
+    }
+
+    fun loadSelectedCompanyId(): String? = prefs.getString(KEY_SELECTED_COMPANY_ID, null)
 
     private fun encrypt(plaintext: String): String {
         val cipher = Cipher.getInstance(TRANSFORMATION).apply {
@@ -104,7 +128,9 @@ class SecureSessionStore(private val context: Context) {
     companion object {
         private const val PREF_NAME = "coffeecontrol_tecnico_secure"
         private const val KEY_SESSION = "encrypted_session"
+        private const val KEY_COMPANIES = "company_profiles"
         private const val KEY_LAST_BASE_URL = "last_backend_url"
+        private const val KEY_SELECTED_COMPANY_ID = "selected_company_id"
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val KEY_ALIAS = "coffeecontrol_tecnico_session"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"

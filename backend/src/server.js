@@ -23,6 +23,7 @@ const notificationSettingsRoutes = require('./routes/notificationSettings');
 const systemSettingsRoutes = require('./routes/systemSettings');
 const auditLogsRoutes = require('./routes/auditLogs');
 const mobileTechRoutes = require('./routes/mobileTech');
+const alertsRoutes = require('./routes/alerts');
 
 const app = express();
 app.use(express.json());
@@ -65,6 +66,7 @@ app.use('/api/notification-settings', authJwt, notificationSettingsRoutes);
 app.use('/api/system-settings', authJwt, systemSettingsRoutes);
 app.use('/api/audit-logs', authJwt, auditLogsRoutes);
 app.use('/api/mobile-tech', authJwt, mobileTechRoutes);
+app.use('/api/alerts', authJwt, alertsRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 

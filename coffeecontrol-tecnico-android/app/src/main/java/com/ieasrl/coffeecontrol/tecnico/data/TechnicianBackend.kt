@@ -389,6 +389,8 @@ class TechnicianBackend(
         baseUrl: String,
         username: String,
         password: String,
+        companyId: String? = null,
+        companyName: String? = null,
         biometricEnabled: Boolean
     ): StoredSession {
         val normalizedBaseUrl = normalizeBaseUrl(baseUrl)
@@ -401,6 +403,8 @@ class TechnicianBackend(
             )
         )
         val stored = StoredSession(
+            companyId = companyId,
+            companyName = companyName,
             baseUrl = normalizedBaseUrl,
             accessToken = response.access_token,
             refreshToken = response.refresh_token,

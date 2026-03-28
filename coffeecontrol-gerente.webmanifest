@@ -1,0 +1,16 @@
+{
+  "name": "CoffeeControl Gerente",
+  "short_name": "CC Gerente",
+  "start_url": "/coffeecontrol-gerente.html",
+  "display": "standalone",
+  "background_color": "#efe8dc",
+  "theme_color": "#1389d5",
+  "icons": [
+    {
+      "src": "/coffeecontrol-gerente-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -607,8 +607,11 @@ Pendiente de esta mejora:
 Origen: necesidad de consultar y operar el sistema desde celular sin depender del panel de escritorio
 
 Estado:
-- Pendiente.
-- Mockup conceptual preparado en `app-mobile-mockups.html/.png/.pdf`.
+- Implementada como PWA V1 en `coffeecontrol-gerente.html`.
+- Mockup dedicado preparado en `app-gerente-mockup.html`.
+- Arquitectura V1 definida en `ARQUITECTURA_APP_GERENTE_MOVIL.md`.
+- Backend read-only complementario en `GET /api/alerts/active`.
+- Decisión actual: esta PWA queda como prototipo funcional y la dirección siguiente pasa a app gerente nativa.
 
 Resultado esperado:
 - Acceso móvil al resumen del día.
@@ -619,6 +622,17 @@ Enfoque recomendado:
 - primera etapa como PWA o app móvil liviana
 - reutilizando backend, JWT y lógica de roles ya existente
 - foco en consulta y operación rápida, no en administración completa
+
+Incluye en esta V1:
+- selector de empresa antes del login
+- sesión local por empresa/backend
+- login con mostrar/ocultar contraseña
+- tabs `Inicio`, `Máquinas`, `Reportes` y `Alertas`
+- `Sesión` para cambiar empresa, abrir panel web o cerrar sesión
+
+Pendiente de esta mejora:
+- definir arquitectura de la app gerente nativa
+- decidir stack, autenticación móvil y roadmap de pantallas para esa versión nativa
 
 ### 32. App móvil para empleado
 Origen: necesidad de que el empleado tenga experiencia digital propia y, más adelante, eventualmente reemplace el TAG físico
@@ -686,7 +700,7 @@ Nota técnica importante:
 29. [x] Rol distribuidor para instalación y soporte.
 
 ### Fase G — Movilidad
-30. [ ] App móvil para gerente.
+30. [~] App gerente móvil: PWA V1 hecha, próximo paso nativo.
 31. [ ] App móvil para empleado.
 
 ## Recomendación práctica
@@ -704,9 +718,8 @@ Ese bloque da mucho valor rápido y prepara bien el terreno para la reconfigurac
 
 Si retomamos desde donde quedó el proyecto, el orden que más sentido tiene sería:
 1. Validación de piloto en campo con `CHECKLIST_PILOTO.md` y `PROTOCOLO_PRUEBAS.md`.
-2. Definir alcance y arquitectura de la app móvil para gerente.
-3. Definir alcance de la app móvil para empleado fase 1.
-4. Dejar el reemplazo del TAG por credencial móvil como laboratorio posterior.
+2. Definir alcance de la app móvil para empleado fase 1.
+3. Dejar el reemplazo del TAG por credencial móvil como laboratorio posterior.
 
 Razón:
 - El producto actual ya cubre bien el escenario objetivo de piloto.
