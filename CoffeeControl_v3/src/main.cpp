@@ -1,3 +1,5 @@
+#define DEBUG_MDB_LOG 1
+
 /*
  * CoffeeControl — Firmware ESP32-C3 v3
  * ─────────────────────────────────────────────────────
@@ -59,8 +61,8 @@
 #define PIN_LED       10
 #define PIN_LED_ONBOARD 8   // LED onboard azul del Super Mini (activo LOW, usar solo post-boot)
 #define PIN_BOOT_BTN   9   // BOOT button: pull-up interno, LOW = presionado
-#define PIN_MDB_TX    20   // GPIO20/21: UART0 nativo (no hay beneficio de HW
-#define PIN_MDB_RX    21   // para MDB 9-bit — ESP32-C3 max 8-bit en hardware)
+#define PIN_MDB_TX    20   // TX = GPIO20 (salida al bus MDB)
+#define PIN_MDB_RX    21   // RX = GPIO21 (entrada del bus, invertido por transistor)
 
 // ── Modo de deployment ────────────────────────────────
 // Opción B — servidor local (URL configurable en el portal)
@@ -81,8 +83,10 @@
 #define MDB_CMD_POLL       0x02
 #define MDB_CMD_VEND       0x03
 #define MDB_CMD_READER     0x04
+#define MDB_CMD_EXPANSION  0x07
 #define SETUP_CONFIG       0x00
 #define SETUP_PRICES       0x01
+#define EXPANSION_REQUEST_ID 0x00
 #define VEND_REQUEST       0x00
 #define VEND_CANCEL        0x01
 #define VEND_SUCCESS       0x02
@@ -98,7 +102,7 @@
 #define MDB_VEND_DENIED    0x06
 #define MDB_END_SESSION    0x07
 #define MDB_CANCELLED      0x08
-#define FUNDS_UNLIMITED    0xFFFF
+#define FUNDS_UNLIMITED    0x0258   // 600 MDB units → VMC muestra 1200
 
 // ── Timing ────────────────────────────────────────────
 #define NFC_COOLDOWN_MS    2500
@@ -150,14 +154,14 @@ RTC_DS3231  rtc;
 Preferences prefs;
 
 // ── Estado MDB ────────────────────────────────────────
-MDBState mdbState      = INACTIVE;
+volatile MDBState mdbState = INACTIVE;
 bool     justReset     = true;
 bool     pendingSession = false;
 bool     vendApproved  = false;
-uint16_t vendAmount    = 0;
+uint16_t vendAmount    = 1200;
 String   sessionUID    = "";
 uint16_t sessionItemId = 0;
-uint16_t sessionAmount = 0;
+uint16_t sessionAmount = 1200;
 bool     vendUsed      = false;
 bool     sessionIsOffline = false;
 unsigned long lastNFCRead    = 0;
@@ -1585,33 +1589,80 @@ void handleNFC() {
 // ══════════════════════════════════════════════════════
 //  MDB handlers
 // ══════════════════════════════════════════════════════
-void mdbSendACK()  { mdb.sendData(MDB_ACK); }
-void mdbSendNAK()  { mdb.sendData(MDB_NAK); }
-void mdbSendByte(uint8_t b) { mdb.sendData(b); mdb.sendData(b); }
+void mdbSendACK()  {
+#if DEBUG_MDB
+    Serial.printf("[MDB][TX] ACK (0x%02X) mode=1\n", MDB_ACK);
+#endif
+    mdb.sendAddress(MDB_ACK);  // ACK = 0x00 con 9no bit = 1
+}
+void mdbSendNAK()  {
+#if DEBUG_MDB
+    Serial.printf("[MDB][TX] NAK (0x%02X) mode=1\n", MDB_NAK);
+#endif
+    mdb.sendAddress(MDB_NAK);  // NAK = 0xFF con 9no bit = 1
+}
+void mdbSendByte(uint8_t b) {
+#if DEBUG_MDB
+    Serial.printf("[MDB][TX] Byte: 0x%02X\n", b);
+#endif
+    mdb.sendData(b);        // data con mode=0
+    mdb.sendAddress(b);     // checksum con mode=1
+}
 void mdbSendData(uint8_t* data, uint8_t len) {
     uint8_t chk = 0;
-    for (uint8_t i = 0; i < len; i++) { mdb.sendData(data[i]); chk += data[i]; }
-    mdb.sendData(chk);
+    for (uint8_t i = 0; i < len; i++) {
+#if DEBUG_MDB
+        Serial.printf("[MDB][TX] Data[%d]: 0x%02X\n", i, data[i]);
+#endif
+        mdb.sendData(data[i]); chk += data[i];
+    }
+#if DEBUG_MDB
+    Serial.printf("[MDB][TX] CHK: 0x%02X mode=1\n", chk);
+#endif
+    mdb.sendAddress(chk);  // Checksum con 9no bit = 1
 }
 
 void cmdReset() {
-    Serial.println("[MDB] RESET recibido → INACTIVE");
     mdbState = INACTIVE; justReset = true; pendingSession = false;
     vendApproved = false; vendUsed = false;
     sessionUID = ""; sessionIsOffline = false;
     mdbSendACK();
+    Serial.printf("[MDB] RESET recibido → INACTIVE (TX pin=%d)\n", PIN_MDB_TX);
 }
 
 void cmdSetup(uint8_t* d, uint8_t len) {
     if (len == 0) { mdbSendNAK(); return; }
+    Serial.printf("[MDB] VMC SETUP data: len=%d", len);
+    for (int i = 0; i < len; i++) Serial.printf(" %02X", d[i]);
+    Serial.println();
     if (d[0] == SETUP_CONFIG) {
         Serial.println("[MDB] SETUP config → MDB_DISABLED");
-        uint8_t r[] = {0x02, 0x00, 0x24, 0x01, 0x02, 0x0A, 0x00};
+        // Feature Level 1 + Country Code Argentina (032).
+        // Scale=100, DecimalPlaces=2 → funds×100 centavos
+        uint8_t r[] = {0x01, 0x00, 0x32, 0x64, 0x02, 0x05, 0x00};
         mdbSendData(r, sizeof(r));
         mdbState = MDB_DISABLED;
     } else {
         mdbSendACK();
     }
+}
+
+void cmdExpansion(uint8_t* d, uint8_t len) {
+    if (len == 0) { mdbSendNAK(); return; }
+
+    if (d[0] == EXPANSION_REQUEST_ID) {
+        Serial.println("[MDB] EXPANSION REQUEST_ID");
+        uint8_t r[30];
+        memset(r, ' ', sizeof(r));
+        r[0] = 0x09;  // Peripheral ID
+        memcpy(&r[1], "SFT", 3);
+        r[28] = 0x00;
+        r[29] = 0x01;
+        mdbSendData(r, sizeof(r));
+        return;
+    }
+
+    mdbSendACK();
 }
 
 void cmdPoll() {
@@ -1631,6 +1682,7 @@ void cmdPoll() {
 
         case SESSION_IDLE:
             if (pendingSession) {
+                Serial.printf("[MDB] BEGIN SESSION → funds=0x%04X\n", FUNDS_UNLIMITED);
                 uint8_t r[3] = {MDB_BEGIN_SESSION,
                                 (FUNDS_UNLIMITED >> 8) & 0xFF,
                                  FUNDS_UNLIMITED        & 0xFF};
@@ -1679,6 +1731,7 @@ void cmdVend(uint8_t* d, uint8_t len) {
                     mdbState = VEND_PENDING;
                 }
             }
+            mdbSendACK();
             break;
 
         case VEND_SUCCESS:
@@ -1751,26 +1804,50 @@ void cmdReader(uint8_t* d, uint8_t len) {
 void handleMDB() {
     uint16_t first = mdb.read(2);
     if (first == 0xFFFF) return;
-    if (!MDB9bit::isAddress(first)) return;
 
+    unsigned long t0 = micros();  // timing debug
+
+    // Filtrar: solo procesar cashless
+    if (!MDB9bit::isAddress(first)) return;
     uint8_t addr = MDB9bit::value(first);
     if ((addr & 0xF8) != MDB_ADDR_CASHLESS) return;
 
-    uint8_t  cmd = addr & 0x07;
+    uint8_t cmd = addr & 0x07;
+
+    // RESET no tiene sub-data relevante → ACK inmediato (sin readFrame)
+    if (cmd == MDB_CMD_RESET) {
+        // Drenar checksum byte que ya está en el ring buffer
+        mdb.read(1);
+        cmdReset();
+        unsigned long dt = micros() - t0;
+        Serial.printf("[MDB] RESET → ACK inmediato dt=%luus\n", dt);
+        return;
+    }
+
+    // Para otros comandos, leer el frame completo
     uint16_t dataBuf[16];
-    uint8_t  dataLen = mdb.readFrame(dataBuf, 16, 3);
+    uint8_t  dataLen = mdb.readFrame(dataBuf, 16, 1);
 
     uint8_t d[16];
-    for (uint8_t i = 0; i < dataLen; i++) d[i] = MDB9bit::value(dataBuf[i]);
+    for (uint8_t i = 0; i < dataLen; i++) {
+        d[i] = MDB9bit::value(dataBuf[i]);
+    }
 
+    // ── Responder al VMC (deadline ≤5ms) ──
     switch (cmd) {
-        case MDB_CMD_RESET:  cmdReset();            break;
         case MDB_CMD_SETUP:  cmdSetup(d, dataLen);  break;
         case MDB_CMD_POLL:   cmdPoll();             break;
         case MDB_CMD_VEND:   cmdVend(d, dataLen);   break;
         case MDB_CMD_READER: cmdReader(d, dataLen); break;
+        case MDB_CMD_EXPANSION: cmdExpansion(d, dataLen); break;
         default: mdbSendNAK(); break;
     }
+
+    // ── Después de responder, loguear ──
+    unsigned long dt = micros() - t0;
+#if DEBUG_MDB_LOG
+    Serial.printf("[MDB] cmd=%d dt=%luus\n", cmd, dt);
+#endif
 }
 
 
@@ -1834,7 +1911,15 @@ void setup() {
 
     // MDB 9-bit software serial
     mdb.begin();
-    Serial.println("[MDB] 9-bit software serial listo (TX=GPIO20, RX=GPIO21)");
+    Serial.println("[MDB] UART HW listo (TX=GPIO20, RX=GPIO21)");
+
+    // Arrancar tarea MDB independiente para responder al VMC durante boot
+    extern void handleMDB();
+    xTaskCreatePinnedToCore(
+        [](void*) { for (;;) { handleMDB(); vTaskDelay(1); } },
+        "mdb_cmd", 4096, NULL, 4, NULL, 1
+    );
+    Serial.println("[MDB] Tarea MDB command handler iniciada");
 
     // WiFi
     readConfig();
@@ -1887,8 +1972,7 @@ void loop() {
         return;
     }
 
-    // Modo normal: MDB + NFC
-    handleMDB();
+    // Modo normal: NFC (MDB ahora corre en tarea independiente)
     handleNFC();
 
     // ── Fix Bug 5: timeout SESSION_IDLE ──────────────
