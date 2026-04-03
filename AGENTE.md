@@ -1,8 +1,10 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 27/03/2026 — backend móvil fase 1 (`mobile-auth` + `mobile-tech`) y app técnico Android nativa ya compilando con `Gradle 8.13` y validada en teléfono real para login, biometría, máquinas, stock y TAGs; además suma `WiFi remoto` y `Pendientes`, y ahora también existe la **app gerente PWA** con selector de empresa, `Inicio / Máquinas / Reportes / Alertas` y ruta backend read-only `GET /api/alerts/active`. Esa PWA queda como prototipo funcional; la dirección de producto consensuada pasa a una futura **app gerente nativa**.
+> Última actualización: 03/04/2026 — ya quedó iniciada la etapa `DeviceConfig + PricingConfig` en `CoffeeControl_v3`: se limpió el ruido MDB, el portal ya guarda precio humano editable (`1200`), el backend ya persiste `machines.price_cents`, el registro de máquina devuelve la config efectiva y el panel puede editar precio con sincronización remota (`config_update`) cuando la máquina está online. Además ya quedó implementado un `event log` compacto de 64 entradas en RAM, accesible por `GET /diag/events` cuando el portal del ESP está activo, la cola offline ya migró a journal append-only (`/queue.log`) con migración automática desde `queue.json`, el firmware ya corre con `task watchdog` conservador de `20s` sobre `loopTask` + tarea MDB, la UI del portal ya fue desacoplada del `main.cpp` hacia `CoffeeControl_v3/data/portal/` con fallback mínimo si falta `uploadfs`, ya existe captura de `SETUP` MDB como hint de compatibilidad disponible en `GET /diag/mdb`, y el runtime MDB principal ahora quedó consolidado en una sola estructura `MdbRuntimeState` sin cambiar todavía la secuencia visible del protocolo. El timing MDB sigue fuera del bloque inicial. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
 >
-> **Punto de restauración:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
+> **Punto de restauración general:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
+>
+> **Punto de restauración firmware:** tag `firmware-baseline-2026-04-03` sobre commit `7af6afa`.
 
 ---
 
@@ -13,6 +15,15 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 ---
 
 ## Decisiones de arquitectura tomadas
+
+### Plan activo del firmware v3
+- Ver [PLAN_FIRMWARE_V3_HARDENING.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PLAN_FIRMWARE_V3_HARDENING.md)
+- Regla actual: no tocar timing MDB en la primera etapa
+- Regla actual: el usuario edita precio humano; el firmware convierte a unidades MDB
+- Estado actual: `event_log.*` ya agregado con ring buffer fijo de 64 eventos
+- Estado actual: `offline_queue.*` ya agregado con journal append-only y compactación post-flush
+- Estado actual: watchdog ya agregado con reset reason visible al boot
+- Estado actual: portal con botones `Ver eventos` / `Ver setup MDB` y snapshot remoto `diagnostics_snapshot` disponible desde panel/backend para usuarios técnicos
 
 ### Hardware por máquina (v2 — target de producción)
 - **Microcontrolador:** ESP32-C3 Super Mini — ~$2-3 USD
@@ -38,8 +49,8 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 |---|---|---|
 | Heap libre | ~30KB | ~380KB |
 | Pines I2C | Ocupados por MDB | GPIO8/GPIO10 libres |
-| UART hardware | 1 (debug) | 2 — UART1 libre para MDB |
-| MDB 9-bit | Bit-banging (SoftwareSerial) | UART1 nativo — más robusto |
+| UART hardware | 1 (debug) | 2, pero MDB sigue por bit-banging |
+| MDB 9-bit | Bit-banging (SoftwareSerial) | Bit-banging `MDB9bit.h` con `IRAM_ATTR` |
 | RTC DS3231 | ❌ Sin pines | ✅ I2C libre |
 | Max tarjetas cache | 200 (seguro) | 2000+ |
 | Max cola offline | 100 (seguro) | 1000+ |
@@ -65,9 +76,11 @@ Se subió código de **VMflow.xyz** (ESP32-S3 + MDB + BLE + MQTT). Decisión: no
   - El backend autentica buscando esa MAC en la tabla `machines`
 
 ### Configuración WiFi y URL del servidor
-- **Portal cautivo:** el ESP levanta un AP `CoffeeControl-Setup`, el cliente/técnico se conecta con el celular, un portal web recibe SSID + password + URL del servidor
-- Los tres valores se guardan en **EEPROM** y persisten entre reinicios
-- **Botón de reset físico:** pin D0 con pulsador a GND, mantener 5 segundos al encender borra EEPROM y vuelve al portal
+- **Portal cautivo:** el ESP levanta un AP `CoffeeControl-Setup`, el cliente/técnico se conecta con el celular y el portal recibe SSID + password + URL del servidor + precio humano
+- La configuración se guarda en **Preferences/NVS** y persiste entre reinicios
+- La UI del portal ya no vive embebida en `main.cpp`; ahora se sirve desde `CoffeeControl_v3/data/portal/` cargado en `LittleFS`
+- Si el filesystem no está cargado, el firmware expone un portal de emergencia mínimo para no bloquear la instalación
+- **Botón BOOT (GPIO9):** mantener 5 segundos con el firmware ya iniciado abre el portal sin borrar la configuración guardada
 - **Modo deployment** se elige en tiempo de compilación con `#define DEPLOYMENT_MODE`:
   - `"local"` → el portal muestra el campo URL del servidor (técnico lo configura en cada instalación)
   - `"saas"` → el portal oculta el campo URL, usa siempre `BACKEND_URL` hardcodeada (todos los ESP apuntan al mismo servidor en la nube)
@@ -277,21 +290,24 @@ NOTA: D1/D2 (I2C estándar) ocupados por MDB → sin RTC DS3231 posible
 
 ### ESP32-C3 Super Mini — target de producción
 ```
-ESP32-C3 Super Mini  (GPIOs disponibles: 0-10; GPIO18/19 = USB interno, no expuestos)
+ESP32-C3 Super Mini
 
-RC522 (SPI hardware):           MDB (UART1 hardware — 9-bit nativo):
-  SS    → GPIO3                  TX → GPIO6 → MAX3232 T1IN → bus MDB
-  SCK   → GPIO0                  RX → GPIO5 ← MAX3232 R1OUT ← bus MDB
+RC522 (SPI hardware):           MDB (bit-banging, IRAM_ATTR):
+  SS    → GPIO4                  TX → GPIO20 → MAX3232 T1IN → bus MDB
+  SCK   → GPIO0                  RX → GPIO21 ← MAX3232 R1OUT ← bus MDB
   MOSI  → GPIO1
-  MISO  → GPIO2                DS3231 RTC (I2C — ahora posible):
-  RST   → GPIO4                  SDA → GPIO8
-  VCC   → 3.3V (¡no 5V!)        SCL → GPIO10
-  GND   → GND                    VCC → 3.3V / GND → GND
+  MISO  → GPIO3                DS3231 RTC (I2C):
+  RST   → GPIO7                  SDA → GPIO5
+  VCC   → 3.3V (¡no 5V!)        SCL → GPIO6
+  GND   → GND
 
-LED de estado → GPIO7
-Reset lógico  → GPIO9 (botón BOOT integrado — no usar como GPIO de entrada normal)
+LED externo   → GPIO10
+LED onboard   → GPIO8 (solo post-boot)
+Portal/BOOT   → GPIO9 (pull-up interno, LOW = presionado)
 
-Total pines usados: 10 de 11 disponibles
+No usar para perifericos externos:
+- GPIO2 (strapping)
+- GPIO18/19 (USB D-/D+)
 ```
 
 ---
@@ -416,7 +432,7 @@ Total pines usados: 10 de 11 disponibles
 
 | Componente | ESP8266 (actual) | ESP32-C3 (target) |
 |---|---|---|
-| MDB 9-bit | `MDB9bit.h` bit-banging SoftwareSerial | `HardwareSerial Serial1` con 9-bit nativo |
+| MDB 9-bit | `MDB9bit.h` bit-banging SoftwareSerial | `MDB9bit.h` bit-banging con `IRAM_ATTR` |
 | Filesystem | `#include <FS.h>` SPIFFS | `#include <LittleFS.h>` (mejor wear leveling) |
 | RTC | No disponible | DS3231 via I2C + librería RTClib (Adafruit) |
 | Hora offline | NTP único | DS3231 primario + NTP fallback |
@@ -434,7 +450,7 @@ Total pines usados: 10 de 11 disponibles
 ### Pasos concretos de migración
 1. Crear `CoffeeControl_v3/` con `platformio.ini` (environments: `esp8266` + `esp32c3`)
 2. Copiar lógica de `CoffeeControl_v2.ino` a `src/main.cpp`
-3. Reescribir `MDB9bit.h` para usar `Serial1.begin(9600, SERIAL_8N1)` con 9-bit en ESP32
+3. Mantener `MDB9bit.h` en ESP32-C3 con bit-banging e `IRAM_ATTR` porque el C3 no expone 9-bit por UART hardware
 4. Cambiar includes WiFi/HTTP con `#ifdef ESP32` / `#elif defined(ESP8266)`
 5. Cambiar `SPIFFS` → `LittleFS`
 6. Redefinir pines con el nuevo mapa GPIO

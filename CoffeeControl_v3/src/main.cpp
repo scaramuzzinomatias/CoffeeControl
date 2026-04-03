@@ -1,4 +1,28 @@
-#define DEBUG_MDB_LOG 1
+#define DEBUG_MDB_EVENTS  0  // eventos de alto nivel en la ruta MDB
+#define DEBUG_MDB_TRACE   0  // bytes TX/RX y dumps detallados
+#define DEBUG_MDB_TIMING  0  // medicion fina de duracion por comando
+
+#if DEBUG_MDB_EVENTS
+#define MDB_LOG_EVENT(...) do { Serial.printf(__VA_ARGS__); } while (0)
+#define MDB_LOG_EVENTLN(msg) do { Serial.println(msg); } while (0)
+#else
+#define MDB_LOG_EVENT(...) do {} while (0)
+#define MDB_LOG_EVENTLN(msg) do {} while (0)
+#endif
+
+#if DEBUG_MDB_TRACE
+#define MDB_LOG_TRACE(...) do { Serial.printf(__VA_ARGS__); } while (0)
+#define MDB_LOG_TRACELN(msg) do { Serial.println(msg); } while (0)
+#else
+#define MDB_LOG_TRACE(...) do {} while (0)
+#define MDB_LOG_TRACELN(msg) do {} while (0)
+#endif
+
+#if DEBUG_MDB_TIMING
+#define MDB_LOG_TIMING(...) do { Serial.printf(__VA_ARGS__); } while (0)
+#else
+#define MDB_LOG_TIMING(...) do {} while (0)
+#endif
 
 /*
  * CoffeeControl — Firmware ESP32-C3 v3
@@ -48,7 +72,13 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <RTClib.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 #include "MDB9bit.h"
+#include "pricing.h"
+#include "device_config.h"
+#include "event_log.h"
+#include "offline_queue.h"
 
 // ── Pines ─────────────────────────────────────────────
 #define PIN_SPI_SCK    0
@@ -102,19 +132,20 @@
 #define MDB_VEND_DENIED    0x06
 #define MDB_END_SESSION    0x07
 #define MDB_CANCELLED      0x08
-#define FUNDS_UNLIMITED    0x0258   // 600 MDB units → VMC muestra 1200
 
 // ── Timing ────────────────────────────────────────────
 #define NFC_COOLDOWN_MS    2500
 #define HTTP_TIMEOUT_MS    4000
 #define SESSION_TIMEOUT_MS 12000
 #define COMMAND_POLL_MS    15000
+#define WATCHDOG_TIMEOUT_SEC 20
 
 // ── Offline ───────────────────────────────────────────
 #define MAX_CARDS          1500   // límite práctico (~100KB ArduinoJson doc)
 #define MAX_QUEUE          1000
 #define CARDS_PATH         "/cards.json"
-#define QUEUE_PATH         "/queue.json"
+#define QUEUE_PATH         "/queue.log"
+#define QUEUE_LEGACY_PATH  "/queue.json"
 
 // Resultados de localAuth()
 #define LOCAL_AUTH_OK        0
@@ -137,12 +168,46 @@ struct __attribute__((packed)) CardEntry {
     uint8_t used;      // used_today (en memoria)
 };
 
-struct __attribute__((packed)) QueueEntry {
-    char     uid[9];
-    uint16_t item_id;
-    uint16_t amount;
-    bool     vend_success;
-    uint32_t ts;       // Unix timestamp
+struct __attribute__((packed)) MdbSetupSnapshot {
+    uint8_t seenMask;       // bit0=config, bit1=prices
+    uint8_t lastSubcmd;
+    uint8_t lastLen;
+    uint8_t vmcLevel;
+    uint8_t displayColumns;
+    uint8_t displayRows;
+    uint8_t displayInfo;
+    uint8_t reserved;
+    uint16_t maxPrice;
+    uint16_t minPrice;
+    uint32_t lastSeenMs;
+    uint8_t raw[8];
+};
+
+struct MdbRuntimeState {
+    volatile MDBState phase;
+    bool justReset;
+    bool pendingSession;
+    bool vendApproved;
+    uint16_t vendAmount;
+    String sessionUID;
+    uint16_t sessionItemId;
+    uint16_t sessionAmount;
+    bool vendUsed;
+    bool sessionIsOffline;
+    unsigned long sessionStartMs;
+
+    MdbRuntimeState()
+        : phase(INACTIVE),
+          justReset(true),
+          pendingSession(false),
+          vendApproved(false),
+          vendAmount(1200),
+          sessionUID(""),
+          sessionItemId(0),
+          sessionAmount(1200),
+          vendUsed(false),
+          sessionIsOffline(false),
+          sessionStartMs(0) {}
 };
 
 // ── Objetos globales ──────────────────────────────────
@@ -152,20 +217,14 @@ WebServer   portalServer(80);
 DNSServer   dnsServer;
 RTC_DS3231  rtc;
 Preferences prefs;
+EventLog diagEventLog;
+volatile bool watchdogReady = false;
 
 // ── Estado MDB ────────────────────────────────────────
-volatile MDBState mdbState = INACTIVE;
-bool     justReset     = true;
-bool     pendingSession = false;
-bool     vendApproved  = false;
-uint16_t vendAmount    = 1200;
-String   sessionUID    = "";
-uint16_t sessionItemId = 0;
-uint16_t sessionAmount = 1200;
-bool     vendUsed      = false;
-bool     sessionIsOffline = false;
+MdbRuntimeState mdbRuntime;
 unsigned long lastNFCRead    = 0;
-unsigned long sessionStartMs = 0;
+PricingConfig pricingConfig = pricingDefaultConfig();
+MdbSetupSnapshot mdbSetupSnapshot{};
 
 // ── WiFi / backend ────────────────────────────────────
 String wifiSSID    = "";
@@ -188,6 +247,149 @@ uint32_t  nextResetTs = 0;      // Unix timestamp UTC del próximo reset de cont
 // ── Offline: cola de eventos ──────────────────────────
 QueueEntry queueBuf[MAX_QUEUE];
 int        queueLen = 0;
+
+void logDiagEvent(uint16_t code, int16_t arg1 = 0, uint32_t arg2 = 0) {
+    diagEventLog.push(code, arg1, arg2, millis());
+}
+
+void resetMdbSetupSnapshot() {
+    memset(&mdbSetupSnapshot, 0, sizeof(mdbSetupSnapshot));
+}
+
+void captureMdbSetup(uint8_t* d, uint8_t len) {
+    if (!d || len == 0) return;
+
+    mdbSetupSnapshot.lastSubcmd = d[0];
+    mdbSetupSnapshot.lastLen = len;
+    mdbSetupSnapshot.lastSeenMs = millis();
+    memset(mdbSetupSnapshot.raw, 0, sizeof(mdbSetupSnapshot.raw));
+    memcpy(mdbSetupSnapshot.raw, d, len > sizeof(mdbSetupSnapshot.raw) ? sizeof(mdbSetupSnapshot.raw) : len);
+
+    if (d[0] == SETUP_CONFIG) {
+        mdbSetupSnapshot.seenMask |= 0x01;
+        if (len >= 5) {
+            mdbSetupSnapshot.vmcLevel = d[1];
+            mdbSetupSnapshot.displayColumns = d[2];
+            mdbSetupSnapshot.displayRows = d[3];
+            mdbSetupSnapshot.displayInfo = d[4];
+        }
+        logDiagEvent(
+            EVT_MDB_SETUP_CONFIG,
+            len >= 2 ? d[1] : 0,
+            ((uint32_t)(len >= 3 ? d[2] : 0) << 16)
+                | ((uint32_t)(len >= 4 ? d[3] : 0) << 8)
+                | (uint32_t)(len >= 5 ? d[4] : 0)
+        );
+        return;
+    }
+
+    if (d[0] == SETUP_PRICES) {
+        mdbSetupSnapshot.seenMask |= 0x02;
+        if (len >= 5) {
+            mdbSetupSnapshot.maxPrice = ((uint16_t)d[1] << 8) | d[2];
+            mdbSetupSnapshot.minPrice = ((uint16_t)d[3] << 8) | d[4];
+        }
+        logDiagEvent(
+            EVT_MDB_SETUP_PRICES,
+            len >= 5 ? (int16_t)mdbSetupSnapshot.minPrice : 0,
+            len >= 3 ? mdbSetupSnapshot.maxPrice : 0
+        );
+    }
+}
+
+String buildMdbSetupJson() {
+    String json = "{\"seen_config\":";
+    json += (mdbSetupSnapshot.seenMask & 0x01) ? "true" : "false";
+    json += ",\"seen_prices\":";
+    json += (mdbSetupSnapshot.seenMask & 0x02) ? "true" : "false";
+    json += ",\"last_subcmd\":";
+    json += mdbSetupSnapshot.lastSubcmd;
+    json += ",\"last_len\":";
+    json += mdbSetupSnapshot.lastLen;
+    json += ",\"vmc_level\":";
+    json += mdbSetupSnapshot.vmcLevel;
+    json += ",\"display_columns\":";
+    json += mdbSetupSnapshot.displayColumns;
+    json += ",\"display_rows\":";
+    json += mdbSetupSnapshot.displayRows;
+    json += ",\"display_info\":";
+    json += mdbSetupSnapshot.displayInfo;
+    json += ",\"max_price\":";
+    json += mdbSetupSnapshot.maxPrice;
+    json += ",\"min_price\":";
+    json += mdbSetupSnapshot.minPrice;
+    json += ",\"last_seen_ms\":";
+    json += mdbSetupSnapshot.lastSeenMs;
+    json += ",\"raw\":[";
+    for (uint8_t i = 0; i < sizeof(mdbSetupSnapshot.raw); i++) {
+        if (i > 0) json += ",";
+        json += mdbSetupSnapshot.raw[i];
+    }
+    json += "]}";
+    return json;
+}
+
+String buildDiagnosticsSnapshotJson(uint8_t eventLimit = 20) {
+    if (eventLimit == 0) eventLimit = 20;
+    if (eventLimit > 32) eventLimit = 32;
+
+    String json = "{\"message\":\"Diagnostico generado desde la maquina\",";
+    json += "\"captured_at_ms\":";
+    json += millis();
+    json += ",\"wifi_connected\":";
+    json += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
+    json += ",\"backend_ready\":";
+    json += backendReady ? "true" : "false";
+    json += ",\"queue_pending\":";
+    json += queueLen;
+    json += ",\"price_cents\":";
+    json += pricingSanitizeHumanPrice(pricingConfig.priceCents);
+    json += ",\"pricing_profile\":\"";
+    json += pricingProfileCode(pricingConfig.profile);
+    json += "\",\"events\":";
+    json += eventLogBuildJson(diagEventLog, eventLimit);
+    json += ",\"mdb\":";
+    json += buildMdbSetupJson();
+    json += "}";
+    return json;
+}
+
+const char* resetReasonLabel(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXT";
+        case ESP_RST_SW: return "SW";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        case ESP_RST_UNKNOWN:
+        default: return "UNKNOWN";
+    }
+}
+
+void feedWatchdog() {
+    if (!watchdogReady) return;
+    esp_task_wdt_reset();
+}
+
+void initWatchdog() {
+    esp_err_t initErr = esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
+    if (initErr != ESP_OK) {
+        Serial.printf("[WDT] Init fallo: %d\n", (int)initErr);
+        return;
+    }
+    esp_err_t addErr = esp_task_wdt_add(NULL);
+    if (addErr != ESP_OK && addErr != ESP_ERR_INVALID_ARG) {
+        Serial.printf("[WDT] No se pudo registrar loopTask: %d\n", (int)addErr);
+        return;
+    }
+    watchdogReady = true;
+    Serial.printf("[WDT] Activo — timeout=%ds\n", WATCHDOG_TIMEOUT_SEC);
+}
 
 
 // ══════════════════════════════════════════════════════
@@ -233,7 +435,81 @@ bool hasHttpScheme(const String& url) {
         || url.startsWith("Https://") || url.startsWith("HTTPS://");
 }
 
+void handleMDB();
+
 void startPortal();
+void saveConfig(const String& ssid, const String& pass, const String& url, uint32_t priceCents);
+uint16_t currentConfiguredHumanPrice();
+
+bool parseUnsignedLongStrict(const String& raw, uint32_t& out) {
+    String value = raw;
+    value.trim();
+    if (value.length() == 0) return false;
+
+    uint32_t parsed = 0;
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value[i];
+        if (c < '0' || c > '9') return false;
+
+        uint32_t digit = (uint32_t)(c - '0');
+        if (parsed > (UINT32_MAX - digit) / 10) return false;
+        parsed = (parsed * 10) + digit;
+    }
+
+    out = parsed;
+    return true;
+}
+
+uint16_t currentConfiguredHumanPrice() {
+    return pricingDefaultVendAmount(pricingConfig);
+}
+
+uint16_t currentConfiguredSessionFunds() {
+    return pricingBeginSessionFunds(pricingConfig);
+}
+
+void syncConfiguredPriceToMdbRuntime() {
+    mdbRuntime.vendAmount = currentConfiguredHumanPrice();
+    mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+}
+
+bool applyConfiguredPrice(uint32_t priceCents, bool persistToNvs, const char* sourceLabel) {
+    uint32_t sanitized = pricingSanitizeHumanPrice(priceCents);
+    if (sanitized == pricingConfig.priceCents) return false;
+
+    pricingConfig.priceCents = sanitized;
+    syncConfiguredPriceToMdbRuntime();
+
+    if (persistToNvs) {
+        saveConfig(wifiSSID, wifiPass, backendBase, pricingConfig.priceCents);
+    }
+
+    Serial.printf("[CFG] Precio sincronizado desde %s: %u\n",
+                  sourceLabel ? sourceLabel : "origen_desconocido",
+                  (unsigned)pricingConfig.priceCents);
+    return true;
+}
+
+void mdbCommandTask(void*) {
+    bool taskRegistered = false;
+
+    for (;;) {
+        if (watchdogReady && !taskRegistered) {
+            esp_err_t addErr = esp_task_wdt_add(NULL);
+            if (addErr == ESP_OK || addErr == ESP_ERR_INVALID_ARG) {
+                taskRegistered = true;
+            }
+        }
+
+        handleMDB();
+
+        if (taskRegistered) {
+            esp_task_wdt_reset();
+        }
+
+        vTaskDelay(1);
+    }
+}
 
 uint8_t parseLimitMode(const String& raw) {
     String mode = raw;
@@ -249,26 +525,37 @@ uint8_t parseLimitMode(const String& raw) {
 //  PREFERENCIAS (reemplaza EEPROM, almacén NVS)
 // ══════════════════════════════════════════════════════
 void readConfig() {
-    prefs.begin("cc", true);  // namespace "cc", read-only
-    wifiSSID = prefs.getString("ssid", "");
-    wifiPass = prefs.getString("pass", "");
-    String url = normalizeBackendUrl(prefs.getString("url", ""));
-    prefs.end();
-    if (url.length() > 0) {
-        backendBase = url;
-    }
+    DeviceConfig config;
+    deviceConfigLoad(prefs, config, BACKEND_URL);
+    wifiSSID = config.wifiSSID;
+    wifiPass = config.wifiPass;
+    backendBase = normalizeBackendUrl(config.backendBase);
+    pricingConfig = config.pricing;
+    syncConfiguredPriceToMdbRuntime();
+
     Serial.printf("[CFG] SSID guardada:   %s\n", wifiSSID.c_str());
     Serial.printf("[CFG] Backend guardado: %s\n", backendBase.c_str());
+    Serial.printf("[CFG] Precio guardado:  %u (perfil=%s)\n",
+                  (unsigned)pricingConfig.priceCents,
+                  pricingProfileCode(pricingConfig.profile));
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& url) {
-    prefs.begin("cc", false);  // read-write
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", pass);
+void saveConfig(const String& ssid, const String& pass, const String& url, uint32_t priceCents) {
+    DeviceConfig config;
+    deviceConfigSetDefaults(config, BACKEND_URL);
+    config.wifiSSID = ssid;
+    config.wifiPass = pass;
     String urlNorm = normalizeBackendUrl(url);
-    prefs.putString("url", urlNorm.length() > 0 ? urlNorm : String(BACKEND_URL));
-    prefs.end();
-    Serial.printf("[CFG] Config guardada — SSID: %s\n", ssid.c_str());
+    config.backendBase = urlNorm.length() > 0 ? urlNorm : String(BACKEND_URL);
+    config.pricing = pricingConfig;
+    config.pricing.priceCents = pricingSanitizeHumanPrice(priceCents);
+
+    deviceConfigSave(prefs, config, BACKEND_URL);
+    pricingConfig = config.pricing;
+    syncConfiguredPriceToMdbRuntime();
+
+    Serial.printf("[CFG] Config guardada — SSID: %s | precio: %u\n",
+                  ssid.c_str(), (unsigned)pricingConfig.priceCents);
 }
 
 void handleResetButtonRuntime() {
@@ -412,53 +699,29 @@ bool advanceDateByOneDay(const char* currentDate, char* out, size_t outSize) {
 
 
 // ══════════════════════════════════════════════════════
-//  LITTLEFS — queue.json
+//  LITTLEFS — queue journal (append-only)
 // ══════════════════════════════════════════════════════
 void loadQueue() {
-    if (!LittleFS.exists(QUEUE_PATH)) { queueLen = 0; return; }
-    File f = LittleFS.open(QUEUE_PATH, "r");
-    if (!f) return;
-
-    DynamicJsonDocument doc(80000);
-    if (deserializeJson(doc, f) != DeserializationError::Ok) {
-        f.close(); queueLen = 0; return;
+    bool migratedLegacy = false;
+    int loaded = 0;
+    if (!offlineQueueLoad(LittleFS, QUEUE_PATH, QUEUE_LEGACY_PATH, queueBuf, MAX_QUEUE, loaded, migratedLegacy)) {
+        queueLen = 0;
+        return;
     }
-    f.close();
 
-    JsonArray arr = doc.as<JsonArray>();
-    queueLen = 0;
-    for (JsonObject e : arr) {
-        if (queueLen >= MAX_QUEUE) break;
-        strlcpy(queueBuf[queueLen].uid, e["uid"] | "", sizeof(queueBuf[0].uid));
-        queueBuf[queueLen].item_id      = (uint16_t)(e["item_id"] | 0);
-        queueBuf[queueLen].amount       = (uint16_t)(e["amount"]  | 0);
-        queueBuf[queueLen].vend_success = (bool)(e["ok"] | false);
-        queueBuf[queueLen].ts           = (uint32_t)(e["ts"] | 0);
-        queueLen++;
+    queueLen = loaded;
+    if (migratedLegacy) {
+        Serial.printf("[QUEUE] Cola legacy migrada a journal: %d eventos pendientes\n", queueLen);
+    } else {
+        Serial.printf("[QUEUE] Cola journal cargada: %d eventos pendientes\n", queueLen);
     }
-    Serial.printf("[QUEUE] Cola cargada: %d eventos pendientes\n", queueLen);
 }
 
 void saveQueue() {
-    if (queueLen == 0) {
-        LittleFS.remove(QUEUE_PATH);
-        return;
+    if (!offlineQueueRewrite(LittleFS, QUEUE_PATH, queueBuf, queueLen)) {
+        Serial.println("[QUEUE] ERROR — no se pudo compactar la cola journal");
+        logDiagEvent(EVT_QUEUE_PERSIST_FAIL, queueLen, 2);
     }
-    File f = LittleFS.open(QUEUE_PATH, "w");
-    if (!f) return;
-
-    f.print("[");
-    for (int i = 0; i < queueLen; i++) {
-        if (i > 0) f.print(",");
-        f.printf("{\"uid\":\"%s\",\"item_id\":%d,\"amount\":%d,\"ok\":%s,\"ts\":%lu}",
-                 queueBuf[i].uid,
-                 queueBuf[i].item_id,
-                 queueBuf[i].amount,
-                 queueBuf[i].vend_success ? "true" : "false",
-                 (unsigned long)queueBuf[i].ts);
-    }
-    f.print("]");
-    f.close();
 }
 
 
@@ -503,17 +766,31 @@ uint32_t getCurrentTs() {
 void enqueueEvent(const String& uid, uint16_t itemId, uint16_t amount, bool ok) {
     if (queueLen >= MAX_QUEUE) {
         Serial.println("[QUEUE] ADVERTENCIA — cola llena, evento descartado");
+        logDiagEvent(EVT_QUEUE_FULL, queueLen, amount);
         return;
     }
-    strlcpy(queueBuf[queueLen].uid, uid.c_str(), sizeof(queueBuf[0].uid));
-    queueBuf[queueLen].item_id      = itemId;
-    queueBuf[queueLen].amount       = amount;
-    queueBuf[queueLen].vend_success = ok;
-    queueBuf[queueLen].ts           = getCurrentTs();
+
+    QueueEntry entry{};
+    strlcpy(entry.uid, uid.c_str(), sizeof(entry.uid));
+    entry.item_id = itemId;
+    entry.amount = amount;
+    entry.vend_success = ok;
+    entry.ts = getCurrentTs();
+
+    if (!offlineQueueAppend(LittleFS, QUEUE_PATH, entry)) {
+        queueBuf[queueLen] = entry;
+        if (!offlineQueueRewrite(LittleFS, QUEUE_PATH, queueBuf, queueLen + 1)) {
+            Serial.println("[QUEUE] ERROR — no se pudo persistir el evento offline");
+            logDiagEvent(EVT_QUEUE_PERSIST_FAIL, queueLen, amount);
+            return;
+        }
+    }
+
+    queueBuf[queueLen] = entry;
     queueLen++;
 
-    saveQueue();  // Persistir inmediatamente por si hay corte de energía
     Serial.printf("[QUEUE] Encolado — uid:%s ok:%d total:%d\n", uid.c_str(), ok, queueLen);
+    logDiagEvent(EVT_QUEUE_ENQUEUE, ok ? 1 : 0, queueLen);
 }
 
 
@@ -530,6 +807,7 @@ void flushQueue() {
 
     while (sent < queueLen) {
         int end = min(sent + BATCH, queueLen);
+        feedWatchdog();
 
         // Construir JSON del lote
         String body = "[";
@@ -554,11 +832,13 @@ void flushQueue() {
 
         int code = http.POST(body);
         http.end();
+        feedWatchdog();
 
         if (code == 200 || code == 204) {
             sent = end;
         } else {
             Serial.printf("[QUEUE] Error HTTP %d — abortando flush\n", code);
+            logDiagEvent(EVT_QUEUE_FLUSH_FAIL, code, queueLen);
             break;
         }
     }
@@ -569,6 +849,7 @@ void flushQueue() {
         queueLen = remaining;
         saveQueue();
         Serial.printf("[QUEUE] Flush OK: %d enviados, %d pendientes\n", sent, remaining);
+        logDiagEvent(EVT_QUEUE_FLUSH_OK, sent, remaining);
     }
 }
 
@@ -587,8 +868,10 @@ void downloadCards() {
     http.setTimeout(HTTP_TIMEOUT_MS * 3);
 
     int code = http.GET();
+    feedWatchdog();
     if (code != 200) {
         Serial.printf("[CARDS] Error descarga HTTP %d\n", code);
+        logDiagEvent(EVT_BACKEND_CARDS_FAIL, code, cardCount);
         http.end();
         return;
     }
@@ -597,9 +880,11 @@ void downloadCards() {
     DynamicJsonDocument doc(100000);
     DeserializationError err = deserializeJson(doc, client);
     http.end();
+    feedWatchdog();
 
     if (err) {
         Serial.printf("[CARDS] Error JSON descarga: %s\n", err.c_str());
+        logDiagEvent(EVT_BACKEND_CARDS_FAIL, -2, cardCount);
         return;
     }
 
@@ -626,6 +911,7 @@ void downloadCards() {
     saveCards();
     Serial.printf("[CARDS] Descarga OK: %d tarjetas (fecha: %s, next_reset_at=%lu)\n",
                   cardCount, savedDate, (unsigned long)nextResetTs);
+    logDiagEvent(EVT_BACKEND_CARDS_OK, cardCount, nextResetTs);
 }
 
 
@@ -866,157 +1152,65 @@ String buildWifiScanJson() {
     return json;
 }
 
-String buildPortalHTML() {
+bool servePortalStaticFile(const char* fsPath, const char* contentType, const char* cacheControl = nullptr) {
+    if (!LittleFS.exists(fsPath)) return false;
+
+    File file = LittleFS.open(fsPath, "r");
+    if (!file) return false;
+
+    if (cacheControl && cacheControl[0] != '\0') {
+        portalServer.sendHeader("Cache-Control", cacheControl);
+    }
+    portalServer.streamFile(file, contentType);
+    file.close();
+    return true;
+}
+
+String buildPortalFallbackHtml() {
     String ssidValue = htmlEscape(wifiSSID);
     String passValue = htmlEscape(wifiPass);
     String urlValue = htmlEscape(backendBase);
-    String html = F("<!DOCTYPE html><html lang='es'>"
-        "<head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>CoffeeControl</title>"
+    String priceValue = String((unsigned long)pricingSanitizeHumanPrice(pricingConfig.priceCents));
+
+    String html = F(
+        "<!DOCTYPE html><html lang='es'><head>"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>CoffeeControl - Portal de emergencia</title>"
         "<style>"
-        ":root{--bg:#FCFCFA;--bg2:#F5F7FA;--panel:#FFFFFF;--tx:#243241;--tx2:#5D6C79;--tx3:#7B8792;--br:#D6DFE7;--brm:#C5CFD8;--pri:#185FA5;--pri2:#114A82;--soft:#E8F1FB;--ok:#E8F3E2;--oktx:#315C1D;--err:#F9E6E5;--errtx:#8A2A2A;--shadow:0 18px 44px rgba(17,74,130,.16);}"
-        "*{box-sizing:border-box;margin:0;padding:0;}"
-        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at top left,#F7FAFD 0,#F7FAFD 34%,#EEF3F8 100%);color:var(--tx);min-height:100vh;padding:22px;}"
-        ".shell{width:100%;max-width:440px;margin:0 auto;}"
-        ".hero{background:linear-gradient(135deg,#FFFFFF 0,#F5F8FB 100%);border:1px solid rgba(24,95,165,.12);border-radius:22px;padding:20px 20px 16px;box-shadow:var(--shadow);margin-bottom:14px;}"
-        ".hero-top{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;}"
-        ".brand-lockup{width:100%;display:flex;justify-content:center;}"
-        ".brand-svg{display:block;width:100%;max-width:380px;height:auto;}"
-        ".eyebrow{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--pri);font-weight:700;margin-bottom:4px;}"
-        "h1{font-size:24px;line-height:1.05;font-weight:650;margin-bottom:5px;}"
-        ".sub{font-size:13px;color:var(--tx2);line-height:1.45;}"
-        ".hero-note{margin-top:10px;background:var(--soft);color:var(--pri2);border-radius:14px;padding:12px 14px;font-size:12px;line-height:1.45;border:1px solid rgba(24,95,165,.08);}"
-        ".card{background:var(--panel);border:1px solid var(--br);border-radius:22px;padding:22px 20px;box-shadow:var(--shadow);}"
-        ".section{margin-bottom:18px;}"
-        ".section:last-of-type{margin-bottom:16px;}"
-        ".section-title{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--tx3);margin-bottom:10px;}"
-        "label{font-size:12px;color:var(--tx2);display:block;margin-bottom:5px;font-weight:600;}"
-        "input{width:100%;border:1px solid var(--brm);border-radius:12px;padding:11px 12px;font-size:14px;color:var(--tx);background:var(--bg);margin-bottom:12px;}"
-        "input:focus{outline:2px solid rgba(24,95,165,.18);border-color:var(--pri);}"
-        ".hint{font-size:11px;color:var(--tx3);margin-top:-6px;margin-bottom:12px;line-height:1.45;}"
-        ".pw-row{display:flex;align-items:center;gap:7px;margin-top:-4px;margin-bottom:12px;font-size:12px;color:var(--tx2);}"
-        ".pw-row input{width:auto;margin:0;padding:0;accent-color:var(--pri);}"
-        ".ghost{width:100%;padding:11px 12px;background:var(--bg2);color:var(--tx);border:1px solid var(--brm);border-radius:12px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:10px;}"
-        ".ghost:disabled{opacity:.68;cursor:wait;}"
-        ".scan-status{display:none;font-size:12px;color:var(--tx2);background:var(--bg2);border-radius:12px;padding:10px 12px;margin-bottom:10px;line-height:1.45;border:1px solid var(--br);}"
-        ".selected-net{display:none;align-items:flex-start;gap:10px;background:var(--soft);border:1px solid rgba(24,95,165,.14);border-radius:14px;padding:12px 13px;margin-bottom:10px;}"
-        ".selected-dot{width:10px;height:10px;border-radius:50%;background:var(--pri);margin-top:5px;flex-shrink:0;box-shadow:0 0 0 4px rgba(24,95,165,.12);}"
-        ".selected-kicker{font-size:11px;color:var(--pri2);text-transform:uppercase;letter-spacing:.08em;font-weight:700;}"
-        ".selected-name{font-size:14px;font-weight:700;color:var(--tx);margin-top:3px;word-break:break-word;}"
-        ".scan-list{display:none;max-height:220px;overflow:auto;margin-bottom:12px;padding-right:2px;}"
-        ".net-btn{width:100%;text-align:left;padding:12px 13px;background:#fff;color:var(--tx);border:1px solid var(--br);border-radius:14px;font-size:13px;cursor:pointer;margin-bottom:8px;transition:transform .12s ease,border-color .12s ease,box-shadow .12s ease,background .12s ease;}"
-        ".net-btn strong{display:block;font-size:13px;font-weight:700;}"
-        ".net-meta{display:block;font-size:11px;color:var(--tx3);margin-top:4px;}"
-        ".net-btn.is-active{border-color:var(--pri);background:var(--soft);box-shadow:0 0 0 3px rgba(24,95,165,.1);transform:translateY(-1px);}"
-        ".status{display:none;font-size:12px;color:var(--pri2);background:var(--soft);border-radius:14px;padding:11px 12px;margin-bottom:12px;line-height:1.45;border:1px solid rgba(24,95,165,.1);}"
-        ".info{font-size:11px;color:var(--tx3);margin-bottom:16px;padding:10px 12px;background:var(--bg2);border-radius:12px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;border:1px solid var(--br);line-height:1.45;}"
-        ".actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:6px;}"
-        "button{width:100%;padding:12px 13px;background:var(--pri);color:#fff;border:none;border-radius:12px;font-size:14px;font-weight:650;cursor:pointer;}"
-        ".ok{display:none;background:var(--ok);color:var(--oktx);border-radius:14px;padding:12px 13px;font-size:13px;text-align:center;margin-top:14px;line-height:1.45;}"
-        ".err{display:none;background:var(--err);color:var(--errtx);border-radius:14px;padding:11px 12px;font-size:13px;margin-bottom:12px;line-height:1.45;}"
-        "@media(max-width:420px){body{padding:16px;}.hero,.card{border-radius:18px;padding:18px 16px;}.actions{grid-template-columns:1fr;}}"
-        "</style></head>"
-        "<body><div class='shell'>"
-        "<div class='hero'>"
-        "<div class='hero-top'>"
-        "<div class='brand-lockup'>"
-        "<svg class='brand-svg' width='1200' height='430' viewBox='0 0 1200 430' xmlns='http://www.w3.org/2000/svg' aria-label='SmartQ CoffeeControl'>"
-        "<g transform='translate(50,60)'>"
-        "<rect x='0' y='0' width='200' height='200' rx='50' fill='#1da1d8'/>"
-        "<text x='100' y='110' text-anchor='middle' dominant-baseline='middle' font-family='Arial, sans-serif' font-size='120' font-weight='bold' fill='white'>Q</text>"
-        "</g>"
-        "<text x='300' y='172' font-family='Arial, sans-serif' font-size='110' fill='#3a3f45'>Smart<tspan fill='#1da1d8'>Q</tspan></text>"
-        "<line x1='300' y1='202' x2='950' y2='202' stroke='#1da1d8' stroke-width='4'/>"
-        "<text x='300' y='262' font-family='Arial, sans-serif' font-size='50' fill='#6b6f75'>Vending m&#225;s inteligente</text>"
-        "<text x='50' y='340' font-family='Arial, sans-serif' font-size='32' font-weight='bold' fill='#1da1d8' letter-spacing='3'>PORTAL DE INSTALACI&#211;N</text>"
-        "<text x='50' y='398' font-family='Arial, sans-serif' font-size='68' font-weight='bold' fill='#243241'>CoffeeControl</text>"
-        "</svg>"
-        "</div>"
-        "</div>"
-        "<div class='hero-note'>Podes escanear redes visibles, validar la conexion antes de guardar y volver a este portal con BOOT sin borrar la configuracion actual.</div>"
-        "</div>"
-        "<div class='card'>"
-        "<div class='err' id='err'></div>"
-        "<div class='status' id='status'></div>"
-        "<form id='f'>"
-        "<div class='section'>"
-        "<div class='section-title'>Conexion WiFi</div>"
-        "<label>Red WiFi (SSID) *</label>"
-        "<input type='text' name='ssid' id='ssidInput' placeholder='NombreDeLaRed' required autocomplete='off' value='");
+        ":root{--bg:#f6f8fb;--panel:#fff;--tx:#243241;--tx2:#5d6c79;--br:#d6dfe7;--pri:#185fa5;--warn:#fff4d8;--warnx:#8a5b00;}"
+        "*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:var(--bg);color:var(--tx);padding:18px;}"
+        ".shell{max-width:480px;margin:0 auto}.card{background:var(--panel);border:1px solid var(--br);border-radius:18px;padding:18px;box-shadow:0 18px 40px rgba(17,74,130,.12)}"
+        "h1{margin:0 0 8px;font-size:24px}.note{background:var(--warn);color:var(--warnx);border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.45;margin:0 0 16px}"
+        "label{display:block;font-size:12px;color:var(--tx2);margin:0 0 6px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}"
+        "input{width:100%;padding:12px;border:1px solid var(--br);border-radius:12px;margin:0 0 12px;font-size:14px}"
+        ".actions{display:grid;grid-template-columns:1fr;gap:10px;margin-top:8px}button{padding:13px 14px;border:0;border-radius:12px;background:var(--pri);color:#fff;font-size:14px;font-weight:700}"
+        ".meta{font-size:12px;color:var(--tx2);margin:14px 0 0;line-height:1.5}"
+        "</style></head><body><main class='shell'><section class='card'>"
+        "<h1>Portal de emergencia</h1>"
+        "<p class='note'>Los archivos visuales del portal no estan cargados en LittleFS. Podes guardar la configuracion igual y despues subir el filesystem con <code>uploadfs</code>.</p>"
+        "<form method='POST' action='/save'>"
+        "<label for='ssid'>Red WiFi</label>"
+        "<input id='ssid' name='ssid' autocomplete='off' required value='");
     html += ssidValue;
     html += F("'>"
-        "<div class='hint'>Podes escribir el SSID manualmente o elegir una red detectada.</div>"
-        "<button type='button' class='ghost' id='scanBtn'>Escanear redes</button>"
-        "<div class='scan-status' id='scanStatus'></div>"
-        "<div class='selected-net' id='selectedNet'><div class='selected-dot'></div><div><div class='selected-kicker' id='selectedNetMode'>Red lista para guardar</div><div class='selected-name' id='selectedNetName'></div></div></div>"
-        "<div class='scan-list' id='scanList'></div>"
-        "<label>Contrasena WiFi</label>"
-        "<input type='password' name='pass' id='wifiPass' autocomplete='off' value='");
+        "<label for='pass'>Contrasena WiFi</label>"
+        "<input id='pass' name='pass' type='password' autocomplete='off' value='");
     html += passValue;
-    html += F("'>"
-        "<label class='pw-row'><input type='checkbox' id='showPass'><span>Mostrar contrasena</span></label>"
-        "<div class='hint'>Las credenciales guardadas no se borran hasta que guardes nuevos cambios.</div>"
-        "</div>");
+    html += F("'>");
 
     if (String(DEPLOYMENT_MODE) != "saas") {
-        html += F("<div class='section'>"
-                  "<div class='section-title'>Servidor</div>"
-                  "<label>URL del servidor *</label>"
-                  "<input type='text' name='url' placeholder='http://192.168.1.50:3000' required autocomplete='off' value='");
+        html += F("<label for='url'>URL backend</label><input id='url' name='url' autocomplete='off' required value='");
         html += urlValue;
-        html += F("'>"
-                  "<div class='hint'>Usa la direccion del backend donde corre CoffeeControl.</div>"
-                  "</div>");
+        html += F("'>");
     }
 
-    html += F("<div class='info' id='mac'>Cargando ID...</div>"
-              "<div class='actions'>"
-              "<button type='button' class='ghost' id='testBtn'>Probar conexion</button>"
-              "<button type='submit' id='saveBtn'>Guardar y conectar</button>"
-              "</div>"
-              "</form>"
-              "<div class='ok' id='ok'>Listo. La maquina se conectara en unos segundos y aparecera en el panel de administracion.</div>"
-              "</div>"
-              "</div>"
-              "<script>"
-              "fetch('/info').then(r=>r.json()).then(d=>{"
-              "  document.getElementById('mac').textContent='ID: '+d.mac+' | FW: '+d.fw+' | Modo: '+d.mode;"
-              "});"
-              "const ssidInput=document.getElementById('ssidInput');"
-              "const scanBtn=document.getElementById('scanBtn');"
-              "const scanStatus=document.getElementById('scanStatus');"
-              "const scanList=document.getElementById('scanList');"
-              "const selectedNet=document.getElementById('selectedNet');"
-              "const selectedNetMode=document.getElementById('selectedNetMode');"
-              "const selectedNetName=document.getElementById('selectedNetName');"
-              "const form=document.getElementById('f');"
-              "const errBox=document.getElementById('err');"
-              "const okBox=document.getElementById('ok');"
-              "const statusBox=document.getElementById('status');"
-              "const testBtn=document.getElementById('testBtn');"
-              "const saveBtn=document.getElementById('saveBtn');"
-              "const urlInput=form.querySelector('[name=url]');"
-              "let selectedSSID='';"
-              "function clearAlerts(){errBox.style.display='none';okBox.style.display='none';}"
-              "function showError(text){statusBox.style.display='none';okBox.style.display='none';errBox.textContent=text;errBox.style.display='block';}"
-              "function showOk(text){errBox.style.display='none';statusBox.style.display='none';okBox.textContent=text;okBox.style.display='block';}"
-              "function showStatus(text){errBox.style.display='none';statusBox.textContent=text;statusBox.style.display='block';}"
-              "function setBusy(mode){const busy=!!mode;scanBtn.disabled=busy;testBtn.disabled=busy;saveBtn.disabled=busy;scanBtn.textContent=mode==='scan'?'Escaneando...':'Escanear redes';testBtn.textContent=mode==='test'?'Probando...':'Probar conexion';saveBtn.textContent=mode==='save'?'Guardando...':'Guardar y conectar';}"
-              "function readForm(){const d=new FormData(form);const ssid=(d.get('ssid')||'').trim();const pass=d.get('pass')||'';const url=urlInput?(d.get('url')||'').trim():'';return {ssid,pass,url};}"
-              "function validateForm(){const data=readForm();if(!data.ssid){showError('El SSID es requerido.');return null;}if(urlInput&&!data.url){showError('La URL del servidor es requerida.');return null;}if(urlInput&&!/^https?:\\/\\//i.test(data.url)){showError('La URL debe comenzar con http:// o https://.');return null;}return data;}"
-              "function showScanStatus(text){scanStatus.textContent=text;scanStatus.style.display='block';}"
-              "function markSelectedButton(){scanList.querySelectorAll('.net-btn').forEach(btn=>{btn.classList.toggle('is-active',selectedSSID&&btn.dataset.ssid===selectedSSID);});}"
-              "function updateSelectedNet(ssid,modeText){if(!ssid){selectedNet.style.display='none';selectedNetName.textContent='';return;}selectedNet.style.display='flex';selectedNetMode.textContent=modeText;selectedNetName.textContent=ssid;}"
-              "function syncTypedSSID(){const current=ssidInput.value.trim();if(!current){selectedSSID='';markSelectedButton();updateSelectedNet('','');return;}if(current!==selectedSSID){selectedSSID='';markSelectedButton();updateSelectedNet(current,'SSID manual listo para guardar');}}"
-              "function renderNetworks(items){scanList.innerHTML='';if(!items.length){scanList.style.display='none';showScanStatus('No se encontraron redes visibles. Podes cargar el SSID manualmente.');syncTypedSSID();return;}showScanStatus('Toca una red para seleccionarla claramente o escribe una red oculta manualmente.');scanList.style.display='block';items.forEach(net=>{const btn=document.createElement('button');btn.type='button';btn.className='net-btn';btn.dataset.ssid=net.ssid;const name=document.createElement('strong');name.textContent=net.ssid;const meta=document.createElement('span');meta.className='net-meta';meta.textContent=(net.secure?'Contrasena requerida':'Red abierta')+' | Senal '+net.rssi+' dBm';btn.appendChild(name);btn.appendChild(meta);btn.onclick=function(){selectedSSID=net.ssid;ssidInput.value=net.ssid;updateSelectedNet(net.ssid,'Red detectada seleccionada');markSelectedButton();document.getElementById('wifiPass').focus();};scanList.appendChild(btn);});if(selectedSSID){markSelectedButton();}else{syncTypedSSID();}}"
-              "function scanNetworks(){setBusy('scan');scanList.style.display='none';showScanStatus('Buscando redes WiFi cercanas...');fetch('/scan',{cache:'no-store'}).then(r=>{if(!r.ok) throw new Error('scan');return r.json();}).then(renderNetworks).catch(()=>{showScanStatus('No se pudo completar el escaneo. Podes cargar el SSID manualmente.');}).finally(()=>{setBusy('');});}"
-              "scanBtn.addEventListener('click',scanNetworks);"
-              "ssidInput.addEventListener('input',syncTypedSSID);"
-              "testBtn.addEventListener('click',function(){const data=validateForm();if(!data) return;clearAlerts();showStatus('Probando conexion WiFi y backend...');setBusy('test');fetch('/test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(data.ssid)+'&pass='+encodeURIComponent(data.pass)+'&url='+encodeURIComponent(data.url)}).then(async r=>{const payload=await r.json().catch(()=>null);if(!payload) throw new Error('json');if(payload.ok){let msg=payload.message;if(payload.extra){msg+=' '+payload.extra;}showOk(msg);}else{let msg=payload.message||'No se pudo completar la prueba.';if(payload.extra){msg+=' '+payload.extra;}showError(msg);}}).catch(()=>{showError('No se pudo ejecutar la prueba de conexion desde el portal.');}).finally(()=>{setBusy('');});});"
-              "document.getElementById('showPass').addEventListener('change',function(){document.getElementById('wifiPass').type=this.checked?'text':'password';});"
-              "document.getElementById('f').onsubmit=function(e){e.preventDefault();const data=validateForm();if(!data) return;clearAlerts();showStatus('Guardando configuracion y reiniciando la maquina...');setBusy('save');fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(data.ssid)+'&pass='+encodeURIComponent(data.pass)+'&url='+encodeURIComponent(data.url)}).then(async r=>{if(r.ok){showOk('Listo. La maquina se conectara en unos segundos y aparecera en el panel de administracion.');document.getElementById('status').style.display='none';form.style.display='none';}else{const text=await r.text().catch(()=>'Error al guardar');showError(text||'Error al guardar');}}).catch(()=>{showError('No se pudo guardar la configuracion desde el portal.');}).finally(()=>{if(form.style.display!=='none'){setBusy('');}});};"
-              "syncTypedSSID();"
-              "</script></body></html>");
+    html += F("<label for='price'>Precio</label><input id='price' name='price' type='number' min='1' step='1' inputmode='numeric' required value='");
+    html += priceValue;
+    html += F("'>"
+        "<div class='actions'><button type='submit'>Guardar y reiniciar</button></div>"
+        "</form>"
+        "<p class='meta'>Si queres la experiencia completa del portal, subi los assets LittleFS del firmware. El endpoint <code>/info</code> sigue disponible para diagnostico rapido.</p>"
+        "</section></main></body></html>");
     return html;
 }
 
@@ -1033,16 +1227,51 @@ void startPortal() {
     dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
     dnsServer.start(DNS_PORT, "*", ip);
 
-    String portalHtml = buildPortalHTML();
+    portalServer.on("/", HTTP_GET, []() {
+        if (servePortalStaticFile("/portal/index.html", "text/html; charset=utf-8", "no-store")) return;
+        portalServer.send(200, "text/html; charset=utf-8", buildPortalFallbackHtml());
+    });
 
-    portalServer.on("/", HTTP_GET, [portalHtml]() {
-        portalServer.send(200, "text/html", portalHtml);
+    portalServer.on("/portal/index.html", HTTP_GET, []() {
+        if (servePortalStaticFile("/portal/index.html", "text/html; charset=utf-8", "no-store")) return;
+        portalServer.send(200, "text/html; charset=utf-8", buildPortalFallbackHtml());
+    });
+
+    portalServer.on("/portal.css", HTTP_GET, []() {
+        if (servePortalStaticFile("/portal/styles.css", "text/css; charset=utf-8", "public, max-age=300")) return;
+        portalServer.send(404, "text/plain", "portal css missing");
+    });
+
+    portalServer.on("/portal.js", HTTP_GET, []() {
+        if (servePortalStaticFile("/portal/app.js", "application/javascript; charset=utf-8", "public, max-age=300")) return;
+        portalServer.send(404, "text/plain", "portal js missing");
     });
 
     portalServer.on("/info", HTTP_GET, []() {
         String json = "{\"mac\":\"" + macAddress + "\","
                       "\"fw\":\"v3.0\","
-                      "\"mode\":\"" DEPLOYMENT_MODE "\"}";
+                      "\"mode\":\"" DEPLOYMENT_MODE "\","
+                      "\"requires_url\":" + String(String(DEPLOYMENT_MODE) == "saas" ? "false" : "true") + ","
+                      "\"ssid\":\"" + jsonEscape(wifiSSID) + "\","
+                      "\"pass\":\"" + jsonEscape(wifiPass) + "\","
+                      "\"url\":\"" + jsonEscape(backendBase) + "\","
+                      "\"price\":" + String((unsigned long)pricingSanitizeHumanPrice(pricingConfig.priceCents)) + ","
+                      "\"price_profile\":\"" + jsonEscape(pricingProfileCode(pricingConfig.profile)) + "\"}";
+        portalServer.sendHeader("Cache-Control", "no-store");
+        portalServer.send(200, "application/json", json);
+    });
+
+    portalServer.on("/diag/events", HTTP_GET, []() {
+        uint8_t limit = (uint8_t)portalServer.arg("limit").toInt();
+        if (limit == 0) limit = 12;
+        String json = eventLogBuildJson(diagEventLog, limit);
+        portalServer.sendHeader("Cache-Control", "no-store");
+        portalServer.send(200, "application/json", json);
+    });
+
+    portalServer.on("/diag/mdb", HTTP_GET, []() {
+        String json = buildMdbSetupJson();
+        portalServer.sendHeader("Cache-Control", "no-store");
         portalServer.send(200, "application/json", json);
     });
 
@@ -1078,8 +1307,10 @@ void startPortal() {
         String ssid = portalServer.arg("ssid");
         String pass = portalServer.arg("pass");
         String url  = portalServer.arg("url");
+        String priceRaw = portalServer.arg("price");
         ssid.trim();
         url = normalizeBackendUrl(url);
+        uint32_t priceValue = 0;
 
         if (ssid.length() == 0) {
             portalServer.send(400, "text/plain", "ssid requerido");
@@ -1096,8 +1327,12 @@ void startPortal() {
             portalServer.send(400, "text/plain", "url invalida: debe comenzar con http:// o https://");
             return;
         }
+        if (!parseUnsignedLongStrict(priceRaw, priceValue) || priceValue == 0) {
+            portalServer.send(400, "text/plain", "precio invalido");
+            return;
+        }
 
-        saveConfig(ssid, pass, url);
+        saveConfig(ssid, pass, url, priceValue);
         portalServer.send(200, "text/plain", "ok");
         Serial.println("[PORTAL] Config guardada, reiniciando...");
         ledBlink(3, 200);
@@ -1131,12 +1366,14 @@ bool connectWiFi() {
         delay(500);
         Serial.print(".");
         ledToggle();
+        feedWatchdog();
     }
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] OK — IP: %s\n", WiFi.localIP().toString().c_str());
         digitalWrite(PIN_LED, HIGH);
         wifiReady = true;
+        logDiagEvent(EVT_WIFI_CONNECT_OK, WiFi.RSSI(), WiFi.localIP());
 
         // Sincronizar NTP (fallback para DS3231)
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -1147,6 +1384,7 @@ bool connectWiFi() {
     }
 
     Serial.println("\n[WiFi] Error de conexion");
+    logDiagEvent(EVT_WIFI_CONNECT_FAIL, -1, 0);
     return false;
 }
 
@@ -1158,6 +1396,7 @@ bool checkBackend() {
     if (WiFi.status() != WL_CONNECTED) {
         backendReady = false;
         backendLastError = "WiFi desconectado";
+        logDiagEvent(EVT_BACKEND_HEALTH_FAIL, -1, 0);
         return false;
     }
     String url = backendBase + "/health";
@@ -1173,15 +1412,19 @@ bool checkBackend() {
     http.setTimeout(HTTP_TIMEOUT_MS);
     int code = http.GET();
     http.end();
+    feedWatchdog();
     Serial.printf("[BACKEND] HTTP code: %d\n", code);
     bool ok = (code == 200);
     backendReady = ok;
     if (ok) {
         backendLastError = "";
+        logDiagEvent(EVT_BACKEND_HEALTH_OK, code, 0);
     } else if (code > 0) {
         backendLastError = "HTTP " + String(code) + " en /health";
+        logDiagEvent(EVT_BACKEND_HEALTH_FAIL, code, 0);
     } else {
         backendLastError = "Sin respuesta en /health";
+        logDiagEvent(EVT_BACKEND_HEALTH_FAIL, -2, 0);
     }
     Serial.printf("[BACKEND] %s\n", ok ? "CONECTADO" : "SIN RESPUESTA");
     return ok;
@@ -1200,6 +1443,7 @@ int postTap(const String& uid) {
 
     int code = http.POST("{\"nfc_uid\":\"" + uid + "\"}");
     http.end();
+    feedWatchdog();
     return code;
 }
 
@@ -1208,7 +1452,7 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
                   ok ? "EXITOSA" : "FALLIDA", itemId, amount);
 
     // Si la sesión fue offline OR el WiFi cayó durante la sesión → encolar
-    if (sessionIsOffline || WiFi.status() != WL_CONNECTED) {
+    if (mdbRuntime.sessionIsOffline || WiFi.status() != WL_CONNECTED) {
         Serial.println("[TAP] Sin conexion online — encolando evento");
         enqueueEvent(uid, itemId, amount, ok);
         if (ok) incrementLocalUsed(uid);
@@ -1235,6 +1479,7 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
 
     int code = http.POST(body);
     http.end();
+    feedWatchdog();
 
     if (code <= 0) {
         // Sin respuesta → encolar para reintentar
@@ -1256,6 +1501,7 @@ void reconcileTaps() {
 
     int code = http.POST("{}");
     http.end();
+    feedWatchdog();
 
     if (code == 200) Serial.println("[RECONCILE] OK — taps huerfanos revertidos");
     else             Serial.printf("[RECONCILE] HTTP %d\n", code);
@@ -1276,6 +1522,8 @@ void registerMachine() {
     doc["mac"] = macAddress;
     doc["wifi_ssid"] = wifiSSID;
     doc["backend_url"] = backendBase;
+    doc["price_cents"] = pricingSanitizeHumanPrice(pricingConfig.priceCents);
+    doc["pricing_profile"] = pricingProfileCode(pricingConfig.profile);
     doc["wifi_rssi"] = WiFi.RSSI();
     doc["wifi_ip"] = WiFi.localIP().toString();
     doc["backend_ok"] = backendReady;
@@ -1285,20 +1533,50 @@ void registerMachine() {
     serializeJson(doc, body);
 
     int code = http.POST(body);
+    String responseBody = (code > 0) ? http.getString() : "";
     http.end();
+    feedWatchdog();
 
-    if      (code == 200) Serial.println("[REG] OK — maquina APROBADA");
-    else if (code == 202) { Serial.println("[REG] PENDIENTE — esperando aprobacion"); ledBlink(2, 300); }
-    else if (code == 401) Serial.println("[REG] ERROR 401 — REGISTRATION_SECRET incorrecto");
-    else if (code <= 0)   Serial.printf("[REG] Sin respuesta (verificar URL: %s)\n", backendBase.c_str());
-    else                  Serial.printf("[REG] HTTP %d\n", code);
+    if (code == 200 && responseBody.length() > 0) {
+        DynamicJsonDocument responseDoc(512);
+        DeserializationError err = deserializeJson(responseDoc, responseBody);
+        if (!err) {
+            JsonObject config = responseDoc["config"].as<JsonObject>();
+            if (!config.isNull()) {
+                uint32_t remotePrice = (uint32_t)(config["price_cents"] | 0);
+                if (remotePrice > 0) {
+                    applyConfiguredPrice(remotePrice, true, "backend/register");
+                }
+            }
+        } else {
+            Serial.printf("[REG] JSON invalido en respuesta: %s\n", err.c_str());
+        }
+    }
+
+    if (code == 200) {
+        Serial.println("[REG] OK — maquina APROBADA");
+        logDiagEvent(EVT_BACKEND_REGISTER_OK, code, pricingSanitizeHumanPrice(pricingConfig.priceCents));
+    } else if (code == 202) {
+        Serial.println("[REG] PENDIENTE — esperando aprobacion");
+        logDiagEvent(EVT_BACKEND_REGISTER_PENDING, code, 0);
+        ledBlink(2, 300);
+    } else if (code == 401) {
+        Serial.println("[REG] ERROR 401 — REGISTRATION_SECRET incorrecto");
+        logDiagEvent(EVT_BACKEND_REGISTER_FAIL, code, 0);
+    } else if (code <= 0) {
+        Serial.printf("[REG] Sin respuesta (verificar URL: %s)\n", backendBase.c_str());
+        logDiagEvent(EVT_BACKEND_REGISTER_FAIL, -2, 0);
+    } else {
+        Serial.printf("[REG] HTTP %d\n", code);
+        logDiagEvent(EVT_BACKEND_REGISTER_FAIL, code, 0);
+    }
 }
 
 bool canProcessRemoteCommand() {
-    return !pendingSession
-        && sessionUID.length() == 0
-        && mdbState != SESSION_IDLE
-        && mdbState != VEND_PENDING;
+    return !mdbRuntime.pendingSession
+        && mdbRuntime.sessionUID.length() == 0
+        && mdbRuntime.phase != SESSION_IDLE
+        && mdbRuntime.phase != VEND_PENDING;
 }
 
 bool ackRemoteCommandJson(uint32_t commandId, const char* status, const String& resultJson) {
@@ -1316,6 +1594,7 @@ bool ackRemoteCommandJson(uint32_t commandId, const char* status, const String& 
     String body = "{\"status\":\"" + String(status) + "\",\"result\":" + resultJson + "}";
     int code = http.POST(body);
     http.end();
+    feedWatchdog();
 
     if (code == 200) return true;
     Serial.printf("[REMOTE] ACK fallo para comando #%lu — HTTP %d\n",
@@ -1408,7 +1687,7 @@ bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
         return false;
     }
 
-    saveConfig(nextSSID, nextPass, nextUrl);
+    saveConfig(nextSSID, nextPass, nextUrl, pricingConfig.priceCents);
     wifiSSID = nextSSID;
     wifiPass = nextPass;
     backendBase = nextUrl;
@@ -1419,6 +1698,34 @@ bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
     delay(350);
     ESP.restart();
     return true;
+}
+
+bool handleRemoteConfigUpdate(uint32_t commandId, JsonObject payload) {
+    uint32_t nextPrice = (uint32_t)(payload["price_cents"] | 0);
+    if (nextPrice == 0) {
+        ackRemoteCommand(commandId, "failed", "price_cents remoto invalido");
+        return true;
+    }
+
+    bool changed = applyConfiguredPrice(nextPrice, true, "backend/command");
+    if (!ackRemoteCommand(commandId, "completed", changed
+        ? "Configuracion aplicada sin reinicio"
+        : "Configuracion ya vigente")) {
+        return false;
+    }
+
+    ledBlink(changed ? 3 : 1, 70);
+    logDiagEvent(EVT_REMOTE_CONFIG_APPLIED, changed ? 1 : 0, nextPrice);
+    return true;
+}
+
+bool handleRemoteDiagnosticsSnapshot(uint32_t commandId, JsonObject payload) {
+    uint8_t limit = (uint8_t)(payload["limit"] | 20);
+    if (limit == 0) limit = 20;
+    if (limit > 32) limit = 32;
+
+    String resultJson = buildDiagnosticsSnapshotJson(limit);
+    return ackRemoteCommandJson(commandId, "completed", resultJson);
 }
 
 void pollRemoteCommands() {
@@ -1436,16 +1743,19 @@ void pollRemoteCommands() {
     int code = http.GET();
     if (code == 204) {
         http.end();
+        feedWatchdog();
         return;
     }
     if (code != 200) {
         if (code > 0) Serial.printf("[REMOTE] Poll comandos HTTP %d\n", code);
         http.end();
+        feedWatchdog();
         return;
     }
 
     String body = http.getString();
     http.end();
+    feedWatchdog();
 
     DynamicJsonDocument doc(768);
     DeserializationError err = deserializeJson(doc, body);
@@ -1489,6 +1799,28 @@ void pollRemoteCommands() {
         return;
     }
 
+    if (commandType == "config_update") {
+        JsonObject payload = command["payload"].as<JsonObject>();
+        if (payload.isNull()) {
+            ackRemoteCommand(commandId, "failed", "Payload remoto invalido");
+            return;
+        }
+        handleRemoteConfigUpdate(commandId, payload);
+        return;
+    }
+
+    if (commandType == "diagnostics_snapshot") {
+        JsonObject payload = command["payload"].as<JsonObject>();
+        if (payload.isNull()) {
+            DynamicJsonDocument emptyDoc(16);
+            payload = emptyDoc.to<JsonObject>();
+            handleRemoteDiagnosticsSnapshot(commandId, payload);
+            return;
+        }
+        handleRemoteDiagnosticsSnapshot(commandId, payload);
+        return;
+    }
+
     ackRemoteCommand(commandId, "failed", "Comando no soportado por este firmware");
 }
 
@@ -1501,7 +1833,7 @@ void handleNFC() {
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
 
     // Fix Bug 6: no aceptar nuevos taps si hay sesión MDB activa
-    if (mdbState == VEND_PENDING || mdbState == SESSION_IDLE) {
+    if (mdbRuntime.phase == VEND_PENDING || mdbRuntime.phase == SESSION_IDLE) {
         Serial.println("[NFC] TAP IGNORADO — sesion MDB activa");
         ledBlink(6, 60);
         rfid.PICC_HaltA();
@@ -1523,6 +1855,7 @@ void handleNFC() {
     rfid.PCD_StopCrypto1();
 
     Serial.printf("[NFC] Tarjeta: %s\n", uid.c_str());
+    logDiagEvent(EVT_NFC_READ, 0, uid.length() >= 4 ? strtoul(uid.substring(0, 4).c_str(), nullptr, 16) : 0);
     ledBlink(1, 50);
 
     bool approved    = false;
@@ -1536,19 +1869,23 @@ void handleNFC() {
         if (code == 200) {
             Serial.println("[TAP] APROBADO (online)");
             approved = true;
+            logDiagEvent(EVT_NFC_APPROVED_ONLINE, 200, 0);
         } else if (code == 403) {
             // Leer body para distinguir razón
             // (postTap devuelve solo el código; la razón viene en el body — se loguea genérico)
             Serial.println("[TAP] DENEGADO (online) — verificar razon en backend");
+            logDiagEvent(EVT_NFC_DENIED, 403, 0);
             ledBlink(5, 80);
             return;
         } else if (code == 401) {
             Serial.println("[TAP] ERROR 401 — re-registrando maquina...");
+            logDiagEvent(EVT_NFC_DENIED, 401, 0);
             registerMachine();
             ledBlink(3, 300);
             return;
         } else if (code > 0) {
             Serial.printf("[TAP] ERROR HTTP %d\n", code);
+            logDiagEvent(EVT_NFC_DENIED, code, 0);
             ledBlink(3, 200);
             return;
         }
@@ -1564,24 +1901,27 @@ void handleNFC() {
         if (result == LOCAL_AUTH_OK) {
             Serial.println("[TAP] APROBADO (offline — cache local)");
             approved = true;
+            logDiagEvent(EVT_NFC_APPROVED_OFFLINE, 1, 0);
         } else if (result == LOCAL_AUTH_OVERLIMIT) {
             Serial.println("[TAP] DENEGADO — limite diario alcanzado (offline)");
+            logDiagEvent(EVT_NFC_DENIED, 1, 0);
             ledBlink(5, 80);
             return;
         } else {
             Serial.println("[TAP] DENEGADO — tarjeta desconocida (offline)");
+            logDiagEvent(EVT_NFC_DENIED, 2, 0);
             ledBlink(3, 200);
             return;
         }
     }
 
     // ── Iniciar sesión MDB ────────────────────────────
-    sessionUID       = uid;
-    sessionIsOffline = isOffline;
-    pendingSession   = true;
-    mdbState         = SESSION_IDLE;
-    sessionStartMs   = millis();   // Fix Bug 5: iniciar timeout
-    vendUsed         = false;      // Fix Bug 2: resetear flag de dispensado
+    mdbRuntime.sessionUID       = uid;
+    mdbRuntime.sessionIsOffline = isOffline;
+    mdbRuntime.pendingSession   = true;
+    mdbRuntime.phase            = SESSION_IDLE;
+    mdbRuntime.sessionStartMs   = millis();   // Fix Bug 5: iniciar timeout
+    mdbRuntime.vendUsed         = false;      // Fix Bug 2: resetear flag de dispensado
     ledBlink(2, 100);
 }
 
@@ -1590,58 +1930,56 @@ void handleNFC() {
 //  MDB handlers
 // ══════════════════════════════════════════════════════
 void mdbSendACK()  {
-#if DEBUG_MDB
-    Serial.printf("[MDB][TX] ACK (0x%02X) mode=1\n", MDB_ACK);
-#endif
+    MDB_LOG_TRACE("[MDB][TX] ACK (0x%02X) mode=1\n", MDB_ACK);
     mdb.sendAddress(MDB_ACK);  // ACK = 0x00 con 9no bit = 1
 }
 void mdbSendNAK()  {
-#if DEBUG_MDB
-    Serial.printf("[MDB][TX] NAK (0x%02X) mode=1\n", MDB_NAK);
-#endif
+    MDB_LOG_TRACE("[MDB][TX] NAK (0x%02X) mode=1\n", MDB_NAK);
     mdb.sendAddress(MDB_NAK);  // NAK = 0xFF con 9no bit = 1
 }
 void mdbSendByte(uint8_t b) {
-#if DEBUG_MDB
-    Serial.printf("[MDB][TX] Byte: 0x%02X\n", b);
-#endif
+    MDB_LOG_TRACE("[MDB][TX] Byte: 0x%02X\n", b);
     mdb.sendData(b);        // data con mode=0
     mdb.sendAddress(b);     // checksum con mode=1
 }
 void mdbSendData(uint8_t* data, uint8_t len) {
     uint8_t chk = 0;
     for (uint8_t i = 0; i < len; i++) {
-#if DEBUG_MDB
-        Serial.printf("[MDB][TX] Data[%d]: 0x%02X\n", i, data[i]);
-#endif
+        MDB_LOG_TRACE("[MDB][TX] Data[%d]: 0x%02X\n", i, data[i]);
         mdb.sendData(data[i]); chk += data[i];
     }
-#if DEBUG_MDB
-    Serial.printf("[MDB][TX] CHK: 0x%02X mode=1\n", chk);
-#endif
+    MDB_LOG_TRACE("[MDB][TX] CHK: 0x%02X mode=1\n", chk);
     mdb.sendAddress(chk);  // Checksum con 9no bit = 1
 }
 
 void cmdReset() {
-    mdbState = INACTIVE; justReset = true; pendingSession = false;
-    vendApproved = false; vendUsed = false;
-    sessionUID = ""; sessionIsOffline = false;
+    mdbRuntime.phase = INACTIVE;
+    mdbRuntime.justReset = true;
+    mdbRuntime.pendingSession = false;
+    mdbRuntime.vendApproved = false;
+    mdbRuntime.vendUsed = false;
+    mdbRuntime.sessionUID = "";
+    mdbRuntime.sessionIsOffline = false;
+    resetMdbSetupSnapshot();
     mdbSendACK();
-    Serial.printf("[MDB] RESET recibido → INACTIVE (TX pin=%d)\n", PIN_MDB_TX);
+    logDiagEvent(EVT_MDB_RESET, 0, 0);
+    MDB_LOG_EVENT("[MDB] RESET recibido → INACTIVE (TX pin=%d)\n", PIN_MDB_TX);
 }
 
 void cmdSetup(uint8_t* d, uint8_t len) {
     if (len == 0) { mdbSendNAK(); return; }
-    Serial.printf("[MDB] VMC SETUP data: len=%d", len);
-    for (int i = 0; i < len; i++) Serial.printf(" %02X", d[i]);
-    Serial.println();
+    captureMdbSetup(d, len);
+    if (DEBUG_MDB_TRACE) {
+        MDB_LOG_TRACE("[MDB] VMC SETUP data: len=%d", len);
+        for (int i = 0; i < len; i++) MDB_LOG_TRACE(" %02X", d[i]);
+        MDB_LOG_TRACELN("");
+    }
     if (d[0] == SETUP_CONFIG) {
-        Serial.println("[MDB] SETUP config → MDB_DISABLED");
-        // Feature Level 1 + Country Code Argentina (032).
-        // Scale=100, DecimalPlaces=2 → funds×100 centavos
-        uint8_t r[] = {0x01, 0x00, 0x32, 0x64, 0x02, 0x05, 0x00};
+        MDB_LOG_EVENTLN("[MDB] SETUP config → MDB_DISABLED");
+        uint8_t r[7];
+        pricingBuildSetupConfigResponse(pricingConfig, r);
         mdbSendData(r, sizeof(r));
-        mdbState = MDB_DISABLED;
+        mdbRuntime.phase = MDB_DISABLED;
     } else {
         mdbSendACK();
     }
@@ -1651,7 +1989,7 @@ void cmdExpansion(uint8_t* d, uint8_t len) {
     if (len == 0) { mdbSendNAK(); return; }
 
     if (d[0] == EXPANSION_REQUEST_ID) {
-        Serial.println("[MDB] EXPANSION REQUEST_ID");
+        MDB_LOG_EVENTLN("[MDB] EXPANSION REQUEST_ID");
         uint8_t r[30];
         memset(r, ' ', sizeof(r));
         r[0] = 0x09;  // Peripheral ID
@@ -1666,12 +2004,12 @@ void cmdExpansion(uint8_t* d, uint8_t len) {
 }
 
 void cmdPoll() {
-    switch (mdbState) {
+    switch (mdbRuntime.phase) {
         case INACTIVE:
-            if (justReset) {
+            if (mdbRuntime.justReset) {
                 mdbSendByte(MDB_JUST_RESET);
-                justReset = false;
-                mdbState = MDB_DISABLED;
+                mdbRuntime.justReset = false;
+                mdbRuntime.phase = MDB_DISABLED;
             } else {
                 mdbSendACK();
             }
@@ -1681,30 +2019,32 @@ void cmdPoll() {
         case ENABLED:  mdbSendACK(); break;
 
         case SESSION_IDLE:
-            if (pendingSession) {
-                Serial.printf("[MDB] BEGIN SESSION → funds=0x%04X\n", FUNDS_UNLIMITED);
+            if (mdbRuntime.pendingSession) {
+                uint16_t sessionFunds = currentConfiguredSessionFunds();
+                MDB_LOG_EVENT("[MDB] BEGIN SESSION → funds=0x%04X\n", sessionFunds);
+                logDiagEvent(EVT_MDB_BEGIN_SESSION, mdbRuntime.phase, sessionFunds);
                 uint8_t r[3] = {MDB_BEGIN_SESSION,
-                                (FUNDS_UNLIMITED >> 8) & 0xFF,
-                                 FUNDS_UNLIMITED        & 0xFF};
+                                (uint8_t)((sessionFunds >> 8) & 0xFF),
+                                (uint8_t)( sessionFunds        & 0xFF)};
                 mdbSendData(r, 3);
-                pendingSession = false;
+                mdbRuntime.pendingSession = false;
             } else {
                 mdbSendACK();
             }
             break;
 
         case VEND_PENDING:
-            if (vendApproved) {
+            if (mdbRuntime.vendApproved) {
                 uint8_t r[3] = {MDB_VEND_APPROVED,
-                                (uint8_t)((vendAmount >> 8) & 0xFF),
-                                (uint8_t)( vendAmount        & 0xFF)};
+                                (uint8_t)((mdbRuntime.vendAmount >> 8) & 0xFF),
+                                (uint8_t)( mdbRuntime.vendAmount        & 0xFF)};
                 mdbSendData(r, 3);
-                vendApproved = false;
+                mdbRuntime.vendApproved = false;
             } else {
                 mdbSendByte(MDB_VEND_DENIED);
-                mdbState = ENABLED;
-                sessionUID = "";
-                sessionIsOffline = false;
+                mdbRuntime.phase = ENABLED;
+                mdbRuntime.sessionUID = "";
+                mdbRuntime.sessionIsOffline = false;
             }
             break;
     }
@@ -1716,61 +2056,65 @@ void cmdVend(uint8_t* d, uint8_t len) {
     switch (d[0]) {
         case VEND_REQUEST:
             if (len >= 5) {
-                sessionAmount = ((uint16_t)d[1] << 8) | d[2];
-                sessionItemId = ((uint16_t)d[3] << 8) | d[4];
-                Serial.printf("[MDB] VEND_REQUEST — item #%d $%d centavos\n",
-                              sessionItemId, sessionAmount);
+                mdbRuntime.sessionAmount = ((uint16_t)d[1] << 8) | d[2];
+                mdbRuntime.sessionItemId = ((uint16_t)d[3] << 8) | d[4];
+                MDB_LOG_EVENT("[MDB] VEND_REQUEST — item #%d $%d centavos\n",
+                              mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
+                logDiagEvent(EVT_MDB_VEND_REQUEST, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
                 // Fix Bug 2: solo 1 dispensado por autorización NFC
-                if (vendUsed) {
-                    Serial.println("[MDB] Denegado — ya se dispenso en esta sesion");
-                    vendApproved = false;
-                    mdbState = VEND_PENDING;
+                if (mdbRuntime.vendUsed) {
+                    MDB_LOG_EVENTLN("[MDB] Denegado — ya se dispenso en esta sesion");
+                    mdbRuntime.vendApproved = false;
+                    mdbRuntime.phase = VEND_PENDING;
                 } else {
-                    vendApproved = true;
-                    vendAmount = sessionAmount;
-                    mdbState = VEND_PENDING;
+                    mdbRuntime.vendApproved = true;
+                    mdbRuntime.vendAmount = mdbRuntime.sessionAmount;
+                    mdbRuntime.phase = VEND_PENDING;
                 }
             }
             mdbSendACK();
             break;
 
         case VEND_SUCCESS:
-            Serial.println("[MDB] VEND_SUCCESS — venta confirmada");
-            notifyVendResult(sessionUID, sessionItemId, sessionAmount, true);
-            vendUsed = true;  // Fix Bug 2
+            MDB_LOG_EVENTLN("[MDB] VEND_SUCCESS — venta confirmada");
+            logDiagEvent(EVT_MDB_VEND_SUCCESS, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
+            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, true);
+            mdbRuntime.vendUsed = true;  // Fix Bug 2
             mdbSendACK();
-            mdbState = SESSION_IDLE;
+            mdbRuntime.phase = SESSION_IDLE;
             break;
 
         case VEND_FAILURE:
-            Serial.println("[MDB] VEND_FAILURE — venta fallida");
-            notifyVendResult(sessionUID, sessionItemId, sessionAmount, false);
+            MDB_LOG_EVENTLN("[MDB] VEND_FAILURE — venta fallida");
+            logDiagEvent(EVT_MDB_VEND_FAILURE, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
+            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, false);
             mdbSendACK();
-            mdbState = SESSION_IDLE;
-            sessionUID = "";
-            vendUsed = false;
-            sessionIsOffline = false;
+            mdbRuntime.phase = SESSION_IDLE;
+            mdbRuntime.sessionUID = "";
+            mdbRuntime.vendUsed = false;
+            mdbRuntime.sessionIsOffline = false;
             break;
 
         case VEND_END:
-            Serial.println("[MDB] VEND_END — sesion cerrada");
+            MDB_LOG_EVENTLN("[MDB] VEND_END — sesion cerrada");
+            logDiagEvent(EVT_MDB_VEND_END, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
             // Fix Bug 1: si no hubo dispensado, cancelar tap en backend
-            if (sessionUID.length() > 0 && !vendUsed) {
-                Serial.printf("[MDB] VEND_END sin dispensado — cancelando tap de %s\n",
-                              sessionUID.c_str());
-                notifyVendResult(sessionUID, 0, 0, false);
+            if (mdbRuntime.sessionUID.length() > 0 && !mdbRuntime.vendUsed) {
+                MDB_LOG_EVENT("[MDB] VEND_END sin dispensado — cancelando tap de %s\n",
+                              mdbRuntime.sessionUID.c_str());
+                notifyVendResult(mdbRuntime.sessionUID, 0, 0, false);
             }
             mdbSendByte(MDB_END_SESSION);
-            mdbState = ENABLED;
-            sessionUID = "";
-            vendUsed = false;
-            sessionIsOffline = false;
+            mdbRuntime.phase = ENABLED;
+            mdbRuntime.sessionUID = "";
+            mdbRuntime.vendUsed = false;
+            mdbRuntime.sessionIsOffline = false;
             break;
 
         case VEND_CANCEL:
-            Serial.println("[MDB] VEND_CANCEL");
+            MDB_LOG_EVENTLN("[MDB] VEND_CANCEL");
             mdbSendByte(MDB_CANCELLED);
-            mdbState = SESSION_IDLE;
+            mdbRuntime.phase = SESSION_IDLE;
             break;
 
         default: mdbSendNAK();
@@ -1781,22 +2125,22 @@ void cmdReader(uint8_t* d, uint8_t len) {
     if (len == 0) { mdbSendNAK(); return; }
 
     if (d[0] == READER_ENABLE) {
-        Serial.println("[MDB] READER ENABLE → ENABLED");
-        mdbState = ENABLED;
+        MDB_LOG_EVENTLN("[MDB] READER ENABLE → ENABLED");
+        mdbRuntime.phase = ENABLED;
     }
     if (d[0] == READER_DISABLE) {
-        Serial.println("[MDB] READER DISABLE → MDB_DISABLED");
+        MDB_LOG_EVENTLN("[MDB] READER DISABLE → MDB_DISABLED");
         // Fix Bug 1: cancelar tap si había sesión sin dispensado
-        if (sessionUID.length() > 0 && !vendUsed) {
-            Serial.printf("[MDB] READER_DISABLE mid-session — cancelando tap de %s\n",
-                          sessionUID.c_str());
-            notifyVendResult(sessionUID, 0, 0, false);
+        if (mdbRuntime.sessionUID.length() > 0 && !mdbRuntime.vendUsed) {
+            MDB_LOG_EVENT("[MDB] READER_DISABLE mid-session — cancelando tap de %s\n",
+                          mdbRuntime.sessionUID.c_str());
+            notifyVendResult(mdbRuntime.sessionUID, 0, 0, false);
         }
-        mdbState = MDB_DISABLED;
-        sessionUID = "";
-        vendUsed = false;
-        pendingSession = false;
-        sessionIsOffline = false;
+        mdbRuntime.phase = MDB_DISABLED;
+        mdbRuntime.sessionUID = "";
+        mdbRuntime.vendUsed = false;
+        mdbRuntime.pendingSession = false;
+        mdbRuntime.sessionIsOffline = false;
     }
     mdbSendACK();
 }
@@ -1820,7 +2164,7 @@ void handleMDB() {
         mdb.read(1);
         cmdReset();
         unsigned long dt = micros() - t0;
-        Serial.printf("[MDB] RESET → ACK inmediato dt=%luus\n", dt);
+        MDB_LOG_TIMING("[MDB] RESET → ACK inmediato dt=%luus\n", dt);
         return;
     }
 
@@ -1845,9 +2189,7 @@ void handleMDB() {
 
     // ── Después de responder, loguear ──
     unsigned long dt = micros() - t0;
-#if DEBUG_MDB_LOG
-    Serial.printf("[MDB] cmd=%d dt=%luus\n", cmd, dt);
-#endif
+    MDB_LOG_TIMING("[MDB] cmd=%d dt=%luus\n", cmd, dt);
 }
 
 
@@ -1857,6 +2199,9 @@ void handleMDB() {
 void setup() {
     Serial.begin(115200);
     delay(100);
+    diagEventLog.clear();
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    logDiagEvent(EVT_BOOT, (int16_t)resetReason, 0);
 
     pinMode(PIN_LED, OUTPUT);
     pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
@@ -1873,8 +2218,12 @@ void setup() {
     Serial.println("  CoffeeControl Firmware v3");
     Serial.printf ("  MAC:  %s\n", macAddress.c_str());
     Serial.printf ("  Modo: %s\n", DEPLOYMENT_MODE);
+    Serial.printf ("  Reset: %s\n", resetReasonLabel(resetReason));
     Serial.println("====================================");
     Serial.println();
+
+    // Config local (WiFi/backend/precio) antes de exponer MDB
+    readConfig();
 
     // I²C + DS3231 RTC
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -1914,15 +2263,13 @@ void setup() {
     Serial.println("[MDB] UART HW listo (TX=GPIO20, RX=GPIO21)");
 
     // Arrancar tarea MDB independiente para responder al VMC durante boot
-    extern void handleMDB();
     xTaskCreatePinnedToCore(
-        [](void*) { for (;;) { handleMDB(); vTaskDelay(1); } },
+        mdbCommandTask,
         "mdb_cmd", 4096, NULL, 4, NULL, 1
     );
     Serial.println("[MDB] Tarea MDB command handler iniciada");
 
     // WiFi
-    readConfig();
     if (wifiSSID.length() == 0) {
         Serial.println("[BOOT] Sin red configurada → modo portal");
         startPortal();
@@ -1956,6 +2303,7 @@ void setup() {
         }
     }
 
+    initWatchdog();
     Serial.println("[BOOT] Sistema listo\n");
 }
 
@@ -1967,6 +2315,7 @@ void loop() {
     handleResetButtonRuntime();
 
     if (portalMode) {
+        feedWatchdog();
         dnsServer.processNextRequest();
         portalServer.handleClient();
         return;
@@ -1976,22 +2325,23 @@ void loop() {
     handleNFC();
 
     // ── Fix Bug 5: timeout SESSION_IDLE ──────────────
-    if (pendingSession && (millis() - sessionStartMs > SESSION_TIMEOUT_MS)) {
+    if (mdbRuntime.pendingSession && (millis() - mdbRuntime.sessionStartMs > SESSION_TIMEOUT_MS)) {
         Serial.printf("[TMO] Timeout SESSION_IDLE — cancelando tap de %s\n",
-                      sessionUID.c_str());
-        String cancelUid    = sessionUID;
-        bool   wasOffline   = sessionIsOffline;
-        sessionUID          = "";
-        pendingSession      = false;
-        mdbState            = MDB_DISABLED;
-        vendApproved        = false;
-        vendUsed            = false;
-        sessionIsOffline    = false;
+                      mdbRuntime.sessionUID.c_str());
+        logDiagEvent(EVT_SESSION_TIMEOUT, mdbRuntime.phase, millis() - mdbRuntime.sessionStartMs);
+        String cancelUid    = mdbRuntime.sessionUID;
+        bool   wasOffline   = mdbRuntime.sessionIsOffline;
+        mdbRuntime.sessionUID       = "";
+        mdbRuntime.pendingSession   = false;
+        mdbRuntime.phase            = MDB_DISABLED;
+        mdbRuntime.vendApproved     = false;
+        mdbRuntime.vendUsed         = false;
+        mdbRuntime.sessionIsOffline = false;
 
         // wasOffline afecta cómo notifyVendResult enruta el evento
-        sessionIsOffline = wasOffline;
+        mdbRuntime.sessionIsOffline = wasOffline;
         notifyVendResult(cancelUid, 0, 0, false);
-        sessionIsOffline = false;
+        mdbRuntime.sessionIsOffline = false;
 
         ledBlink(4, 150);
     }
@@ -2010,6 +2360,7 @@ void loop() {
             // Reconectado: vaciar cola y refrescar cards
             wifiReady = true;
             Serial.println("[WiFi] Reconectado");
+            logDiagEvent(EVT_WIFI_RECONNECTED, WiFi.RSSI(), WiFi.localIP());
             checkBackend();
             registerMachine();
             flushQueue();
@@ -2055,9 +2406,10 @@ void loop() {
         Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | RTC:%s\n",
                      WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
                       backendReady ? "OK" : "OFFLINE",
-                      stStr[mdbState], cardCount, queueLen,
+                      stStr[mdbRuntime.phase], cardCount, queueLen,
                       rtcAvailable ? "DS3231" : "NTP");
     }
 
+    feedWatchdog();
     yield();
 }

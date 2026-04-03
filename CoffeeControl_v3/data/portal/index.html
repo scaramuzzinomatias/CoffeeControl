@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CoffeeControl Setup</title>
+  <link rel="stylesheet" href="/portal.css?v=2">
+  <script defer src="/portal.js?v=2"></script>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">Portal de instalacion</p>
+      <h1>CoffeeControl</h1>
+      <p class="sub">Configura WiFi, backend y precio sin recompilar el firmware.</p>
+      <p class="hero-note">
+        Podes escanear redes visibles, probar conectividad antes de guardar y volver a este portal
+        manteniendo BOOT presionado.
+      </p>
+    </section>
+
+    <section class="card">
+      <div class="status hidden" id="status" aria-live="polite"></div>
+      <div class="err hidden" id="err" aria-live="assertive"></div>
+      <div class="ok hidden" id="ok" aria-live="polite"></div>
+
+      <form id="configForm" method="post" action="/save" novalidate>
+        <section class="section">
+          <div class="section-title">Conexion WiFi</div>
+          <label for="ssidInput">Red WiFi (SSID) *</label>
+          <input id="ssidInput" name="ssid" type="text" placeholder="NombreDeLaRed" autocomplete="off" required>
+          <p class="hint">Podes escribir el SSID manualmente o elegir una red detectada.</p>
+
+          <button type="button" class="ghost" id="scanBtn">Escanear redes</button>
+          <div class="scan-status hidden" id="scanStatus"></div>
+
+          <div class="selected-net hidden" id="selectedNet">
+            <div class="selected-dot"></div>
+            <div>
+              <div class="selected-kicker" id="selectedNetMode">Red lista para guardar</div>
+              <div class="selected-name" id="selectedNetName"></div>
+            </div>
+          </div>
+
+          <div class="scan-list hidden" id="scanList"></div>
+
+          <label for="wifiPass">Contrasena WiFi</label>
+          <input id="wifiPass" name="pass" type="password" autocomplete="off">
+          <label class="pw-row" for="showPass">
+            <input id="showPass" type="checkbox">
+            <span>Mostrar contrasena</span>
+          </label>
+          <p class="hint">Las credenciales guardadas no se borran hasta que guardes nuevos cambios.</p>
+        </section>
+
+        <section class="section" id="urlSection">
+          <div class="section-title">Servidor</div>
+          <label for="urlInput">URL del servidor</label>
+          <input id="urlInput" name="url" type="text" placeholder="http://192.168.1.50:3000" autocomplete="off">
+          <p class="hint">Usa la direccion del backend donde corre CoffeeControl.</p>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Precio</div>
+          <label for="priceInput">Precio del producto *</label>
+          <input id="priceInput" name="price" type="number" min="1" step="1" inputmode="numeric" required>
+          <p class="hint">Ingresa el valor humano, por ejemplo 1200. La conversion MDB interna la hace el firmware.</p>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Diagnostico</div>
+          <p class="hint">Permite ver lo ultimo que registró el equipo sin abrir el monitor serie.</p>
+          <div class="diag-actions">
+            <button type="button" class="ghost" id="diagEventsBtn">Ver eventos</button>
+            <button type="button" class="ghost" id="diagMdbBtn">Ver setup MDB</button>
+          </div>
+          <div class="scan-status hidden" id="diagStatus"></div>
+          <div class="diag-grid">
+            <div class="diag-card">
+              <div class="diag-title">Eventos</div>
+              <pre class="diag-output hidden" id="diagEventsOutput"></pre>
+            </div>
+            <div class="diag-card">
+              <div class="diag-title">MDB</div>
+              <pre class="diag-output hidden" id="diagMdbOutput"></pre>
+            </div>
+          </div>
+        </section>
+
+        <div class="info" id="deviceInfo">Cargando informacion del equipo...</div>
+
+        <div class="actions">
+          <button type="button" class="ghost" id="testBtn">Probar conexion</button>
+          <button type="submit" id="saveBtn">Guardar y conectar</button>
+        </div>
+
+        <noscript>
+          <p class="hint">
+            El portal funciona sin JavaScript para guardar la configuracion. Si queres escaneo y prueba
+            de conectividad, habilita JavaScript en el navegador del telefono.
+          </p>
+        </noscript>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

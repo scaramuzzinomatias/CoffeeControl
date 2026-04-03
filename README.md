@@ -160,6 +160,7 @@ psql $DATABASE_URL -f sql/migration_v21.sql
 psql $DATABASE_URL -f sql/migration_v22.sql
 psql $DATABASE_URL -f sql/migration_v23.sql
 psql $DATABASE_URL -f sql/migration_v24.sql
+psql $DATABASE_URL -f sql/migration_v25.sql
 ```
 
 Configurar variables de entorno (crear `.env` en `backend/`):
@@ -214,7 +215,16 @@ Para flashear en modo manual: mantener **BOOT** → presionar **EN** → soltar 
 6. En instalaciones `local`, ingresar la URL del backend
 7. Opcional: tocar **Probar conexión** para validar WiFi + `/health` del backend antes de guardar
 8. Guardar → el ESP reinicia y aparece como **pendiente** en el panel admin
-9. Aprobar desde el panel (asignar nombre y ubicación)
+9. Aprobar desde el panel (asignar nombre, ubicación y precio humano, por ejemplo `1200`)
+
+**Portal desacoplado en LittleFS:**
+- la UI del portal ahora vive en:
+  - `CoffeeControl_v3/data/portal/index.html`
+  - `CoffeeControl_v3/data/portal/styles.css`
+  - `CoffeeControl_v3/data/portal/app.js`
+- después de cambiar esos archivos, además del firmware conviene cargar filesystem:
+  - `platformio run -e esp32c3 -t uploadfs`
+- si por alguna razón el filesystem no está cargado, el ESP muestra un portal de emergencia mínimo para guardar WiFi, backend y precio igual
 
 **Acceso manual al portal con botón BOOT (GPIO9):**
 - Mantener 5 segundos con el firmware ya iniciado y soltar → abre el AP `CoffeeControl-Setup`
@@ -234,7 +244,7 @@ Abrir `http://<ip-servidor>:3000` en el navegador.
 | Sección | Descripción |
 |---|---|
 | **Dashboard** | Métricas del día, consumo mensual, % sobre límite, máquinas online/offline, alertas |
-| **Máquinas** | Lista con estado online, detalle de red (SSID/IP/RSSI/backend), reinicio remoto, cambio de WiFi, escaneo remoto de redes, stock por selección, bloquear/desbloquear y aprobar nuevas |
+| **Máquinas** | Lista con estado online, detalle de red (SSID/IP/RSSI/backend), precio configurable por máquina, reinicio remoto, cambio de WiFi, escaneo remoto de redes, stock por selección, bloquear/desbloquear y aprobar nuevas |
 | **Stock** | Control manual/estimado por máquina y selección, con reposición, ajuste e historial de movimientos |
 | **Empleados** | CRUD completo, asignar tarjetas NFC, definir política diaria manual o asociar una jerarquía reutilizable (`bloquear`, `solo advertir`, `sin límite`) e historial de consumo |
 | **Jerarquías** | ABM de niveles de acceso reutilizables, con límite diario, modo, advertencia y orden |
@@ -250,6 +260,114 @@ Abrir `http://<ip-servidor>:3000` en el navegador.
 ### Indicador online/offline de máquinas
 
 Cada máquina muestra un punto **verde** (activa en los últimos 3 minutos) o **gris** (offline). El firmware hace heartbeat cada 60 segundos actualizando `last_seen` en la base de datos.
+
+### Precio configurable por máquina
+
+El precio del café ahora se maneja como un valor **humano** por máquina:
+
+- backend: `machines.price_cents`
+- panel admin: edición como `1200`, `1500`, etc.
+- portal del ESP32-C3: edición del mismo valor humano
+- firmware: conversión interna automática a las unidades MDB que requiere la máquina actual
+
+Si el precio cambia desde `Máquinas`:
+
+- si la máquina está online y sin otros comandos pendientes, el backend encola automáticamente un `config_update`
+- si está offline, el cambio queda persistido y marcado para reconectarse
+- si ya había otro comando pendiente, el panel avisa que la sincronización remota quedó diferida
+
+El operador nunca tiene que cargar el valor técnico MDB interno.
+
+### Diagnóstico rápido en el ESP32-C3
+
+El firmware v3 ahora mantiene un `event log` compacto en RAM para soporte de campo:
+
+- ring buffer fijo de `64` eventos
+- estructura compacta (sin strings grandes en RAM)
+- pensado para dejar trazas cortas de:
+  - boot
+  - WiFi
+  - salud backend
+  - registro de máquina
+  - descargas de tarjetas
+  - cola offline
+  - secuencia MDB principal
+  - aplicación remota de `config_update`
+
+Consulta rápida desde el portal:
+
+- `GET /diag/events`
+- `GET /diag/events?limit=20`
+- `GET /diag/mdb`
+- la UI del portal ya expone botones `Ver eventos` y `Ver setup MDB`
+
+Se expone solo cuando el portal del ESP está activo.
+
+`/diag/mdb` devuelve el último `SETUP` visto desde el VMC como hint de compatibilidad:
+
+- `vmc_level`
+- `display_columns`
+- `display_rows`
+- `display_info`
+- `max_price`
+- `min_price`
+- `raw`
+
+Importante:
+
+- hoy esto es solo diagnóstico
+- no cambia todavía la respuesta MDB ni el cálculo de precio
+- sirve para comparar cómo está negociando cada máquina sin tocar el flujo actual
+
+Diagnóstico remoto desde backend/panel:
+
+- nuevo comando remoto `diagnostics_snapshot`
+- disponible para usuarios con operación de máquinas (`tecnico`, `distribuidor`, `gerente`, `admin`)
+- visible en `Máquinas` como botón `Diag`
+- reutiliza la misma cola segura de comandos remotos que `reboot`, `wifi_scan` y `config_update`
+- devuelve snapshot con:
+  - conectividad WiFi/backend
+  - cola offline pendiente
+  - precio/perfil activo
+  - últimos eventos del `event log`
+  - último `SETUP` MDB capturado
+
+### Cola offline robusta
+
+La cola offline del firmware v3 ya no reescribe el JSON completo en cada evento.
+
+Ahora usa:
+
+- journal append-only en `LittleFS` (`/queue.log`)
+- compactación solo después de flush exitoso
+- migración automática desde la cola legacy `queue.json` si un equipo viejo todavía la tiene
+
+Beneficios:
+
+- menos desgaste de flash
+- menor riesgo de corrupción ante corte de energía
+- persistencia incremental por evento
+- mejor base para seguir endureciendo el modo offline
+
+### Watchdog del firmware
+
+El firmware v3 ya incluye `task watchdog` del ESP32-C3 en modo conservador:
+
+- timeout actual: `20s`
+- tareas vigiladas:
+  - `loopTask`
+  - tarea MDB
+- `feed` explícito en:
+  - loop principal
+  - tarea MDB
+  - reconexión WiFi
+  - chequeos backend
+  - registro de máquina
+  - flush offline
+  - descarga de tarjetas
+  - polling de comandos remotos
+
+Además, al boot el firmware informa la razón del último reset (`POWERON`, `SW`, `TASK_WDT`, etc.), lo que ayuda mucho para soporte de campo.
 
 ### Reportes avanzados
 
@@ -520,8 +638,13 @@ POST /api/auth/login          { username, password } → { token, role }
 POST /api/tap                 { nfc_uid } → 200 | 403 | 401
 POST /api/tap/confirm         { nfc_uid, item_id, amount }
 POST /api/tap/cancel          { nfc_uid }
-POST /api/machines/register   { mac } → 200 | 202 (pendiente)
+POST /api/machines/register   { mac, price_cents?, pricing_profile? } → 200 | 202 (pendiente)
 ```
+
+Notas:
+
+- `POST /api/machines/register` devuelve la configuración efectiva aprobada por backend, incluyendo `config.price_cents`
+- cuando cambia el precio de una máquina desde el panel, el backend puede encolar un `config_update` para que el ESP lo aplique sin recompilar
 
 ### Panel admin (auth JWT — header Authorization: Bearer token)
 ```
@@ -532,7 +655,9 @@ GET  /api/dashboard/unknown-uids
 
 GET  /api/machines              ← incluye campo online: bool
 GET  /api/machines/pending
-POST /api/machines/pending/:id/approve  { name, location }
+POST /api/machines/pending/:id/approve  { name, location, price_cents }
+POST /api/machines                      { name, location, mac, price_cents }
+PATCH /api/machines/:id                { name?, location?, price_cents? } → { machine, config_sync }
 POST /api/machines/:id/block    { reason }
 POST /api/machines/:id/unblock
 
@@ -582,14 +707,14 @@ node scripts/support-user.js --username dist.norte --password coffeecontrol2024 
 Qué hace cada uno:
 
 - `db:init`: aplica el estado actual de `sql/schema.sql` sobre una base vacía.
-- `db:migrate:all`: ejecuta en orden todas las migraciones `migration_v2.sql ... migration_v23.sql`.
+- `db:migrate:all`: ejecuta en orden todas las migraciones `migration_v2.sql ... migration_v25.sql`.
 - `db:backup`: genera un backup lógico con `pg_dump` en `backups/db/` o en la ruta indicada por `--output`.
 - `db:purge`: limpia datos operativos/transaccionales sin borrar usuarios, empleados, TAGs, máquinas, jerarquías, configuración ni stock configurado. También resetea `last_seen` y la telemetría dinámica de máquinas.
 - `db:drop`: borra la base configurada en `DATABASE_URL`; exige confirmación explícita con `--confirm nombre_bd`.
 - `db:restore`: restaura un backup `.sql` o `.dump`; acepta `--recreate` para reconstruir la base antes de restaurar.
 - `db:rebuild`: reconstruye la base desde cero usando `schema.sql` y luego aplica las migraciones faltantes del repo.
 - `support:doctor`: valida `.env`, conexión PostgreSQL, tablas clave, SMTP y `/health` del backend.
-- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos, permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor`, cuentas protegidas y la capa móvil (`mobile-auth` + `mobile-tech`).
+- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos (incluyendo `diagnostics_snapshot`), permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor`, cuentas protegidas y la capa móvil (`mobile-auth` + `mobile-tech`).
 - `support:reset-admin`: wrapper para resetear o crear el usuario `admin` del panel.
 - `support:user`: crea o actualiza cualquier usuario del panel (`admin`, `gerente`, `supervisor`, `tecnico`, `distribuidor`). Si el rol es `supervisor`, acepta múltiples áreas con `--departments`. También permite marcar o desmarcar cuentas protegidas con `--protected` / `--unprotect`.
 - `support:create-supervisor`: wrapper cómodo de `support:user` para supervisores; igual requiere `--username`, `--password` y opcionalmente `--departments`.
@@ -714,6 +839,7 @@ Acceso:
 - [x] Perfil técnico para operar máquinas, stock y comandos remotos sin permisos gerenciales
 - [x] App técnico PWA para máquinas, stock, WiFi remoto y onboarding
 - [x] Jerarquías de acceso reutilizables con política efectiva online/offline y filtro en reportes
+- [x] Precio configurable por máquina en backend, panel admin y portal del ESP32-C3, con conversión MDB interna en firmware
 - [x] Scripts DB y soporte (`db:migrate:all`, `support:doctor`, reseteo/alta de usuarios del panel)
 - [x] Tests de integración mínimos (`npm run test:integration`)
 - [~] App técnico Android nativa (operativa en teléfono real; falta pulido UX y validación en vivo de WiFi/pending)

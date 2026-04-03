@@ -938,15 +938,18 @@ async function approvePending(id,mac){
     <p style="font-size:13px;color:var(--tx2);margin-bottom:16px">MAC: <code style="font-family:monospace;font-size:12px">${mac}</code></p>
     <div class="field"><label>Nombre de la máquina *</label><input id="pName" placeholder="Máquina A — Piso 1" autofocus></div>
     <div class="field"><label>Ubicación</label><input id="pLoc" placeholder="Piso 1, sector entrada"></div>
+    <div class="field"><label>Precio del café *</label><input id="pPrice" type="number" min="1" step="1" value="1200" placeholder="1200"></div>
     <div class="err-banner" id="pErr"></div>
   `,`doApprovePending(${id})`);
 }
 
 async function doApprovePending(id){
   const name=document.getElementById('pName').value.trim();
+  const price=parseInt(document.getElementById('pPrice')?.value||'0',10);
   if(!name){showModalErr('pErr','El nombre es requerido');return;}
+  if(!Number.isInteger(price) || price<=0){showModalErr('pErr','El precio debe ser un entero mayor a cero');return;}
   try{
-    await api('POST',`/api/machines/pending/${id}/approve`,{name,location:v('pLoc')});
+    await api('POST',`/api/machines/pending/${id}/approve`,{name,location:v('pLoc'),price_cents:price});
     closeModal();checkPending();loadMachines();
   }catch(e){showModalErr('pErr',e.message);}
 }
@@ -1141,6 +1144,10 @@ let remoteWifiMachineName = '';
 let remoteWifiMachineState = null;
 let remoteWifiScanPollTimer = null;
 let remoteWifiScanCommandId = null;
+let remoteDiagMachineName = '';
+let remoteDiagPollTimer = null;
+let remoteDiagCommandId = null;
+let remoteDiagLastResult = null;
 let accessLevelCache = [];
 
 function isManagerRole(){
@@ -1766,7 +1773,7 @@ function applyMachineFilters(){
     const onlineDot=`<span style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${m.online?'#22c55e':'#94a3b8'};display:inline-block" title="${m.online?'Online — activa en los últimos 3 min':'Offline'}"></span>`;
     const backend=machineBackendBadge(m);
     const stockLine=machineStockSummaryHtml(m.stock_summary);
-    const networkLine=`${machineNetworkSummary(m)}</div><div style="font-size:11px;color:var(--tx3);margin-top:4px">${stockLine}`;
+    const networkLine=`${machineNetworkSummary(m)}</div><div style="font-size:11px;color:var(--tx3);margin-top:4px">Precio ${formatMachinePriceValue(m.price_cents)} · ${stockLine}`;
     const lastSeen=m.last_seen?timeSince(m.last_seen):'Nunca';
     const backendError=m.backend_error?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.backend_error)}</div>`:'';
     return `<tr>
@@ -1782,7 +1789,9 @@ function applyMachineFilters(){
           :`<button class="btn btn-xs" style="background:var(--bgd);color:var(--txd)" onclick="blockMachine(${m.id},'${m.name}')">Bloquear</button>`) : ''}
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openRemoteWifi(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>WiFi</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="restartMachine(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>Reiniciar</button>
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openRemoteDiagnostics(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>Diag</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick='openMachineStock(${m.id},${JSON.stringify(m.name)})'>Stock</button>
+        ${manager?`<button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openEditMachine(${m.id})">Editar</button>`:''}
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="machineDetail(${m.id},'${m.name}')">Ver</button>
         ${manager?`<button class="btn btn-ghost btn-xs" style="margin-left:4px;color:var(--txd)" onclick="deleteMachine(${m.id},'${m.name}')">Eliminar</button>`:''}
       </td>
@@ -1988,6 +1997,483 @@ async function scanRemoteWifi(machineId){
   }
 }
 
+function stopRemoteDiagnosticsPoll(){
+  if(remoteDiagPollTimer){clearTimeout(remoteDiagPollTimer);remoteDiagPollTimer=null;}
+  remoteDiagCommandId=null;
+}
+
+function setRemoteDiagStatus(msg,tone='info'){
+  const el=document.getElementById('mdDiagStatus');
+  if(!el) return;
+  if(!msg){
+    el.style.display='none';
+    el.textContent='';
+    return;
+  }
+  const palette=tone==='error'
+    ? {bg:'rgba(190,24,93,.08)', br:'rgba(190,24,93,.16)', tx:'var(--txd)'}
+    : tone==='ok'
+      ? {bg:'rgba(14,116,144,.08)', br:'rgba(14,116,144,.14)', tx:'var(--txs)'}
+      : {bg:'rgba(15,23,42,.04)', br:'rgba(148,163,184,.26)', tx:'var(--tx2)'};
+  el.style.display='block';
+  el.style.background=palette.bg;
+  el.style.border=`1px solid ${palette.br}`;
+  el.style.color=palette.tx;
+  el.textContent=msg;
+}
+
+function formatDiagValue(value,fallback='—'){
+  return value===null || value===undefined || value==='' ? fallback : String(value);
+}
+
+function formatDiagUptime(ms){
+  const totalSeconds=Math.max(0,Math.floor(Number(ms||0)/1000));
+  const minutes=Math.floor(totalSeconds/60);
+  const seconds=totalSeconds%60;
+  if(minutes<=0) return `${seconds}s`;
+  const hours=Math.floor(minutes/60);
+  const remMinutes=minutes%60;
+  if(hours<=0) return `${minutes}m ${seconds}s`;
+  return `${hours}h ${remMinutes}m ${seconds}s`;
+}
+
+function remoteDiagResetReasonLabel(code){
+  const map={
+    0:'UNKNOWN',
+    1:'POWERON',
+    2:'EXT',
+    3:'SW',
+    4:'PANIC',
+    5:'INT_WDT',
+    6:'TASK_WDT',
+    7:'WDT',
+    8:'DEEPSLEEP',
+    9:'BROWNOUT',
+    10:'SDIO'
+  };
+  return map[Number(code)]||`CODE_${String(code)}`;
+}
+
+function remoteDiagBackendHealthLabel(arg1){
+  if(arg1===-1) return 'WiFi desconectado';
+  if(arg1===-2) return 'Sin respuesta del backend';
+  if(arg1>0) return `HTTP ${arg1}`;
+  return 'Estado desconocido';
+}
+
+function remoteDiagNfcDenyLabel(arg1){
+  if(arg1===403) return 'rechazado por backend';
+  if(arg1===401) return 'máquina no autorizada o secret inválido';
+  if(arg1===1) return 'límite diario alcanzado offline';
+  if(arg1===2) return 'tarjeta desconocida offline';
+  if(arg1>0) return `HTTP ${arg1}`;
+  return 'motivo no identificado';
+}
+
+function describeRemoteDiagEvent(event){
+  const name=String(event?.name||event?.code||'UNKNOWN');
+  const arg1=Number(event?.arg1||0);
+  const arg2=Number(event?.arg2||0);
+  switch(name){
+    case 'BOOT':
+      return `Arranque del equipo. Reset: ${remoteDiagResetReasonLabel(arg1)}.`;
+    case 'WIFI_CONNECT_OK':
+      return `WiFi conectado correctamente. RSSI ${arg1} dBm.`;
+    case 'WIFI_CONNECT_FAIL':
+      return 'No pudo conectarse al WiFi guardado.';
+    case 'WIFI_RECONNECTED':
+      return `WiFi reconectado. RSSI ${arg1} dBm.`;
+    case 'BACKEND_HEALTH_OK':
+      return `Backend alcanzable. /health respondió HTTP ${arg1}.`;
+    case 'BACKEND_HEALTH_FAIL':
+      return `Falla de conectividad con backend: ${remoteDiagBackendHealthLabel(arg1)}.`;
+    case 'BACKEND_REGISTER_OK':
+      return `Máquina aprobada por backend. Precio activo ${arg2}.`;
+    case 'BACKEND_REGISTER_PENDING':
+      return 'Máquina pendiente de aprobación en backend.';
+    case 'BACKEND_REGISTER_FAIL':
+      return `Falló el registro de máquina: ${remoteDiagBackendHealthLabel(arg1)}.`;
+    case 'BACKEND_CARDS_OK':
+      return `Cache de tarjetas descargada. Tarjetas: ${arg1}.`;
+    case 'BACKEND_CARDS_FAIL':
+      return `Falló la descarga de tarjetas. Detalle: ${remoteDiagBackendHealthLabel(arg1)}.`;
+    case 'NFC_READ':
+      return 'Se leyó una tarjeta NFC.';
+    case 'NFC_APPROVED_ONLINE':
+      return 'Tarjeta aprobada online por backend.';
+    case 'NFC_APPROVED_OFFLINE':
+      return 'Tarjeta aprobada offline con cache local.';
+    case 'NFC_DENIED':
+      return `Tarjeta rechazada: ${remoteDiagNfcDenyLabel(arg1)}.`;
+    case 'QUEUE_ENQUEUE':
+      return `Evento guardado offline. Pendientes en cola: ${arg2}.`;
+    case 'QUEUE_FULL':
+      return 'Cola offline llena. El equipo descartó nuevos eventos.';
+    case 'QUEUE_FLUSH_OK':
+      return `Cola offline sincronizada. Enviados: ${arg1}, pendientes: ${arg2}.`;
+    case 'QUEUE_FLUSH_FAIL':
+      return `Falló la sincronización de cola offline. Código: ${arg1}.`;
+    case 'QUEUE_PERSIST_FAIL':
+      return 'Falló la persistencia local de la cola offline.';
+    case 'MDB_RESET':
+      return 'La máquina expendedora reinició el periférico cashless.';
+    case 'MDB_BEGIN_SESSION':
+      return `Sesión MDB iniciada. Fondos ofrecidos: ${arg2}.`;
+    case 'MDB_VEND_REQUEST':
+      return `La máquina pidió venta. Selección ${arg1}, monto ${arg2}.`;
+    case 'MDB_VEND_SUCCESS':
+      return `Venta confirmada por la máquina. Selección ${arg1}, monto ${arg2}.`;
+    case 'MDB_VEND_FAILURE':
+      return `Venta fallida o cancelada. Selección ${arg1}, monto ${arg2}.`;
+    case 'MDB_VEND_END':
+      return 'La máquina cerró la sesión MDB.';
+    case 'SESSION_TIMEOUT':
+      return `La sesión venció sin cierre correcto. Duración ${formatDiagUptime(arg2)}.`;
+    case 'MDB_SETUP_CONFIG':
+      return `Se capturó SETUP CONFIG del VMC. Level ${arg1}.`;
+    case 'MDB_SETUP_PRICES':
+      return `Se capturó SETUP PRICES. Min ${arg1}, max ${arg2}.`;
+    case 'REMOTE_CONFIG_APPLIED':
+      return arg1 ? 'Se aplicó una configuración remota nueva.' : 'Llegó una configuración remota pero ya estaba vigente.';
+    default:
+      return 'Evento técnico sin traducción específica.';
+  }
+}
+
+function describeRemoteDiagMdb(setup){
+  if(!setup?.seen_config && !setup?.seen_prices){
+    return 'Todavía no se capturó SETUP MDB. Reiniciá la máquina o esperá un nuevo handshake cashless.';
+  }
+  const parts=[];
+  if(setup?.seen_config){
+    parts.push(`SETUP CONFIG visto. Level ${formatDiagValue(setup.vmc_level)}.`);
+    parts.push(`Display ${formatDiagValue(setup.display_columns)} x ${formatDiagValue(setup.display_rows)}.`);
+  }
+  if(setup?.seen_prices){
+    parts.push(`SETUP PRICES visto. Min ${formatDiagValue(setup.min_price)}, max ${formatDiagValue(setup.max_price)}.`);
+  }
+  if(setup?.last_seen_ms!==null && setup?.last_seen_ms!==undefined){
+    parts.push(`Último paquete capturado hace ${formatDiagUptime(setup.last_seen_ms)} desde el boot.`);
+  }
+  return parts.join(' ');
+}
+
+function remoteDiagLatestMatchingEvent(result,predicate){
+  const list=result?.events?.events||[];
+  for(let i=list.length-1;i>=0;i--){
+    if(predicate(list[i])) return list[i];
+  }
+  return null;
+}
+
+function describeRemoteDiagWifi(result){
+  if(!result?.wifi_connected){
+    return 'WiFi sin enlace en el momento del snapshot.';
+  }
+  const latest=remoteDiagLatestMatchingEvent(result,ev=>['WIFI_CONNECT_OK','WIFI_RECONNECTED'].includes(String(ev?.name||ev?.code||'')));
+  if(latest) return describeRemoteDiagEvent(latest);
+  return 'WiFi conectado al momento del diagnóstico.';
+}
+
+function describeRemoteDiagBackend(result){
+  if(result?.backend_ready){
+    const latestOk=remoteDiagLatestMatchingEvent(result,ev=>String(ev?.name||ev?.code||'')==='BACKEND_HEALTH_OK');
+    return latestOk ? describeRemoteDiagEvent(latestOk) : 'Backend alcanzable al momento del diagnóstico.';
+  }
+  const latestFail=remoteDiagLatestMatchingEvent(result,ev=>['BACKEND_HEALTH_FAIL','BACKEND_REGISTER_FAIL','BACKEND_CARDS_FAIL','BACKEND_REGISTER_PENDING'].includes(String(ev?.name||ev?.code||'')));
+  if(latestFail) return describeRemoteDiagEvent(latestFail);
+  if(!result?.wifi_connected) return 'El backend figura no disponible porque la máquina no tenía enlace WiFi.';
+  return 'Backend pendiente o sin respuesta en el momento del snapshot.';
+}
+
+function describeRemoteDiagQueue(result){
+  const pending=Number(result?.queue_pending||0);
+  if(pending<=0) return 'La cola offline está vacía.';
+  const latest=remoteDiagLatestMatchingEvent(result,ev=>['QUEUE_ENQUEUE','QUEUE_FLUSH_OK','QUEUE_FLUSH_FAIL','QUEUE_FULL'].includes(String(ev?.name||ev?.code||'')));
+  if(latest) return describeRemoteDiagEvent(latest);
+  return `Hay ${formatReportInt(pending)} evento(s) pendientes en cola offline.`;
+}
+
+function describeRemoteDiagPrice(result){
+  return `Precio humano activo ${formatMachinePriceValue(result?.price_cents)} con perfil ${formatDiagValue(result?.pricing_profile,'desconocido')}.`;
+}
+
+function remoteDiagContextMeta(){
+  let backendLabel=BASE||CURRENT_ORIGIN||window.location.origin||'—';
+  let instanceLabel=backendLabel;
+  try{
+    const parsed=new URL(backendLabel);
+    instanceLabel=parsed.hostname || backendLabel;
+    backendLabel=parsed.origin || backendLabel;
+  }catch(_error){
+    instanceLabel=backendLabel;
+  }
+  let username='—';
+  try{
+    if(TOKEN){
+      const payload=JSON.parse(atob(TOKEN.split('.')[1]));
+      username=payload?.username || username;
+    }
+  }catch(_error){}
+  const now=new Date();
+  const stampParts=[
+    now.getFullYear(),
+    String(now.getMonth()+1).padStart(2,'0'),
+    String(now.getDate()).padStart(2,'0')
+  ];
+  const timeParts=[
+    String(now.getHours()).padStart(2,'0'),
+    String(now.getMinutes()).padStart(2,'0'),
+    String(now.getSeconds()).padStart(2,'0')
+  ];
+  return {
+    generatedAt: now.toLocaleString('es-AR'),
+    timestampTag: `${stampParts.join('')}_${timeParts.join('')}`,
+    backendLabel,
+    instanceLabel,
+    username
+  };
+}
+
+function buildRemoteDiagnosticsExportText(result){
+  const meta=remoteDiagContextMeta();
+  const lines=[
+    'CoffeeControl - Diagnóstico remoto',
+    `Instancia: ${meta.instanceLabel}`,
+    `Backend: ${meta.backendLabel}`,
+    `Máquina: ${remoteDiagMachineName || '—'}`,
+    `Usuario: ${meta.username}`,
+    `Generado: ${meta.generatedAt}`,
+    '',
+    'Resumen',
+    `- WiFi: ${describeRemoteDiagWifi(result)}`,
+    `- Backend: ${describeRemoteDiagBackend(result)}`,
+    `- Cola offline: ${describeRemoteDiagQueue(result)}`,
+    `- Precio: ${describeRemoteDiagPrice(result)}`,
+    `- Capturado: ${formatDiagUptime(result?.captured_at_ms||0)} desde el boot`,
+    '',
+    'Eventos'
+  ];
+  const events=result?.events?.events||[];
+  if(!events.length){
+    lines.push('- Sin eventos registrados');
+  }else{
+    events.forEach((ev,index)=>{
+      lines.push(`[${index+1}] ${formatDiagValue(ev.name,ev.code)} | ${formatDiagUptime(ev.ms||0)}`);
+      lines.push(`    ${describeRemoteDiagEvent(ev)}`);
+      lines.push(`    Arg1=${formatReportInt(ev.arg1||0)} | Arg2=${formatReportInt(ev.arg2||0)}`);
+    });
+  }
+  lines.push('');
+  lines.push('Setup MDB');
+  lines.push(`- ${describeRemoteDiagMdb(result?.mdb||{})}`);
+  lines.push(`- Config vista: ${result?.mdb?.seen_config?'Sí':'No'}`);
+  lines.push(`- Precios vistos: ${result?.mdb?.seen_prices?'Sí':'No'}`);
+  lines.push(`- VMC level: ${formatDiagValue(result?.mdb?.vmc_level)}`);
+  lines.push(`- Display: ${formatDiagValue(result?.mdb?.display_columns)} x ${formatDiagValue(result?.mdb?.display_rows)}`);
+  lines.push(`- Max price: ${formatDiagValue(result?.mdb?.max_price)}`);
+  lines.push(`- Min price: ${formatDiagValue(result?.mdb?.min_price)}`);
+  lines.push(`- Último visto: ${formatDiagUptime(result?.mdb?.last_seen_ms||0)}`);
+  if(Array.isArray(result?.mdb?.raw)){
+    lines.push(`- Raw: ${result.mdb.raw.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+function setRemoteDiagExportState(enabled){
+  ['mdDiagCopyBtn','mdDiagDownloadBtn'].forEach(id=>{
+    const btn=document.getElementById(id);
+    if(btn) btn.disabled=!enabled;
+  });
+}
+
+async function copyRemoteDiagnosticsText(){
+  if(!remoteDiagLastResult){
+    setRemoteDiagStatus('Todavía no hay un diagnóstico para copiar.','error');
+    return;
+  }
+  const text=buildRemoteDiagnosticsExportText(remoteDiagLastResult);
+  try{
+    if(navigator.clipboard?.writeText){
+      await navigator.clipboard.writeText(text);
+    }else{
+      const area=document.createElement('textarea');
+      area.value=text;
+      area.setAttribute('readonly','readonly');
+      area.style.position='fixed';
+      area.style.opacity='0';
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      area.remove();
+    }
+    setRemoteDiagStatus('Diagnóstico copiado al portapapeles.','ok');
+  }catch(_error){
+    setRemoteDiagStatus('No se pudo copiar el diagnóstico.','error');
+  }
+}
+
+function downloadRemoteDiagnosticsText(){
+  if(!remoteDiagLastResult){
+    setRemoteDiagStatus('Todavía no hay un diagnóstico para descargar.','error');
+    return;
+  }
+  const meta=remoteDiagContextMeta();
+  const safeInstance=(meta.instanceLabel||'instancia').replace(/[^a-z0-9_-]+/gi,'-').replace(/^-+|-+$/g,'')||'instancia';
+  const safeName=(remoteDiagMachineName||'maquina').replace(/[^a-z0-9_-]+/gi,'-').replace(/^-+|-+$/g,'')||'maquina';
+  const text=buildRemoteDiagnosticsExportText(remoteDiagLastResult);
+  downloadBlob(`coffeecontrol_diag_${safeInstance}_${safeName}_${meta.timestampTag}.txt`, text, 'text/plain;charset=utf-8');
+  setRemoteDiagStatus('Diagnóstico exportado a TXT.','ok');
+}
+
+function renderRemoteDiagnosticsResult(result){
+  const summary=document.getElementById('mdDiagSummary');
+  const events=document.getElementById('mdDiagEvents');
+  const mdb=document.getElementById('mdDiagMdb');
+  remoteDiagLastResult=result||null;
+  setRemoteDiagExportState(Boolean(remoteDiagLastResult));
+  if(summary){
+    summary.innerHTML=`
+      <div class="metrics" style="margin:0 0 16px 0">
+        <div class="metric"><div class="mlbl">WiFi</div><div class="mval" style="font-size:16px">${result?.wifi_connected?'Conectado':'Sin enlace'}</div></div>
+        <div class="metric"><div class="mlbl">Backend</div><div class="mval" style="font-size:16px">${result?.backend_ready?'OK':'Pendiente'}</div></div>
+        <div class="metric"><div class="mlbl">Cola offline</div><div class="mval" style="font-size:16px">${formatReportInt(result?.queue_pending||0)}</div></div>
+        <div class="metric"><div class="mlbl">Precio</div><div class="mval" style="font-size:16px">${formatMachinePriceValue(result?.price_cents)}</div></div>
+      </div>
+      <div style="display:grid;gap:8px;margin-bottom:12px">
+        <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>WiFi:</strong> ${escHtml(describeRemoteDiagWifi(result))}</div>
+        <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Backend:</strong> ${escHtml(describeRemoteDiagBackend(result))}</div>
+        <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Cola offline:</strong> ${escHtml(describeRemoteDiagQueue(result))}</div>
+        <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Precio:</strong> ${escHtml(describeRemoteDiagPrice(result))}</div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);margin-bottom:10px">
+        Perfil MDB: <strong>${escHtml(formatDiagValue(result?.pricing_profile,'desconocido'))}</strong> ·
+        Capturado a los <strong>${escHtml(formatDiagUptime(result?.captured_at_ms||0))}</strong> del boot
+      </div>
+    `;
+  }
+  if(events){
+    const list=result?.events?.events||[];
+    const rows=list.map(ev=>`<tr>
+      <td>${escHtml(formatDiagValue(ev.name,ev.code))}</td>
+      <td>
+        <div>${escHtml(describeRemoteDiagEvent(ev))}</div>
+        <div style="font-size:11px;color:var(--tx3);margin-top:4px">Arg1=${formatReportInt(ev.arg1||0)} · Arg2=${formatReportInt(ev.arg2||0)}</div>
+      </td>
+      <td style="font-size:11px;color:var(--tx3)">${escHtml(formatDiagUptime(ev.ms||0))}</td>
+    </tr>`).join('');
+    events.innerHTML=`
+      <div class="section-lbl" style="margin-bottom:8px">Últimos eventos (${formatReportInt(result?.events?.count||0)} / ${formatReportInt(result?.events?.capacity||0)})</div>
+      <table style="margin-bottom:18px">
+        <thead><tr><th>Evento</th><th>Lectura</th><th>Uptime</th></tr></thead>
+        <tbody>${rows||'<tr><td colspan="3" class="empty">La máquina todavía no registró eventos.</td></tr>'}</tbody>
+      </table>
+    `;
+  }
+  if(mdb){
+    const setup=result?.mdb||{};
+    const raw=Array.isArray(setup.raw)?setup.raw.map(v=>formatReportInt(v)).join(', '):'—';
+    mdb.innerHTML=`
+      <div class="section-lbl" style="margin-bottom:8px">Último setup MDB</div>
+      <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45;margin-bottom:12px">${escHtml(describeRemoteDiagMdb(setup))}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:13px;margin-bottom:14px">
+        <div><span style="color:var(--tx3)">Config vista:</span> ${setup.seen_config?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Precios vistos:</span> ${setup.seen_prices?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">VMC level:</span> ${formatDiagValue(setup.vmc_level)}</div>
+        <div><span style="color:var(--tx3)">Display:</span> ${formatDiagValue(setup.display_columns)} x ${formatDiagValue(setup.display_rows)}</div>
+        <div><span style="color:var(--tx3)">Max price:</span> ${formatDiagValue(setup.max_price)}</div>
+        <div><span style="color:var(--tx3)">Min price:</span> ${formatDiagValue(setup.min_price)}</div>
+        <div><span style="color:var(--tx3)">Subcmd:</span> ${formatDiagValue(setup.last_subcmd)}</div>
+        <div><span style="color:var(--tx3)">Último visto:</span> ${escHtml(formatDiagUptime(setup.last_seen_ms||0))}</div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);margin-bottom:6px">Raw bytes</div>
+      <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.45">${escHtml(raw)}</div>
+    `;
+  }
+}
+
+function openRemoteDiagnostics(id,name,online){
+  if(!online){alert('La máquina está offline. El diagnóstico remoto solo se envía a equipos online.');return;}
+  stopRemoteDiagnosticsPoll();
+  remoteDiagMachineName=name;
+  remoteDiagLastResult=null;
+  openModal(`Diagnóstico remoto: ${name}`,`
+    <div style="font-size:12px;color:var(--tx2);margin-bottom:14px;line-height:1.5">
+      Este comando le pide a la máquina un snapshot técnico con conectividad, cola offline, últimos eventos y el último setup MDB capturado.
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      <button type="button" class="btn btn-primary btn-sm" id="mdDiagBtn" onclick="requestRemoteDiagnostics(${id})">Solicitar diagnóstico</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="mdDiagCopyBtn" onclick="copyRemoteDiagnosticsText()" disabled>Copiar</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="mdDiagDownloadBtn" onclick="downloadRemoteDiagnosticsText()" disabled>Descargar TXT</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="closeModal()">Cerrar</button>
+    </div>
+    <div id="mdDiagStatus" style="display:none;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.45;margin-bottom:14px"></div>
+    <div id="mdDiagSummary"></div>
+    <div id="mdDiagEvents"></div>
+    <div id="mdDiagMdb"></div>
+  `,'',true);
+  setRemoteDiagExportState(false);
+}
+
+async function pollRemoteDiagnostics(machineId,commandId,attempt=0){
+  try{
+    const d=await api('GET',`/api/machines/${machineId}/commands/${commandId}`);
+    const cmd=d.command;
+    if(!cmd) throw new Error('Sin estado de comando');
+    if(cmd.status==='completed'){
+      setRemoteDiagStatus(cmd.result?.message||`Diagnóstico recibido desde "${remoteDiagMachineName}".`,'ok');
+      renderRemoteDiagnosticsResult(cmd.result||{});
+      const btn=document.getElementById('mdDiagBtn');
+      if(btn){btn.disabled=false;btn.textContent='Solicitar diagnóstico';}
+      stopRemoteDiagnosticsPoll();
+      return;
+    }
+    if(cmd.status==='failed'){
+      setRemoteDiagStatus(cmd.result?.message||'No se pudo obtener el diagnóstico remoto.','error');
+      const btn=document.getElementById('mdDiagBtn');
+      if(btn){btn.disabled=false;btn.textContent='Solicitar diagnóstico';}
+      stopRemoteDiagnosticsPoll();
+      return;
+    }
+    if(attempt>=20){
+      setRemoteDiagStatus('La máquina está tardando más de lo esperado en responder el diagnóstico.','error');
+      const btn=document.getElementById('mdDiagBtn');
+      if(btn){btn.disabled=false;btn.textContent='Solicitar diagnóstico';}
+      stopRemoteDiagnosticsPoll();
+      return;
+    }
+    remoteDiagPollTimer=setTimeout(()=>pollRemoteDiagnostics(machineId,commandId,attempt+1),2000);
+  }catch(e){
+    setRemoteDiagStatus('No se pudo consultar el resultado del diagnóstico remoto.','error');
+    const btn=document.getElementById('mdDiagBtn');
+    if(btn){btn.disabled=false;btn.textContent='Solicitar diagnóstico';}
+    stopRemoteDiagnosticsPoll();
+  }
+}
+
+async function requestRemoteDiagnostics(machineId){
+  const btn=document.getElementById('mdDiagBtn');
+  remoteDiagLastResult=null;
+  setRemoteDiagExportState(false);
+  if(btn){btn.disabled=true;btn.textContent='Solicitando...';}
+  setRemoteDiagStatus('Pidiendo a la máquina un snapshot técnico...','info');
+  stopRemoteDiagnosticsPoll();
+  try{
+    const d=await api('POST',`/api/machines/${machineId}/commands`,{
+      type:'diagnostics_snapshot',
+      payload:{limit:20}
+    });
+    remoteDiagCommandId=d.command?.id||null;
+    if(!remoteDiagCommandId) throw new Error('No se recibió ID de comando');
+    setRemoteDiagStatus('Comando enviado. Esperando respuesta de la máquina...','info');
+    pollRemoteDiagnostics(machineId,remoteDiagCommandId,0);
+  }catch(e){
+    setRemoteDiagStatus(e.message||'No se pudo iniciar el diagnóstico remoto.','error');
+    if(btn){btn.disabled=false;btn.textContent='Solicitar diagnóstico';}
+    stopRemoteDiagnosticsPoll();
+  }
+}
+
 async function machineDetail(id,name){
   try{
     const stateFallback=allMachines.find(m=>m.id===id)
@@ -2001,6 +2487,7 @@ async function machineDetail(id,name){
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;font-size:13px">
         <div><span style="color:var(--tx3)">Conectividad:</span> ${machineState.online?'Online':'Offline'}</div>
         <div><span style="color:var(--tx3)">Último contacto:</span> ${machineState.last_seen?timeSince(machineState.last_seen):'Nunca'}</div>
+        <div><span style="color:var(--tx3)">Precio configurado:</span> ${formatMachinePriceValue(machineState.price_cents)}</div>
         <div><span style="color:var(--tx3)">SSID:</span> ${escHtml(machineState.wifi_ssid||'—')}</div>
         <div><span style="color:var(--tx3)">RSSI:</span> ${formatMachineRssi(machineState.wifi_rssi)}</div>
         <div><span style="color:var(--tx3)">IP:</span> ${escHtml(machineState.wifi_ip||'—')}</div>
@@ -2016,6 +2503,10 @@ async function machineDetail(id,name){
       const movementRows=(stockData.movements||[]).map(move=>`<tr><td>${escHtml(stockMovementLabel(move.movement_type))}</td><td>${escHtml(move.product_name||`Selección ${move.item_id ?? '—'}`)}</td><td>${move.quantity_delta>0?'+':''}${move.quantity_delta}</td><td>${move.current_units===null||move.current_units===undefined?'—':move.current_units}</td><td style="font-size:11px;color:var(--tx3)">${move.created_at?new Date(move.created_at).toLocaleString('es-AR'):'—'}</td></tr>`).join('');
       openModal(`Máquina: ${name}`,`
         ${networkBlock}
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">
+          <button type="button" class="btn btn-ghost btn-sm" onclick='openMachineStock(${id},${JSON.stringify(name)})'>Actualizar stock</button>
+          <button type="button" class="btn btn-primary btn-sm" onclick="openRemoteDiagnostics(${id},'${name.replace(/'/g,"&#39;")}',${machineState?.online?'true':'false'})" ${machineState?.online?'':'disabled title="Solo disponible si la máquina está online"'}>Diagnóstico remoto</button>
+        </div>
         <div class="metrics" style="margin-bottom:18px">
           <div class="metric"><div class="mlbl">Selecciones activas</div><div class="mval">${formatReportInt(summary.configured_items||0)}</div></div>
           <div class="metric"><div class="mlbl">Bajo mínimo</div><div class="mval">${formatReportInt(summary.low_items||0)}</div></div>
@@ -2251,7 +2742,8 @@ function openAddMachine(){
   openModal('Nueva máquina',`
     <div class="field"><label>Nombre *</label><input id="mName" placeholder="Máquina E — Piso 3"></div>
     <div class="field"><label>Ubicación</label><input id="mLoc" placeholder="Piso 3, sector contabilidad"></div>
-    <div class="field"><label>Secret (clave del ESP8266) *</label><input id="mSecret" placeholder="cc-secret-5"></div>
+    <div class="field"><label>MAC / ID máquina *</label><input id="mMac" placeholder="AA55BB66CC77"></div>
+    <div class="field"><label>Precio del café *</label><input id="mPrice" type="number" min="1" step="1" value="1200" placeholder="1200"></div>
     <div class="err-banner" id="mErr"></div>
   `,`saveMachine()`);
 }
@@ -2259,12 +2751,46 @@ function openAddMachine(){
 async function saveMachine(){
   const name=document.getElementById('mName').value.trim();
   const location=document.getElementById('mLoc').value.trim();
-  const secret=document.getElementById('mSecret').value.trim();
-  if(!name||!secret){showModalErr('mErr','Nombre y secret son requeridos');return;}
+  const mac=document.getElementById('mMac').value.trim();
+  const price=parseInt(document.getElementById('mPrice')?.value||'0',10);
+  if(!name||!mac){showModalErr('mErr','Nombre y MAC son requeridos');return;}
+  if(!Number.isInteger(price) || price<=0){showModalErr('mErr','El precio debe ser un entero mayor a cero');return;}
   try{
-    await api('POST','/api/machines',{name,location,secret});
+    await api('POST','/api/machines',{name,location,mac,price_cents:price});
     closeModal();loadMachines();
   }catch(e){showModalErr('mErr',e.message);}
+}
+
+function openEditMachine(id){
+  const machine=allMachines.find(m=>m.id===id);
+  if(!machine){alert('No se encontró la máquina seleccionada.');return;}
+  openModal(`Editar máquina: ${machine.name}`,`
+    <div class="field"><label>Nombre *</label><input id="meName" value="${escHtml(machine.name||'')}" placeholder="Máquina A — Piso 1"></div>
+    <div class="field"><label>Ubicación</label><input id="meLoc" value="${escHtml(machine.location||'')}" placeholder="Piso 1, sector entrada"></div>
+    <div class="field"><label>Precio del café *</label><input id="mePrice" type="number" min="1" step="1" value="${Number(machine.price_cents||1200)}" placeholder="1200"></div>
+    <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-top:-4px;margin-bottom:12px">Si la máquina está online y no tiene otro comando pendiente, el nuevo precio se envía automáticamente sin reinicio.</div>
+    <div class="err-banner" id="meErr"></div>
+  `,`saveMachineEdit(${id})`);
+}
+
+async function saveMachineEdit(id){
+  const name=document.getElementById('meName')?.value.trim()||'';
+  const location=document.getElementById('meLoc')?.value.trim()||'';
+  const price=parseInt(document.getElementById('mePrice')?.value||'0',10);
+  if(!name){showModalErr('meErr','El nombre es requerido');return;}
+  if(!Number.isInteger(price) || price<=0){showModalErr('meErr','El precio debe ser un entero mayor a cero');return;}
+  try{
+    const d=await api('PATCH',`/api/machines/${id}`,{name,location,price_cents:price});
+    closeModal();
+    loadMachines();
+    if(d.config_sync==='queued'){
+      alert('Precio actualizado. La sincronización remota quedó encolada para esta máquina.');
+    }else if(d.config_sync==='pending_reconnect'){
+      alert('Precio actualizado. La máquina está offline; se aplicará al reconectarse.');
+    }else if(d.config_sync==='queued_command_exists'){
+      alert('Precio actualizado. Ya había otro comando pendiente; si no llega una sincronización remota, la máquina tomará el nuevo precio al reconectarse.');
+    }
+  }catch(e){showModalErr('meErr',e.message);}
 }
 
 // ══════════════════════════════════════════════════════
@@ -4760,6 +5286,7 @@ function openModal(title,body,saveCall,readOnly){
 }
 function closeModal(){
   stopRemoteWifiScanPoll();
+  stopRemoteDiagnosticsPoll();
   document.getElementById('modal').classList.remove('show');
 }
 document.getElementById('modal').addEventListener('click',e=>{ if(e.target===document.getElementById('modal')) closeModal(); });
@@ -4850,6 +5377,11 @@ function formatMachineRssi(value){
   const r=numericRssi(value);
   if(r===null) return 'Sin dato';
   return `${r} dBm (${rssiDescriptor(r)})`;
+}
+
+function formatMachinePriceValue(value){
+  const amount=parseInt(value||0,10)||0;
+  return amount>0 ? `$${amount.toLocaleString('es-AR')}` : 'Sin definir';
 }
 
 function machineBackendBadge(machine){

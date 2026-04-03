@@ -27,9 +27,49 @@ function normalizeOptionalInteger(value) {
     return Number.isInteger(parsed) ? parsed : null;
 }
 
+function normalizePositiveInteger(value) {
+    const parsed = normalizeOptionalInteger(value);
+    if (parsed === null) return null;
+    return parsed > 0 ? parsed : null;
+}
+
 function parseMachineId(value) {
     const parsed = parseInt(value, 10);
     return Number.isInteger(parsed) ? parsed : null;
+}
+
+async function queueMachineCommand({ machineId, machineName, commandType, payload, req }) {
+    const insertResult = await pool.query(
+        `INSERT INTO machine_commands(machine_id, command_type, payload)
+         VALUES ($1, $2, $3::jsonb)
+         RETURNING id, machine_id, command_type, payload, status, queued_at`,
+        [machineId, commandType, JSON.stringify(payload || {})]
+    );
+
+    if (req) {
+        await audit.logAuditEvent({
+            req,
+            action: 'machine.command_queue',
+            entityType: 'machine',
+            entityId: machineId,
+            entityLabel: machineName,
+            summary: `Encoló el comando ${commandType} para ${machineName}`,
+            details: {
+                command_id: parseInt(insertResult.rows[0].id, 10),
+                command_type: commandType,
+                payload: payload || {}
+            }
+        });
+    }
+
+    broadcast({
+        event: 'machine_command_queued',
+        machine_id: machineId,
+        machine: machineName,
+        command_type: commandType
+    });
+
+    return insertResult.rows[0];
 }
 
 async function getActiveMachineById(machineId) {
@@ -55,6 +95,14 @@ function normalizeCommandPayload(type, payload) {
 
     if (type === 'wifi_scan') {
         return {};
+    }
+
+    if (type === 'diagnostics_snapshot') {
+        const limit = normalizePositiveInteger(payload?.limit);
+        if (limit !== null && limit > 32) {
+            throw new Error('El límite de diagnóstico no puede superar 32 eventos');
+        }
+        return limit ? { limit } : {};
     }
 
     if (type === 'wifi_update') {
@@ -87,6 +135,8 @@ router.post('/register', async (req, res) => {
         mac,
         wifi_ssid,
         backend_url,
+        price_cents,
+        pricing_profile,
         wifi_rssi,
         wifi_ip,
         backend_ok,
@@ -97,6 +147,8 @@ router.post('/register', async (req, res) => {
     const macClean = mac.toUpperCase().replace(/[^A-F0-9]/g, '');
     const wifiSsid = normalizeOptionalString(wifi_ssid, 64);
     const backendUrl = normalizeOptionalString(backend_url, 255);
+    const reportedPriceCents = normalizePositiveInteger(price_cents);
+    const pricingProfile = normalizeOptionalString(pricing_profile, 40);
     const wifiRssi = normalizeOptionalInteger(wifi_rssi);
     const wifiIp = normalizeOptionalString(wifi_ip, 45);
     const backendOk = typeof backend_ok === 'boolean' ? backend_ok : null;
@@ -104,7 +156,7 @@ router.post('/register', async (req, res) => {
 
     try {
         const approved = await pool.query(
-            'SELECT id, name FROM machines WHERE mac = $1 AND active = true',
+            'SELECT id, name, price_cents FROM machines WHERE mac = $1 AND active = true',
             [macClean]
         );
 
@@ -119,12 +171,19 @@ router.post('/register', async (req, res) => {
                      backend_ok = COALESCE($6, backend_ok),
                      backend_error = $7
                  WHERE mac = $1
-                 RETURNING id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, backend_ok, backend_error`,
+                 RETURNING id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, backend_ok, backend_error, price_cents`,
                 [macClean, wifiSsid, backendUrl, wifiRssi, wifiIp, backendOk, backendError]
             );
             const machineState = updateResult.rows[0];
             alerts.resolveMachineOffline(machineState.id).catch(err => console.error('[ALERT] Error resolviendo offline:', err.message));
-            return res.status(200).json({ status: 'approved', machine: approved.rows[0].name });
+            return res.status(200).json({
+                status: 'approved',
+                machine: approved.rows[0].name,
+                config: {
+                    price_cents: Number(machineState.price_cents || reportedPriceCents || 1200),
+                    pricing_profile: pricingProfile || 'rubino_half_credit'
+                }
+            });
         }
 
         const pending = await pool.query(
@@ -159,8 +218,9 @@ router.get('/pending', requireMachineSetup, async (req, res) => {
 });
 
 router.post('/pending/:id/approve', requireMachineSetup, async (req, res) => {
-    const { name, location } = req.body;
+    const { name, location, price_cents } = req.body;
     if (!name) return res.status(400).json({ error: 'nombre requerido' });
+    const priceCents = normalizePositiveInteger(price_cents) || 1200;
 
     try {
         const pending = await pool.query(
@@ -171,12 +231,12 @@ router.post('/pending/:id/approve', requireMachineSetup, async (req, res) => {
 
         const mac = pending.rows[0].mac;
         const machine = await pool.query(
-            `INSERT INTO machines(name, location, mac, secret, active)
-             VALUES ($1, $2, $3, $3, true)
+            `INSERT INTO machines(name, location, mac, secret, active, price_cents)
+             VALUES ($1, $2, $3, $3, true, $4)
              ON CONFLICT(mac) DO UPDATE
-             SET name = $1, location = $2, active = true
+             SET name = $1, location = $2, active = true, price_cents = $4
              RETURNING *`,
-            [name.trim(), location?.trim() || null, mac]
+            [name.trim(), location?.trim() || null, mac, priceCents]
         );
 
         await pool.query('UPDATE pending_machines SET approved = true WHERE id = $1', [req.params.id]);
@@ -191,7 +251,8 @@ router.post('/pending/:id/approve', requireMachineSetup, async (req, res) => {
             details: {
                 pending_id: pending.rows[0].id,
                 mac,
-                location: machine.rows[0].location
+                location: machine.rows[0].location,
+                price_cents: machine.rows[0].price_cents
             }
         });
         res.status(201).json({ machine: machine.rows[0] });
@@ -247,15 +308,16 @@ router.get('/', requireMachineOperator, async (req, res) => {
 });
 
 router.post('/', requireManager, async (req, res) => {
-    const { name, location, mac } = req.body;
+    const { name, location, mac, price_cents } = req.body;
     if (!name || !mac) return res.status(400).json({ error: 'name y mac requeridos' });
+    const priceCents = normalizePositiveInteger(price_cents) || 1200;
 
     try {
         const result = await pool.query(
-            `INSERT INTO machines(name, location, mac, secret)
-             VALUES ($1, $2, $3, $3)
+            `INSERT INTO machines(name, location, mac, secret, price_cents)
+             VALUES ($1, $2, $3, $3, $4)
              RETURNING *`,
-            [name.trim(), location?.trim() || null, mac.toUpperCase().replace(/[^A-F0-9]/g, '')]
+            [name.trim(), location?.trim() || null, mac.toUpperCase().replace(/[^A-F0-9]/g, ''), priceCents]
         );
         await audit.logAuditEvent({
             req,
@@ -266,7 +328,8 @@ router.post('/', requireManager, async (req, res) => {
             summary: `Creó la máquina ${result.rows[0].name}`,
             details: {
                 mac: result.rows[0].mac,
-                location: result.rows[0].location
+                location: result.rows[0].location,
+                price_cents: result.rows[0].price_cents
             }
         });
         res.status(201).json({ machine: result.rows[0] });
@@ -277,34 +340,73 @@ router.post('/', requireManager, async (req, res) => {
 });
 
 router.patch('/:id', requireMachineSetup, async (req, res) => {
-    const { name, location } = req.body;
+    const { name, location, price_cents } = req.body;
+    const priceCents = price_cents === undefined ? undefined : normalizePositiveInteger(price_cents);
+    if (price_cents !== undefined && priceCents === null) {
+        return res.status(400).json({ error: 'price_cents inválido' });
+    }
     try {
         const before = await pool.query(
-            'SELECT id, name, location FROM machines WHERE id = $1',
+            'SELECT id, name, location, price_cents, last_seen FROM machines WHERE id = $1',
             [req.params.id]
         );
         if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
+        const previousMachine = before.rows[0];
         const result = await pool.query(
-            'UPDATE machines SET name = COALESCE($1, name), location = COALESCE($2, location) WHERE id = $3 RETURNING *',
-            [name, location, req.params.id]
+            'UPDATE machines SET name = COALESCE($1, name), location = COALESCE($2, location), price_cents = COALESCE($3, price_cents) WHERE id = $4 RETURNING *',
+            [name, location, priceCents, req.params.id]
         );
+        const updatedMachine = result.rows[0];
+        let configSync = 'unchanged';
+
+        if (priceCents !== undefined && Number(previousMachine.price_cents) !== Number(updatedMachine.price_cents)) {
+            const existing = await pool.query(
+                `SELECT id
+                 FROM machine_commands
+                 WHERE machine_id = $1
+                   AND status = 'queued'
+                 ORDER BY queued_at DESC
+                 LIMIT 1`,
+                [updatedMachine.id]
+            );
+
+            if (existing.rowCount > 0) {
+                configSync = 'queued_command_exists';
+            } else if (isMachineOnline(updatedMachine.last_seen)) {
+                await queueMachineCommand({
+                    machineId: updatedMachine.id,
+                    machineName: updatedMachine.name,
+                    commandType: 'config_update',
+                    payload: {
+                        price_cents: Number(updatedMachine.price_cents)
+                    },
+                    req
+                });
+                configSync = 'queued';
+            } else {
+                configSync = 'pending_reconnect';
+            }
+        }
+
         await audit.logAuditEvent({
             req,
             action: 'machine.update',
             entityType: 'machine',
-            entityId: result.rows[0].id,
-            entityLabel: result.rows[0].name,
-            summary: `Actualizó la máquina ${result.rows[0].name}`,
+            entityId: updatedMachine.id,
+            entityLabel: updatedMachine.name,
+            summary: `Actualizó la máquina ${updatedMachine.name}`,
             details: {
-                before: before.rows[0],
+                before: previousMachine,
                 after: {
-                    id: result.rows[0].id,
-                    name: result.rows[0].name,
-                    location: result.rows[0].location
-                }
+                    id: updatedMachine.id,
+                    name: updatedMachine.name,
+                    location: updatedMachine.location,
+                    price_cents: updatedMachine.price_cents
+                },
+                config_sync: configSync
             }
         });
-        res.json({ machine: result.rows[0] });
+        res.json({ machine: updatedMachine, config_sync: configSync });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -348,38 +450,18 @@ router.post('/:id/commands', requireMachineOperator, async (req, res) => {
             return res.status(409).json({ error: 'Ya hay un comando pendiente para esta máquina.' });
         }
 
-        const insertResult = await pool.query(
-            `INSERT INTO machine_commands(machine_id, command_type, payload)
-             VALUES ($1, $2, $3::jsonb)
-             RETURNING id, machine_id, command_type, payload, status, queued_at`,
-            [machineId, commandType, JSON.stringify(normalizedPayload)]
-        );
-
-        await audit.logAuditEvent({
-            req,
-            action: 'machine.command_queue',
-            entityType: 'machine',
-            entityId: machine.id,
-            entityLabel: machine.name,
-            summary: `Encoló el comando ${commandType} para ${machine.name}`,
-            details: {
-                command_id: parseInt(insertResult.rows[0].id, 10),
-                command_type: commandType,
-                payload: normalizedPayload
-            }
-        });
-
-        broadcast({
-            event: 'machine_command_queued',
-            machine_id: machineId,
-            machine: machine.name,
-            command_type: commandType
+        const queuedCommand = await queueMachineCommand({
+            machineId: machine.id,
+            machineName: machine.name,
+            commandType,
+            payload: normalizedPayload,
+            req
         });
 
         return res.status(201).json({
             command: {
-                ...insertResult.rows[0],
-                id: parseInt(insertResult.rows[0].id, 10)
+                ...queuedCommand,
+                id: parseInt(queuedCommand.id, 10)
             }
         });
     } catch (err) {
@@ -387,7 +469,8 @@ router.post('/:id/commands', requireMachineOperator, async (req, res) => {
             || err.message === 'El SSID es requerido'
             || err.message === 'El SSID es demasiado largo'
             || err.message === 'La contraseña WiFi es demasiado larga'
-            || err.message === 'La URL del backend debe comenzar con http:// o https://') {
+            || err.message === 'La URL del backend debe comenzar con http:// o https://'
+            || err.message === 'El límite de diagnóstico no puede superar 32 eventos') {
             return res.status(400).json({ error: err.message });
         }
         return res.status(500).json({ error: err.message });

@@ -546,6 +546,132 @@ test('comando remoto reboot se puede encolar, entregar y confirmar', async () =>
     assert.equal(ack.json.ok, true);
 });
 
+test('técnico puede solicitar diagnostics_snapshot remoto y consultar el resultado', async () => {
+    await withDb(async client => {
+        await client.query('DELETE FROM machine_commands WHERE machine_id = $1', [fixture.machine.id]);
+        await client.query('UPDATE machines SET last_seen = NOW() WHERE id = $1', [fixture.machine.id]);
+    });
+
+    const queued = await requestJson('POST', `/api/machines/${fixture.machine.id}/commands`, {
+        token: technicianToken,
+        body: {
+            type: 'diagnostics_snapshot',
+            payload: { limit: 12 }
+        }
+    });
+    assert.equal(queued.status, 201);
+    assert.equal(queued.json.command.command_type, 'diagnostics_snapshot');
+    assert.equal(queued.json.command.payload.limit, 12);
+
+    const next = await requestJson('GET', '/api/machine-control/commands/next', {
+        headers: {
+            'X-Machine-Mac': fixture.machine.mac
+        }
+    });
+    assert.equal(next.status, 200);
+    assert.equal(next.json.command.type, 'diagnostics_snapshot');
+    assert.equal(next.json.command.payload.limit, 12);
+
+    const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
+        headers: machineHeaders(fixture.machine.mac),
+        body: {
+            status: 'completed',
+            result: {
+                message: 'Diagnóstico generado desde la máquina',
+                wifi_connected: true,
+                backend_ready: true,
+                events: {
+                    count: 2,
+                    capacity: 64,
+                    events: [
+                        { name: 'BOOT', arg1: 1, arg2: 0, ms: 15 },
+                        { name: 'MDB_RESET', arg1: 0, arg2: 0, ms: 320 }
+                    ]
+                },
+                mdb: {
+                    seen_config: true,
+                    seen_prices: true,
+                    vmc_level: 2,
+                    max_price: 1500,
+                    min_price: 1
+                }
+            }
+        }
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(ack.json.ok, true);
+
+    const result = await requestJson('GET', `/api/machines/${fixture.machine.id}/commands/${next.json.command.id}`, {
+        token: technicianToken
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.json.command.status, 'completed');
+    assert.equal(result.json.command.result.events.count, 2);
+    assert.equal(result.json.command.result.mdb.vmc_level, 2);
+});
+
+test('registro de máquina devuelve la configuración efectiva de precio desde backend', async () => {
+    await withDb(client => client.query(
+        'UPDATE machines SET price_cents = $1 WHERE id = $2',
+        [1450, fixture.machine.id]
+    ));
+
+    const registration = await requestJson('POST', '/api/machines/register', {
+        headers: {
+            'X-Registration-Secret': process.env.REGISTRATION_SECRET
+        },
+        body: {
+            mac: fixture.machine.mac,
+            backend_url: BASE_URL,
+            wifi_ssid: 'QA_WIFI',
+            price_cents: 1200,
+            pricing_profile: 'rubino_half_credit',
+            backend_ok: true
+        }
+    });
+
+    assert.equal(registration.status, 200);
+    assert.equal(registration.json.status, 'approved');
+    assert.equal(registration.json.config.price_cents, 1450);
+    assert.equal(registration.json.config.pricing_profile, 'rubino_half_credit');
+});
+
+test('actualizar precio de máquina encola config_update cuando la máquina está online', async () => {
+    await withDb(async (client) => {
+        await client.query('DELETE FROM machine_commands WHERE machine_id = $1', [fixture.machine.id]);
+        await client.query('UPDATE machines SET last_seen = NOW() WHERE id = $1', [fixture.machine.id]);
+    });
+
+    const updated = await requestJson('PATCH', `/api/machines/${fixture.machine.id}`, {
+        token: adminToken,
+        body: {
+            price_cents: 1550
+        }
+    });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.json.machine.price_cents, 1550);
+    assert.equal(updated.json.config_sync, 'queued');
+
+    const next = await requestJson('GET', '/api/machine-control/commands/next', {
+        headers: {
+            'X-Machine-Mac': fixture.machine.mac
+        }
+    });
+    assert.equal(next.status, 200);
+    assert.equal(next.json.command.type, 'config_update');
+    assert.equal(next.json.command.payload.price_cents, 1550);
+
+    const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
+        headers: machineHeaders(fixture.machine.mac),
+        body: {
+            status: 'completed',
+            result: { message: 'price applied' }
+        }
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(ack.json.ok, true);
+});
+
 test('supervisor no puede acceder a notificaciones ni auditoría', async () => {
     const login = await requestJson('POST', '/api/auth/login', {
         body: {

@@ -58,6 +58,7 @@ CREATE TABLE machines (
     name        VARCHAR(60) NOT NULL,         -- "Máquina A — Piso 1"
     location    VARCHAR(100),
     secret      VARCHAR(64) NOT NULL,         -- X-Machine-Secret del firmware
+    price_cents INT NOT NULL DEFAULT 1200,    -- precio humano configurable por máquina
     wifi_ssid   VARCHAR(64),
     backend_url VARCHAR(255),
     wifi_rssi   INT,

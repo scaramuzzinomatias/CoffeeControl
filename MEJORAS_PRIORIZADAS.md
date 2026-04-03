@@ -7,6 +7,27 @@ Objetivo:
 - Implementar cambios de a una, sin mezclar prioridades.
 - Reducir riesgo operativo en instalaciones reales.
 
+## Prioridad 0 — Hardening del firmware v3
+
+Estado: en curso
+
+Documento base:
+- [PLAN_FIRMWARE_V3_HARDENING.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PLAN_FIRMWARE_V3_HARDENING.md)
+
+Lineas ya acordadas:
+- no tocar timing MDB en la primera etapa
+- el precio se edita como valor humano y el firmware hace la conversion MDB
+- dejar precio editable desde portal y preparado para backend
+- estado actual: `PricingConfig` y `DeviceConfig` ya iniciados en firmware; el portal ya persiste `price`, backend ya guarda `machines.price_cents` y el panel puede editar precio por máquina
+- estado actual: el firmware ya informa `price_cents` / `pricing_profile` al registrarse y acepta `config_update` remoto para aplicar precio sin recompilar
+- estado actual: `event_log.*` ya implementado con ring buffer fijo de 64 entradas y endpoint `GET /diag/events` cuando el portal está activo
+- estado actual: persistencia offline mejorada con `offline_queue.*`, journal append-only `/queue.log` y migración automática desde `queue.json`
+- estado actual: watchdog implementado en modo conservador (`20s`) para `loopTask` + tarea MDB, con reset reason visible al boot
+- estado actual: portal desacoplado del `main.cpp`, servido desde `CoffeeControl_v3/data/portal/` en `LittleFS`, con fallback mínimo si faltan los assets
+- estado actual: captura del `SETUP` MDB agregada como diagnóstico (`GET /diag/mdb`) sin cambiar todavía la negociación ni el cálculo actual del precio
+- estado actual: runtime MDB consolidado en `MdbRuntimeState`, reduciendo estado disperso sin tocar todavía timing ni secuencia visible
+- estado actual: el portal ya expone botones para ver `Eventos` y `Setup MDB`, y el panel/backend ya puede pedir un snapshot remoto `diagnostics_snapshot` para soporte técnico
+
 ## Criterio de priorización
 
 Se usó este orden:
