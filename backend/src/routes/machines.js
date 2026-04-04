@@ -21,7 +21,10 @@ const DEFAULT_MACHINE_TECH_CONFIG = Object.freeze({
     mdb_scale_factor: 100,
     mdb_decimal_places: 2,
     mdb_max_response_time: 5,
-    mdb_misc_options: 0
+    mdb_misc_options: 0,
+    config_version: 1,
+    config_source: 'backend',
+    config_updated_at: null
 });
 const MACHINE_TECH_CONFIG_FIELDS = Object.freeze([
     'price_cents',
@@ -33,8 +36,31 @@ const MACHINE_TECH_CONFIG_FIELDS = Object.freeze([
     'mdb_max_response_time',
     'mdb_misc_options'
 ]);
+const MACHINE_TECH_META_FIELDS = Object.freeze([
+    'technical_config_version',
+    'technical_config_source',
+    'technical_config_updated_at'
+]);
+const MACHINE_TECH_REPORTED_FIELDS = Object.freeze([
+    'last_reported_technical_config',
+    'last_reported_technical_config_at'
+]);
 const MACHINE_TECH_CONFIG_SQL = MACHINE_TECH_CONFIG_FIELDS.join(', ');
-const MACHINE_TECH_CONFIG_SELECT = `id, name, location, last_seen, ${MACHINE_TECH_CONFIG_SQL}`;
+const MACHINE_TECH_META_SQL = MACHINE_TECH_META_FIELDS.join(', ');
+const MACHINE_TECH_REPORTED_SQL = MACHINE_TECH_REPORTED_FIELDS.join(', ');
+const MACHINE_TECH_CONFIG_SELECT = `id, name, location, last_seen, ${MACHINE_TECH_CONFIG_SQL}, ${MACHINE_TECH_META_SQL}, ${MACHINE_TECH_REPORTED_SQL}`;
+const MACHINE_TECH_FIELD_LABELS = Object.freeze({
+    price_cents: 'Precio',
+    pricing_profile: 'Perfil MDB',
+    mdb_feature_level: 'Feature level',
+    mdb_country_code: 'Country code',
+    mdb_scale_factor: 'Scale factor',
+    mdb_decimal_places: 'Decimal places',
+    mdb_max_response_time: 'Max response time',
+    mdb_misc_options: 'Misc options',
+    config_version: 'Config version',
+    config_source: 'Config source'
+});
 
 function isMachineOnline(lastSeen) {
     if (!lastSeen) return false;
@@ -65,6 +91,13 @@ function normalizePricingProfile(value) {
     const profile = value.trim();
     if (!profile) return null;
     return ['rubino_half_credit', 'identity'].includes(profile) ? profile : null;
+}
+
+function normalizeConfigSource(value, fallback = null) {
+    if (typeof value !== 'string') return fallback;
+    const source = value.trim().toLowerCase();
+    if (!source) return fallback;
+    return ['backend', 'portal', 'factory', 'unknown'].includes(source) ? source : fallback;
 }
 
 function normalizeByteValue(value) {
@@ -105,14 +138,133 @@ function buildMachineTechnicalConfig(machine) {
         mdb_scale_factor: Number(machine?.mdb_scale_factor ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_scale_factor),
         mdb_decimal_places: Number(machine?.mdb_decimal_places ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_decimal_places),
         mdb_max_response_time: Number(machine?.mdb_max_response_time ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_max_response_time),
-        mdb_misc_options: Number(machine?.mdb_misc_options ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_misc_options)
+        mdb_misc_options: Number(machine?.mdb_misc_options ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_misc_options),
+        config_version: Number(machine?.technical_config_version ?? machine?.config_version ?? DEFAULT_MACHINE_TECH_CONFIG.config_version),
+        config_source: normalizeConfigSource(machine?.technical_config_source ?? machine?.config_source, DEFAULT_MACHINE_TECH_CONFIG.config_source),
+        config_updated_at: machine?.technical_config_updated_at ?? machine?.config_updated_at ?? DEFAULT_MACHINE_TECH_CONFIG.config_updated_at
+    };
+}
+
+function buildReportedMachineTechnicalSnapshot(machine) {
+    const raw = machine?.last_reported_technical_config;
+    if (!raw || typeof raw !== 'object') return null;
+    return buildMachineTechnicalConfig(raw);
+}
+
+function buildMachineTechnicalDrift(desiredConfig, reportedConfig) {
+    if (!reportedConfig) return [];
+    return [...MACHINE_TECH_CONFIG_FIELDS, 'config_version', 'config_source']
+        .filter(field => desiredConfig[field] !== reportedConfig[field])
+        .map(field => ({
+            field,
+            label: MACHINE_TECH_FIELD_LABELS[field] || field,
+            desired: desiredConfig[field],
+            reported: reportedConfig[field]
+        }));
+}
+
+async function getLastMachineTechnicalAudit(machineId) {
+    const result = await pool.query(
+        `SELECT action,
+                actor_username,
+                actor_role,
+                summary,
+                details,
+                created_at
+         FROM audit_logs
+         WHERE entity_type = 'machine'
+           AND entity_id = $1
+           AND action IN ('machine.update_technical_config', 'machine.update')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`,
+        [String(machineId)]
+    );
+    if (result.rowCount === 0) return null;
+    const row = result.rows[0];
+    return {
+        action: row.action,
+        actor_username: row.actor_username,
+        actor_role: row.actor_role,
+        summary: row.summary,
+        created_at: row.created_at,
+        config_sync: row.details?.config_sync || null
+    };
+}
+
+async function buildMachineTechnicalSupport(machine) {
+    const desiredConfig = buildMachineTechnicalConfig(machine);
+    const reportedConfig = buildReportedMachineTechnicalSnapshot(machine);
+    const drift = buildMachineTechnicalDrift(desiredConfig, reportedConfig);
+    const lastBackendChange = await getLastMachineTechnicalAudit(machine?.id);
+    return {
+        status: reportedConfig ? (drift.length ? 'drift' : 'in_sync') : 'not_reported',
+        reported_config: reportedConfig,
+        reported_at: machine?.last_reported_technical_config_at || null,
+        drift,
+        last_backend_change: lastBackendChange
     };
 }
 
 function machineTechnicalConfigChanged(previousMachine, updatedMachine) {
     const previous = buildMachineTechnicalConfig(previousMachine);
     const next = buildMachineTechnicalConfig(updatedMachine);
-    return MACHINE_TECH_CONFIG_FIELDS.some(field => previous[field] !== next[field]);
+    return [...MACHINE_TECH_CONFIG_FIELDS, 'config_version', 'config_source'].some(field => previous[field] !== next[field]);
+}
+
+function buildReportedMachineTechnicalConfig(machine, body = {}) {
+    const base = buildMachineTechnicalConfig(machine);
+    const reported = { ...base };
+
+    if (body.price_cents !== undefined) {
+        const value = normalizePositiveInteger(body.price_cents);
+        if (value !== null) reported.price_cents = value;
+    }
+    if (body.pricing_profile !== undefined) {
+        const value = normalizePricingProfile(body.pricing_profile);
+        if (value) reported.pricing_profile = value;
+    }
+    if (body.mdb_feature_level !== undefined) {
+        const value = normalizeByteValue(body.mdb_feature_level);
+        if (value !== null) reported.mdb_feature_level = value;
+    }
+    if (body.mdb_country_code !== undefined) {
+        const value = normalizeWordValue(body.mdb_country_code);
+        if (value !== null) reported.mdb_country_code = value;
+    }
+    if (body.mdb_scale_factor !== undefined) {
+        const value = normalizeByteValue(body.mdb_scale_factor);
+        if (value !== null) reported.mdb_scale_factor = value;
+    }
+    if (body.mdb_decimal_places !== undefined) {
+        const value = normalizeByteValue(body.mdb_decimal_places);
+        if (value !== null) reported.mdb_decimal_places = value;
+    }
+    if (body.mdb_max_response_time !== undefined) {
+        const value = normalizeByteValue(body.mdb_max_response_time);
+        if (value !== null) reported.mdb_max_response_time = value;
+    }
+    if (body.mdb_misc_options !== undefined) {
+        const value = normalizeByteValue(body.mdb_misc_options);
+        if (value !== null) reported.mdb_misc_options = value;
+    }
+
+    const version = normalizePositiveInteger(body.config_version);
+    if (version !== null) reported.config_version = version;
+    reported.config_source = normalizeConfigSource(body.config_source, reported.config_source);
+    return reported;
+}
+
+async function bumpMachineTechnicalConfigVersion(client, machineId, baseVersion, source = 'backend') {
+    const result = await client.query(
+        `UPDATE machines
+         SET technical_config_version = GREATEST(COALESCE(technical_config_version, 1), $2) + 1,
+             technical_config_source = $3,
+             technical_config_updated_at = NOW()
+         WHERE id = $1
+         RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
+        [machineId, Math.max(1, Number(baseVersion) || 1), normalizeConfigSource(source, 'backend')]
+    );
+    return result.rows[0] || null;
 }
 
 async function syncMachineTechnicalConfig({ req, previousMachine, updatedMachine }) {
@@ -327,6 +479,8 @@ router.post('/register', async (req, res) => {
     const backendUrl = normalizeOptionalString(backend_url, 255);
     const reportedPriceCents = normalizePositiveInteger(price_cents);
     const pricingProfile = normalizePricingProfile(pricing_profile);
+    const reportedConfigVersion = normalizePositiveInteger(req.body?.config_version);
+    const reportedConfigSource = normalizeConfigSource(req.body?.config_source, 'unknown');
     const wifiRssi = normalizeOptionalInteger(wifi_rssi);
     const wifiIp = normalizeOptionalString(wifi_ip, 45);
     const backendOk = typeof backend_ok === 'boolean' ? backend_ok : null;
@@ -334,7 +488,7 @@ router.post('/register', async (req, res) => {
 
     try {
         const approved = await pool.query(
-            `SELECT id, name, ${MACHINE_TECH_CONFIG_SQL}
+            `SELECT id, name, ${MACHINE_TECH_CONFIG_SQL}, ${MACHINE_TECH_META_SQL}
              FROM machines
              WHERE mac = $1
                AND active = true`,
@@ -342,29 +496,50 @@ router.post('/register', async (req, res) => {
         );
 
         if (approved.rowCount > 0) {
+            const reportedConfig = buildReportedMachineTechnicalConfig(approved.rows[0], {
+                price_cents: reportedPriceCents,
+                pricing_profile: pricingProfile,
+                mdb_feature_level: req.body?.mdb_feature_level,
+                mdb_country_code: req.body?.mdb_country_code,
+                mdb_scale_factor: req.body?.mdb_scale_factor,
+                mdb_decimal_places: req.body?.mdb_decimal_places,
+                mdb_max_response_time: req.body?.mdb_max_response_time,
+                mdb_misc_options: req.body?.mdb_misc_options,
+                config_version: reportedConfigVersion,
+                config_source: reportedConfigSource
+            });
             const updateResult = await pool.query(
                 `UPDATE machines
-                SET last_seen = NOW(),
+                 SET last_seen = NOW(),
                     wifi_ssid = COALESCE($2, wifi_ssid),
                     backend_url = COALESCE($3, backend_url),
                      wifi_rssi = COALESCE($4, wifi_rssi),
                      wifi_ip = COALESCE($5, wifi_ip),
                      backend_ok = COALESCE($6, backend_ok),
-                     backend_error = $7
+                     backend_error = $7,
+                     last_reported_technical_config = $8::jsonb,
+                     last_reported_technical_config_at = NOW()
                  WHERE mac = $1
-                 RETURNING id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, backend_ok, backend_error, ${MACHINE_TECH_CONFIG_SQL}`,
-                [macClean, wifiSsid, backendUrl, wifiRssi, wifiIp, backendOk, backendError]
+                 RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
+                [macClean, wifiSsid, backendUrl, wifiRssi, wifiIp, backendOk, backendError, JSON.stringify(reportedConfig)]
             );
-            const machineState = updateResult.rows[0];
+            let machineState = updateResult.rows[0];
+            const desiredConfig = buildMachineTechnicalConfig(machineState);
+            const deviceMismatch = [...MACHINE_TECH_CONFIG_FIELDS, 'config_version', 'config_source']
+                .some(field => reportedConfig[field] !== desiredConfig[field]);
+            if (deviceMismatch && (reportedConfig.config_version >= desiredConfig.config_version)) {
+                machineState = await bumpMachineTechnicalConfigVersion(
+                    pool,
+                    machineState.id,
+                    reportedConfig.config_version,
+                    'backend'
+                ) || machineState;
+            }
             alerts.resolveMachineOffline(machineState.id).catch(err => console.error('[ALERT] Error resolviendo offline:', err.message));
             return res.status(200).json({
                 status: 'approved',
                 machine: approved.rows[0].name,
-                config: buildMachineTechnicalConfig({
-                    ...machineState,
-                    price_cents: machineState.price_cents || reportedPriceCents || DEFAULT_MACHINE_TECH_CONFIG.price_cents,
-                    pricing_profile: machineState.pricing_profile || pricingProfile || DEFAULT_MACHINE_TECH_CONFIG.pricing_profile
-                })
+                config: buildMachineTechnicalConfig(machineState)
             });
         }
 
@@ -537,7 +712,8 @@ router.get('/:id/technical-config', requireMachineTechnicalConfig, async (req, r
                 name: machine.name,
                 location: machine.location
             },
-            technical_config: buildMachineTechnicalConfig(machine)
+            technical_config: buildMachineTechnicalConfig(machine),
+            support: await buildMachineTechnicalSupport(machine)
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -587,7 +763,15 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
             ]
         );
 
-        const updatedMachine = result.rows[0];
+        let updatedMachine = result.rows[0];
+        if (machineTechnicalConfigChanged(previousMachine, updatedMachine)) {
+            updatedMachine = await bumpMachineTechnicalConfigVersion(
+                pool,
+                updatedMachine.id,
+                previousMachine.technical_config_version || previousMachine.config_version || 1,
+                'backend'
+            ) || updatedMachine;
+        }
         const configSync = await syncMachineTechnicalConfig({ req, previousMachine, updatedMachine });
 
         await audit.logAuditEvent({
@@ -611,7 +795,8 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
                 location: updatedMachine.location
             },
             technical_config: buildMachineTechnicalConfig(updatedMachine),
-            config_sync: configSync
+            config_sync: configSync,
+            support: await buildMachineTechnicalSupport(updatedMachine)
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -642,7 +827,15 @@ router.patch('/:id', requireMachineSetup, async (req, res) => {
              RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
             [name, location, priceCents, req.params.id]
         );
-        const updatedMachine = result.rows[0];
+        let updatedMachine = result.rows[0];
+        if (machineTechnicalConfigChanged(previousMachine, updatedMachine)) {
+            updatedMachine = await bumpMachineTechnicalConfigVersion(
+                pool,
+                updatedMachine.id,
+                previousMachine.technical_config_version || previousMachine.config_version || 1,
+                'backend'
+            ) || updatedMachine;
+        }
         const configSync = await syncMachineTechnicalConfig({ req, previousMachine, updatedMachine });
 
         await audit.logAuditEvent({

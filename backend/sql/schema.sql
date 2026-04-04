@@ -66,6 +66,11 @@ CREATE TABLE machines (
     mdb_decimal_places SMALLINT NOT NULL DEFAULT 2,
     mdb_max_response_time SMALLINT NOT NULL DEFAULT 5,
     mdb_misc_options SMALLINT NOT NULL DEFAULT 0,
+    technical_config_version INT NOT NULL DEFAULT 1,
+    technical_config_source VARCHAR(20) NOT NULL DEFAULT 'backend',
+    technical_config_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_reported_technical_config JSONB,
+    last_reported_technical_config_at TIMESTAMPTZ,
     wifi_ssid   VARCHAR(64),
     backend_url VARCHAR(255),
     wifi_rssi   INT,
@@ -81,7 +86,9 @@ CREATE TABLE machines (
     CHECK (mdb_scale_factor BETWEEN 0 AND 255),
     CHECK (mdb_decimal_places BETWEEN 0 AND 255),
     CHECK (mdb_max_response_time BETWEEN 0 AND 255),
-    CHECK (mdb_misc_options BETWEEN 0 AND 255)
+    CHECK (mdb_misc_options BETWEEN 0 AND 255),
+    CHECK (technical_config_version >= 1),
+    CHECK (technical_config_source IN ('backend', 'portal', 'factory', 'unknown'))
 );
 
 CREATE TABLE alert_events (

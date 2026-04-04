@@ -10,6 +10,8 @@ struct DeviceConfig {
     String wifiPass;
     String backendBase;
     PricingConfig pricing;
+    uint32_t configVersion;
+    String configSource;
 };
 
 void deviceConfigSetDefaults(DeviceConfig& config, const char* defaultBackendUrl);

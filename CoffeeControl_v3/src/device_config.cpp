@@ -11,6 +11,15 @@ String normalizeStoredUrl(String url) {
     }
     return url;
 }
+
+String normalizeConfigSource(String source) {
+    source.trim();
+    source.toLowerCase();
+    if (source == "backend" || source == "portal" || source == "factory" || source == "unknown") {
+        return source;
+    }
+    return "backend";
+}
 }
 
 void deviceConfigSetDefaults(DeviceConfig& config, const char* defaultBackendUrl) {
@@ -18,6 +27,8 @@ void deviceConfigSetDefaults(DeviceConfig& config, const char* defaultBackendUrl
     config.wifiPass = "";
     config.backendBase = String(defaultBackendUrl);
     config.pricing = pricingDefaultConfig();
+    config.configVersion = 1;
+    config.configSource = "backend";
 }
 
 void deviceConfigLoad(Preferences& prefs, DeviceConfig& config, const char* defaultBackendUrl) {
@@ -42,6 +53,9 @@ void deviceConfigLoad(Preferences& prefs, DeviceConfig& config, const char* defa
     config.pricing.decimalPlaces = (uint8_t)prefs.getUChar("decimal", config.pricing.decimalPlaces);
     config.pricing.maxResponseTime = (uint8_t)prefs.getUChar("resp_ms", config.pricing.maxResponseTime);
     config.pricing.miscOptions = (uint8_t)prefs.getUChar("misc_opt", config.pricing.miscOptions);
+    config.configVersion = prefs.getUInt("cfg_ver", config.configVersion);
+    if (config.configVersion == 0) config.configVersion = 1;
+    config.configSource = normalizeConfigSource(prefs.getString("cfg_src", config.configSource));
     pricingNormalizeConfig(config.pricing);
     prefs.end();
 }
@@ -66,5 +80,7 @@ void deviceConfigSave(Preferences& prefs, const DeviceConfig& config, const char
     prefs.putUChar("decimal", pricing.decimalPlaces);
     prefs.putUChar("resp_ms", pricing.maxResponseTime);
     prefs.putUChar("misc_opt", pricing.miscOptions);
+    prefs.putUInt("cfg_ver", config.configVersion > 0 ? config.configVersion : 1);
+    prefs.putString("cfg_src", normalizeConfigSource(config.configSource));
     prefs.end();
 }

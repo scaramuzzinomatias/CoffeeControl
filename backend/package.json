@@ -19,7 +19,7 @@
     "support:create-supervisor": "node scripts/support-user.js --role supervisor --activate",
     "support:create-technician": "node scripts/support-user.js --role tecnico --activate",
     "support:create-distributor": "node scripts/support-user.js --role distribuidor --activate",
-    "test:integration": "node --test test/integration.test.js"
+    "test:integration": "node scripts/db-migrate-all.js && node --test test/integration.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -620,9 +620,12 @@ test('registro de máquina devuelve la configuración efectiva de precio desde b
              mdb_scale_factor = $5,
              mdb_decimal_places = $6,
              mdb_max_response_time = $7,
-             mdb_misc_options = $8
-         WHERE id = $9`,
-        [1450, 'identity', 2, 0x0032, 100, 2, 6, 1, fixture.machine.id]
+             mdb_misc_options = $8,
+             technical_config_version = $9,
+             technical_config_source = 'backend',
+             technical_config_updated_at = NOW()
+         WHERE id = $10`,
+        [1450, 'identity', 2, 0x0032, 100, 2, 6, 1, 4, fixture.machine.id]
     ));
 
     const registration = await requestJson('POST', '/api/machines/register', {
@@ -635,6 +638,8 @@ test('registro de máquina devuelve la configuración efectiva de precio desde b
             wifi_ssid: 'QA_WIFI',
             price_cents: 1200,
             pricing_profile: 'rubino_half_credit',
+            config_version: 9,
+            config_source: 'portal',
             backend_ok: true
         }
     });
@@ -649,6 +654,19 @@ test('registro de máquina devuelve la configuración efectiva de precio desde b
     assert.equal(registration.json.config.mdb_decimal_places, 2);
     assert.equal(registration.json.config.mdb_max_response_time, 6);
     assert.equal(registration.json.config.mdb_misc_options, 1);
+    assert.equal(registration.json.config.config_version, 10);
+    assert.equal(registration.json.config.config_source, 'backend');
+
+    const support = await requestJson('GET', `/api/machines/${fixture.machine.id}/technical-config`, {
+        token: technicianToken
+    });
+    assert.equal(support.status, 200);
+    assert.equal(support.json.support.reported_config.price_cents, 1200);
+    assert.equal(support.json.support.reported_config.pricing_profile, 'rubino_half_credit');
+    assert.equal(support.json.support.reported_config.config_version, 9);
+    assert.equal(support.json.support.reported_config.config_source, 'portal');
+    assert.equal(support.json.support.status, 'drift');
+    assert.equal(support.json.support.drift.some(item => item.field === 'price_cents'), true);
 });
 
 test('actualizar precio de máquina encola config_update cuando la máquina está online', async () => {
@@ -694,6 +712,8 @@ test('actualizar precio de máquina encola config_update cuando la máquina est�
     assert.equal(next.json.command.payload.mdb_decimal_places, 2);
     assert.equal(next.json.command.payload.mdb_max_response_time, 5);
     assert.equal(next.json.command.payload.mdb_misc_options, 0);
+    assert.equal(next.json.command.payload.config_version >= 1, true);
+    assert.equal(next.json.command.payload.config_source, 'backend');
 
     const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
         headers: machineHeaders(fixture.machine.mac),
@@ -717,6 +737,10 @@ test('configuración técnica remota solo está disponible para admin/técnico/d
     });
     assert.equal(visibleForTechnician.status, 200);
     assert.equal(visibleForTechnician.json.technical_config.price_cents > 0, true);
+    assert.equal(visibleForTechnician.json.technical_config.config_version >= 1, true);
+    assert.equal(visibleForTechnician.json.technical_config.config_source, 'backend');
+    assert.ok(visibleForTechnician.json.support);
+    assert.ok(['not_reported', 'in_sync', 'drift'].includes(visibleForTechnician.json.support.status));
 
     const visibleForDistributor = await requestJson('GET', `/api/machines/${fixture.machine.id}/technical-config`, {
         token: distributorToken
@@ -750,7 +774,11 @@ test('técnico puede actualizar configuración técnica completa y encola config
     assert.equal(updated.json.technical_config.mdb_country_code, 0x0032);
     assert.equal(updated.json.technical_config.mdb_max_response_time, 7);
     assert.equal(updated.json.technical_config.mdb_misc_options, 1);
+    assert.equal(updated.json.technical_config.config_version >= 1, true);
+    assert.equal(updated.json.technical_config.config_source, 'backend');
     assert.equal(updated.json.config_sync, 'queued');
+    assert.equal(updated.json.support.last_backend_change.actor_username, fixture.technician.username);
+    assert.equal(updated.json.support.last_backend_change.action, 'machine.update_technical_config');
 
     const next = await requestJson('GET', '/api/machine-control/commands/next', {
         headers: {
@@ -767,6 +795,8 @@ test('técnico puede actualizar configuración técnica completa y encola config
     assert.equal(next.json.command.payload.mdb_decimal_places, 2);
     assert.equal(next.json.command.payload.mdb_max_response_time, 7);
     assert.equal(next.json.command.payload.mdb_misc_options, 1);
+    assert.equal(next.json.command.payload.config_version, updated.json.technical_config.config_version);
+    assert.equal(next.json.command.payload.config_source, 'backend');
 
     const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
         headers: machineHeaders(fixture.machine.mac),
