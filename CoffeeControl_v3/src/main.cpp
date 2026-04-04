@@ -74,6 +74,7 @@
 #include <RTClib.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <freertos/queue.h>
 #include "MDB9bit.h"
 #include "pricing.h"
 #include "device_config.h"
@@ -108,6 +109,7 @@
 
 // ── MDB constantes ────────────────────────────────────
 #define MDB_ADDR_CASHLESS  0x10
+#define MDB_ADDR_GATEWAY   0x18
 #define MDB_CMD_RESET      0x00
 #define MDB_CMD_SETUP      0x01
 #define MDB_CMD_POLL       0x02
@@ -117,6 +119,17 @@
 #define SETUP_CONFIG       0x00
 #define SETUP_PRICES       0x01
 #define EXPANSION_REQUEST_ID 0x00
+#define EXPANSION_WRITE_TIME_DATE 0x03
+#define MDB_TIME_DATE_REQUEST 0x11
+#define MDB_GW_EXP_IDENTIFICATION 0x00
+#define MDB_GW_EXP_FEATURE_ENABLE 0x01
+#define MDB_GW_EXP_TIME_DATE_REQUEST 0x02
+#define MDB_GW_CONTROL_DISABLE 0x00
+#define MDB_GW_CONTROL_ENABLE  0x01
+#define MDB_GW_CONTROL_TRANSMIT 0x02
+#define MDB_GW_FEATURE_FTL        0x00000001UL
+#define MDB_GW_FEATURE_VERBOSE    0x00000002UL
+#define MDB_GW_FEATURE_TIME_DATE  0x00000004UL
 #define VEND_REQUEST       0x00
 #define VEND_CANCEL        0x01
 #define VEND_SUCCESS       0x02
@@ -137,6 +150,8 @@
 #define NFC_COOLDOWN_MS    2500
 #define HTTP_TIMEOUT_MS    4000
 #define SESSION_TIMEOUT_MS 12000
+#define MDB_ASYNC_QUEUE_LEN 4
+#define MDB_ASYNC_UID_MAX 17
 #define COMMAND_POLL_MS    15000
 #define WATCHDOG_TIMEOUT_SEC 20
 
@@ -181,6 +196,71 @@ struct __attribute__((packed)) MdbSetupSnapshot {
     uint16_t minPrice;
     uint32_t lastSeenMs;
     uint8_t raw[8];
+    uint8_t lastExpansionSubcmd;
+    uint8_t lastExpansionLen;
+    uint8_t lastExpansionReserved[2];
+    uint32_t lastExpansionSeenMs;
+    uint8_t expansionRaw[12];
+    uint8_t timeDateYear;
+    uint8_t timeDateMonth;
+    uint8_t timeDateDay;
+    uint8_t timeDateHour;
+    uint8_t timeDateMinute;
+    uint8_t timeDateSecond;
+    uint8_t timeDateDayOfWeek;
+    uint8_t timeDateWeekNumber;
+};
+
+struct __attribute__((packed)) MdbGatewaySnapshot {
+    uint8_t seenMask;       // bit0=setup, bit1=control, bit2=identification, bit3=feature_enable, bit4=time_request, bit5=report
+    uint8_t lastCmd;
+    uint8_t lastLen;
+    uint8_t vmcFeatureLevel;
+    uint8_t vmcScaleFactor;
+    uint8_t vmcDecimalPlaces;
+    uint8_t gatewayFeatureLevel;
+    uint8_t controlState;
+    uint16_t appMaxResponseSeconds;
+    uint32_t enabledFeatures;
+    uint32_t lastSeenMs;
+    uint32_t lastControlMs;
+    uint32_t lastTimeDateResponseMs;
+    uint8_t raw[12];
+    uint8_t timeDateYear;
+    uint8_t timeDateMonth;
+    uint8_t timeDateDay;
+    uint8_t timeDateHour;
+    uint8_t timeDateMinute;
+    uint8_t timeDateSecond;
+};
+
+struct MdbGatewayRuntimeState {
+    bool justReset;
+    bool enabled;
+    uint8_t vmcFeatureLevel;
+    uint8_t featureLevel;
+    uint16_t appMaxResponseSeconds;
+    uint32_t enabledFeatures;
+
+    MdbGatewayRuntimeState()
+        : justReset(true),
+          enabled(false),
+          vmcFeatureLevel(0),
+          featureLevel(0),
+          appMaxResponseSeconds(5),
+          enabledFeatures(0) {}
+};
+
+enum MdbAsyncEventType : uint8_t {
+    MDB_EVENT_START_SESSION = 1
+};
+
+struct __attribute__((packed)) MdbAsyncEvent {
+    uint8_t type;
+    uint8_t sessionIsOffline;
+    uint16_t reserved;
+    uint32_t requestedAtMs;
+    char uid[MDB_ASYNC_UID_MAX];
 };
 
 struct MdbRuntimeState {
@@ -226,9 +306,14 @@ volatile bool watchdogReady = false;
 
 // ── Estado MDB ────────────────────────────────────────
 MdbRuntimeState mdbRuntime;
+QueueHandle_t mdbAsyncQueue = nullptr;
 unsigned long lastNFCRead    = 0;
 PricingConfig pricingConfig = pricingDefaultConfig();
+uint32_t technicalConfigVersion = 1;
+String technicalConfigSource = "backend";
 MdbSetupSnapshot mdbSetupSnapshot{};
+MdbGatewaySnapshot mdbGatewaySnapshot{};
+MdbGatewayRuntimeState mdbGatewayRuntime;
 
 // ── WiFi / backend ────────────────────────────────────
 String wifiSSID    = "";
@@ -240,6 +325,11 @@ bool   portalMode    = false;
 bool   wifiReady     = false;
 bool   backendReady  = false;   // true si /health respondio OK
 bool   rtcAvailable  = false;
+bool   mdbMachineTimeValid = false;
+uint32_t mdbMachineTimeEpoch = 0;
+uint32_t mdbMachineTimeCapturedAtMs = 0;
+volatile bool mdbTimeDateProbePending = false;
+uint32_t mdbTimeDateProbeRequestedAtMs = 0;
 
 // ── Offline: cache de tarjetas ────────────────────────
 CardEntry cards[MAX_CARDS];
@@ -252,12 +342,188 @@ uint32_t  nextResetTs = 0;      // Unix timestamp UTC del próximo reset de cont
 QueueEntry queueBuf[MAX_QUEUE];
 int        queueLen = 0;
 
+String jsonEscape(const String& value);
+String buildMdbGatewayJson();
+
 void logDiagEvent(uint16_t code, int16_t arg1 = 0, uint32_t arg2 = 0) {
     diagEventLog.push(code, arg1, arg2, millis());
 }
 
 void resetMdbSetupSnapshot() {
     memset(&mdbSetupSnapshot, 0, sizeof(mdbSetupSnapshot));
+}
+
+void resetMdbGatewaySnapshot() {
+    memset(&mdbGatewaySnapshot, 0, sizeof(mdbGatewaySnapshot));
+}
+
+uint8_t bcdToDec(uint8_t value) {
+    return (uint8_t)(((value >> 4) & 0x0F) * 10 + (value & 0x0F));
+}
+
+bool mdbSnapshotHasTimeDate() {
+    return (mdbSetupSnapshot.seenMask & 0x08) != 0;
+}
+
+bool getMdbMachineTimeTs(uint32_t* outTs) {
+    if (!mdbMachineTimeValid || mdbMachineTimeEpoch == 0) return false;
+
+    uint32_t elapsedSec = (uint32_t)((millis() - mdbMachineTimeCapturedAtMs) / 1000UL);
+    if (outTs) {
+        *outTs = mdbMachineTimeEpoch + elapsedSec;
+    }
+    return true;
+}
+
+void applyMdbMachineClockIfAvailable() {
+    if (!mdbSnapshotHasTimeDate()) return;
+
+    const uint8_t year = mdbSetupSnapshot.timeDateYear;
+    const uint8_t month = mdbSetupSnapshot.timeDateMonth;
+    const uint8_t day = mdbSetupSnapshot.timeDateDay;
+    const uint8_t hour = mdbSetupSnapshot.timeDateHour;
+    const uint8_t minute = mdbSetupSnapshot.timeDateMinute;
+    const uint8_t second = mdbSetupSnapshot.timeDateSecond;
+
+    if (month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+        return;
+    }
+
+    DateTime machineDate(2000 + year, month, day, hour, minute, second);
+    mdbMachineTimeEpoch = machineDate.unixtime();
+    mdbMachineTimeCapturedAtMs = millis();
+    mdbMachineTimeValid = true;
+
+    char iso[24];
+    snprintf(iso, sizeof(iso), "20%02u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)year,
+             (unsigned)month,
+             (unsigned)day,
+             (unsigned)hour,
+             (unsigned)minute,
+             (unsigned)second);
+    Serial.printf("[MDB] Hora de maquina capturada: %s\n", iso);
+}
+
+String buildMdbTimeDateIso() {
+    if (!mdbSnapshotHasTimeDate()) return "";
+
+    const uint8_t year = mdbSetupSnapshot.timeDateYear;
+    const uint8_t month = mdbSetupSnapshot.timeDateMonth;
+    const uint8_t day = mdbSetupSnapshot.timeDateDay;
+    const uint8_t hour = mdbSetupSnapshot.timeDateHour;
+    const uint8_t minute = mdbSetupSnapshot.timeDateMinute;
+    const uint8_t second = mdbSetupSnapshot.timeDateSecond;
+
+    if (month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+        return "";
+    }
+
+    char iso[24];
+    snprintf(iso, sizeof(iso), "20%02u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)year,
+             (unsigned)month,
+             (unsigned)day,
+             (unsigned)hour,
+             (unsigned)minute,
+             (unsigned)second);
+    return String(iso);
+}
+
+bool getGatewayCurrentTime(DateTime* out, const char** sourceLabel = nullptr) {
+    if (!out) return false;
+
+    if (rtcAvailable) {
+        *out = rtc.now();
+        if (sourceLabel) *sourceLabel = "ds3231";
+        return true;
+    }
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        *out = DateTime(1900 + timeinfo.tm_year,
+                        timeinfo.tm_mon + 1,
+                        timeinfo.tm_mday,
+                        timeinfo.tm_hour,
+                        timeinfo.tm_min,
+                        timeinfo.tm_sec);
+        if (sourceLabel) *sourceLabel = "ntp";
+        return true;
+    }
+
+    return false;
+}
+
+uint8_t gatewayFeatureLevelForVmc() {
+    const uint8_t supportedLevel = 0x03;
+    if (mdbGatewayRuntime.vmcFeatureLevel == 0) return supportedLevel;
+    return (uint8_t)min((int)mdbGatewayRuntime.vmcFeatureLevel, (int)supportedLevel);
+}
+
+uint32_t gatewaySupportedFeatures() {
+    return MDB_GW_FEATURE_TIME_DATE;
+}
+
+String buildGatewayTimeDateIso() {
+    if ((mdbGatewaySnapshot.seenMask & 0x10) == 0) return "";
+
+    char iso[24];
+    snprintf(iso, sizeof(iso), "20%02u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)mdbGatewaySnapshot.timeDateYear,
+             (unsigned)mdbGatewaySnapshot.timeDateMonth,
+             (unsigned)mdbGatewaySnapshot.timeDateDay,
+             (unsigned)mdbGatewaySnapshot.timeDateHour,
+             (unsigned)mdbGatewaySnapshot.timeDateMinute,
+             (unsigned)mdbGatewaySnapshot.timeDateSecond);
+    return String(iso);
+}
+
+void captureMdbGatewayCommand(uint8_t cmd, uint8_t* d, uint8_t len) {
+    mdbGatewaySnapshot.lastCmd = cmd;
+    mdbGatewaySnapshot.lastLen = len;
+    mdbGatewaySnapshot.lastSeenMs = millis();
+    memset(mdbGatewaySnapshot.raw, 0, sizeof(mdbGatewaySnapshot.raw));
+    if (d && len > 0) {
+        memcpy(mdbGatewaySnapshot.raw, d, len > sizeof(mdbGatewaySnapshot.raw) ? sizeof(mdbGatewaySnapshot.raw) : len);
+    }
+
+    switch (cmd) {
+        case MDB_CMD_SETUP:
+            mdbGatewaySnapshot.seenMask |= 0x01;
+            if (len >= 1) mdbGatewaySnapshot.vmcFeatureLevel = d[0];
+            if (len >= 2) mdbGatewaySnapshot.vmcScaleFactor = d[1];
+            if (len >= 3) mdbGatewaySnapshot.vmcDecimalPlaces = d[2];
+            logDiagEvent(EVT_MDB_GATEWAY_SETUP,
+                         len >= 1 ? d[0] : 0,
+                         ((uint32_t)(len >= 2 ? d[1] : 0) << 8) | (uint32_t)(len >= 3 ? d[2] : 0));
+            break;
+        case MDB_CMD_VEND:
+            mdbGatewaySnapshot.seenMask |= 0x20;
+            logDiagEvent(EVT_MDB_GATEWAY_REPORT, len >= 1 ? d[0] : 0, len);
+            break;
+        case MDB_CMD_READER:
+            mdbGatewaySnapshot.seenMask |= 0x02;
+            mdbGatewaySnapshot.controlState = len >= 1 ? d[0] : mdbGatewaySnapshot.controlState;
+            mdbGatewaySnapshot.lastControlMs = millis();
+            logDiagEvent(EVT_MDB_GATEWAY_CONTROL, len >= 1 ? d[0] : 0, len);
+            break;
+        case MDB_CMD_EXPANSION:
+            if (len >= 1 && d[0] == MDB_GW_EXP_IDENTIFICATION) {
+                mdbGatewaySnapshot.seenMask |= 0x04;
+                logDiagEvent(EVT_MDB_GATEWAY_IDENTIFICATION, len, 0);
+            } else if (len >= 5 && d[0] == MDB_GW_EXP_FEATURE_ENABLE) {
+                mdbGatewaySnapshot.seenMask |= 0x08;
+                mdbGatewaySnapshot.enabledFeatures =
+                    ((uint32_t)d[1] << 24) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 8) | (uint32_t)d[4];
+                logDiagEvent(EVT_MDB_GATEWAY_FEATURE_ENABLE, len, mdbGatewaySnapshot.enabledFeatures);
+            } else if (len >= 1 && d[0] == MDB_GW_EXP_TIME_DATE_REQUEST) {
+                mdbGatewaySnapshot.seenMask |= 0x10;
+                logDiagEvent(EVT_MDB_GATEWAY_TIME_DATE_REQUEST, len, 0);
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 void captureMdbSetup(uint8_t* d, uint8_t len) {
@@ -301,11 +567,52 @@ void captureMdbSetup(uint8_t* d, uint8_t len) {
     }
 }
 
+void captureMdbExpansion(uint8_t* d, uint8_t len) {
+    if (!d || len == 0) return;
+
+    mdbSetupSnapshot.lastExpansionSubcmd = d[0];
+    mdbSetupSnapshot.lastExpansionLen = len;
+    mdbSetupSnapshot.lastExpansionSeenMs = millis();
+    memset(mdbSetupSnapshot.expansionRaw, 0, sizeof(mdbSetupSnapshot.expansionRaw));
+    memcpy(mdbSetupSnapshot.expansionRaw, d, len > sizeof(mdbSetupSnapshot.expansionRaw) ? sizeof(mdbSetupSnapshot.expansionRaw) : len);
+
+    if (d[0] == EXPANSION_REQUEST_ID) {
+        mdbSetupSnapshot.seenMask |= 0x04;
+        logDiagEvent(EVT_MDB_EXPANSION_REQUEST_ID, len, 0);
+        return;
+    }
+
+    if (d[0] == EXPANSION_WRITE_TIME_DATE && len >= 11) {
+        mdbSetupSnapshot.seenMask |= 0x08;
+        mdbSetupSnapshot.timeDateYear = bcdToDec(d[1]);
+        mdbSetupSnapshot.timeDateMonth = bcdToDec(d[2]);
+        mdbSetupSnapshot.timeDateDay = bcdToDec(d[3]);
+        mdbSetupSnapshot.timeDateHour = bcdToDec(d[4]);
+        mdbSetupSnapshot.timeDateMinute = bcdToDec(d[5]);
+        mdbSetupSnapshot.timeDateSecond = bcdToDec(d[6]);
+        mdbSetupSnapshot.timeDateDayOfWeek = bcdToDec(d[7]);
+        mdbSetupSnapshot.timeDateWeekNumber = bcdToDec(d[8]);
+        logDiagEvent(
+            EVT_MDB_TIME_DATE_FILE,
+            (int16_t)((mdbSetupSnapshot.timeDateHour << 8) | mdbSetupSnapshot.timeDateMinute),
+            ((uint32_t)mdbSetupSnapshot.timeDateYear << 24)
+                | ((uint32_t)mdbSetupSnapshot.timeDateMonth << 16)
+                | ((uint32_t)mdbSetupSnapshot.timeDateDay << 8)
+                | (uint32_t)mdbSetupSnapshot.timeDateSecond
+        );
+        applyMdbMachineClockIfAvailable();
+    }
+}
+
 String buildMdbSetupJson() {
     String json = "{\"seen_config\":";
     json += (mdbSetupSnapshot.seenMask & 0x01) ? "true" : "false";
     json += ",\"seen_prices\":";
     json += (mdbSetupSnapshot.seenMask & 0x02) ? "true" : "false";
+    json += ",\"seen_request_id\":";
+    json += (mdbSetupSnapshot.seenMask & 0x04) ? "true" : "false";
+    json += ",\"seen_time_date\":";
+    json += (mdbSetupSnapshot.seenMask & 0x08) ? "true" : "false";
     json += ",\"last_subcmd\":";
     json += mdbSetupSnapshot.lastSubcmd;
     json += ",\"last_len\":";
@@ -324,10 +631,115 @@ String buildMdbSetupJson() {
     json += mdbSetupSnapshot.minPrice;
     json += ",\"last_seen_ms\":";
     json += mdbSetupSnapshot.lastSeenMs;
+    json += ",\"last_expansion_subcmd\":";
+    json += mdbSetupSnapshot.lastExpansionSubcmd;
+    json += ",\"last_expansion_len\":";
+    json += mdbSetupSnapshot.lastExpansionLen;
+    json += ",\"last_expansion_seen_ms\":";
+    json += mdbSetupSnapshot.lastExpansionSeenMs;
+    json += ",\"time_date\":{";
+    json += "\"valid\":";
+    json += mdbSnapshotHasTimeDate() ? "true" : "false";
+    json += ",\"iso\":\"";
+    json += jsonEscape(buildMdbTimeDateIso());
+    json += "\",\"year\":";
+    json += mdbSetupSnapshot.timeDateYear;
+    json += ",\"month\":";
+    json += mdbSetupSnapshot.timeDateMonth;
+    json += ",\"day\":";
+    json += mdbSetupSnapshot.timeDateDay;
+    json += ",\"hour\":";
+    json += mdbSetupSnapshot.timeDateHour;
+    json += ",\"minute\":";
+    json += mdbSetupSnapshot.timeDateMinute;
+    json += ",\"second\":";
+    json += mdbSetupSnapshot.timeDateSecond;
+    json += ",\"day_of_week\":";
+    json += mdbSetupSnapshot.timeDateDayOfWeek;
+    json += ",\"week_number\":";
+    json += mdbSetupSnapshot.timeDateWeekNumber;
+    json += "}";
+    json += ",\"time_date_probe_pending\":";
+    json += mdbTimeDateProbePending ? "true" : "false";
+    json += ",\"time_date_probe_requested_at_ms\":";
+    json += mdbTimeDateProbeRequestedAtMs;
     json += ",\"raw\":[";
     for (uint8_t i = 0; i < sizeof(mdbSetupSnapshot.raw); i++) {
         if (i > 0) json += ",";
         json += mdbSetupSnapshot.raw[i];
+    }
+    json += "],\"expansion_raw\":[";
+    for (uint8_t i = 0; i < sizeof(mdbSetupSnapshot.expansionRaw); i++) {
+        if (i > 0) json += ",";
+        json += mdbSetupSnapshot.expansionRaw[i];
+    }
+    json += "],\"gateway\":";
+    json += buildMdbGatewayJson();
+    json += "}";
+    return json;
+}
+
+String buildMdbGatewayJson() {
+    String json = "{\"seen_setup\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x01) ? "true" : "false";
+    json += ",\"seen_control\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x02) ? "true" : "false";
+    json += ",\"seen_identification\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x04) ? "true" : "false";
+    json += ",\"seen_feature_enable\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x08) ? "true" : "false";
+    json += ",\"seen_time_date_request\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x10) ? "true" : "false";
+    json += ",\"seen_report\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x20) ? "true" : "false";
+    json += ",\"last_cmd\":";
+    json += mdbGatewaySnapshot.lastCmd;
+    json += ",\"last_len\":";
+    json += mdbGatewaySnapshot.lastLen;
+    json += ",\"last_seen_ms\":";
+    json += mdbGatewaySnapshot.lastSeenMs;
+    json += ",\"vmc_feature_level\":";
+    json += mdbGatewaySnapshot.vmcFeatureLevel;
+    json += ",\"vmc_scale_factor\":";
+    json += mdbGatewaySnapshot.vmcScaleFactor;
+    json += ",\"vmc_decimal_places\":";
+    json += mdbGatewaySnapshot.vmcDecimalPlaces;
+    json += ",\"gateway_feature_level\":";
+    json += mdbGatewaySnapshot.gatewayFeatureLevel;
+    json += ",\"gateway_enabled\":";
+    json += mdbGatewayRuntime.enabled ? "true" : "false";
+    json += ",\"control_state\":";
+    json += mdbGatewaySnapshot.controlState;
+    json += ",\"app_max_response_seconds\":";
+    json += mdbGatewaySnapshot.appMaxResponseSeconds;
+    json += ",\"enabled_features\":";
+    json += mdbGatewaySnapshot.enabledFeatures;
+    json += ",\"time_date\":{";
+    json += "\"valid\":";
+    json += (mdbGatewaySnapshot.seenMask & 0x10) ? "true" : "false";
+    json += ",\"iso\":\"";
+    json += jsonEscape(buildGatewayTimeDateIso());
+    json += "\",\"year\":";
+    json += mdbGatewaySnapshot.timeDateYear;
+    json += ",\"month\":";
+    json += mdbGatewaySnapshot.timeDateMonth;
+    json += ",\"day\":";
+    json += mdbGatewaySnapshot.timeDateDay;
+    json += ",\"hour\":";
+    json += mdbGatewaySnapshot.timeDateHour;
+    json += ",\"minute\":";
+    json += mdbGatewaySnapshot.timeDateMinute;
+    json += ",\"second\":";
+    json += mdbGatewaySnapshot.timeDateSecond;
+    json += "}";
+    json += ",\"last_control_ms\":";
+    json += mdbGatewaySnapshot.lastControlMs;
+    json += ",\"last_time_date_response_ms\":";
+    json += mdbGatewaySnapshot.lastTimeDateResponseMs;
+    json += ",\"raw\":[";
+    for (uint8_t i = 0; i < sizeof(mdbGatewaySnapshot.raw); i++) {
+        if (i > 0) json += ",";
+        json += mdbGatewaySnapshot.raw[i];
     }
     json += "]}";
     return json;
@@ -346,10 +758,28 @@ String buildDiagnosticsSnapshotJson(uint8_t eventLimit = 20) {
     json += backendReady ? "true" : "false";
     json += ",\"queue_pending\":";
     json += queueLen;
+    json += ",\"mdb_time_date_probe_pending\":";
+    json += mdbTimeDateProbePending ? "true" : "false";
+    json += ",\"mdb_time_date_probe_requested_at_ms\":";
+    json += mdbTimeDateProbeRequestedAtMs;
+    json += ",\"clock_source\":\"";
+    if (rtcAvailable) {
+        json += "ds3231";
+    } else {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) json += "ntp";
+        else if (mdbMachineTimeValid) json += "mdb";
+        else json += "uptime";
+    }
+    json += "\"";
     json += ",\"price_cents\":";
     json += pricingSanitizeHumanPrice(pricingConfig.priceCents);
     json += ",\"pricing_profile\":\"";
     json += pricingProfileCode(pricingConfig.profile);
+    json += "\",\"config_version\":";
+    json += technicalConfigVersion;
+    json += ",\"config_source\":\"";
+    json += jsonEscape(technicalConfigSource);
     json += "\",\"mdb_feature_level\":";
     json += pricingConfig.featureLevel;
     json += ",\"mdb_country_code\":";
@@ -366,6 +796,8 @@ String buildDiagnosticsSnapshotJson(uint8_t eventLimit = 20) {
     json += eventLogBuildJson(diagEventLog, eventLimit);
     json += ",\"mdb\":";
     json += buildMdbSetupJson();
+    json += ",\"gateway\":";
+    json += buildMdbGatewayJson();
     json += "}";
     return json;
 }
@@ -454,7 +886,8 @@ bool hasHttpScheme(const String& url) {
 void handleMDB();
 
 void startPortal();
-void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing);
+void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing, uint32_t configVersion, const String& configSource);
+void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool ok);
 uint16_t currentConfiguredHumanPrice();
 
 bool parseUnsignedLongStrict(const String& raw, uint32_t& out) {
@@ -484,24 +917,111 @@ uint16_t currentConfiguredSessionFunds() {
     return pricingBeginSessionFunds(pricingConfig);
 }
 
-void syncConfiguredPriceToMdbRuntime() {
-    mdbRuntime.vendAmount = currentConfiguredHumanPrice();
-    mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+bool enqueueMdbStartSession(const String& uid, bool isOffline) {
+    if (mdbAsyncQueue == nullptr) return false;
+
+    MdbAsyncEvent event{};
+    event.type = MDB_EVENT_START_SESSION;
+    event.sessionIsOffline = isOffline ? 1 : 0;
+    event.requestedAtMs = millis();
+    snprintf(event.uid, sizeof(event.uid), "%s", uid.c_str());
+
+    return xQueueSend(mdbAsyncQueue, &event, 0) == pdPASS;
 }
 
-bool applyPricingConfig(const PricingConfig& nextConfigRaw, bool persistToNvs, const char* sourceLabel) {
-    PricingConfig nextConfig = nextConfigRaw;
-    pricingNormalizeConfig(nextConfig);
-    if (pricingEquals(nextConfig, pricingConfig)) return false;
-
-    pricingConfig = nextConfig;
-    syncConfiguredPriceToMdbRuntime();
-
-    if (persistToNvs) {
-        saveConfig(wifiSSID, wifiPass, backendBase, pricingConfig);
+void startMdbSessionFromEvent(const MdbAsyncEvent& event) {
+    if (mdbRuntime.pendingSession || mdbRuntime.phase == SESSION_IDLE || mdbRuntime.phase == VEND_PENDING) {
+        MDB_LOG_EVENT("[MDB] Evento NFC descartado por sesion activa: %s\n", event.uid);
+        return;
     }
 
-    Serial.printf("[CFG] Config tecnica sincronizada desde %s: precio=%u perfil=%s feature=%u country=0x%04X scale=%u decimals=%u resp=%u misc=%u\n",
+    mdbRuntime.sessionUID = event.uid;
+    mdbRuntime.sessionIsOffline = event.sessionIsOffline != 0;
+    mdbRuntime.pendingSession = true;
+    mdbRuntime.phase = SESSION_IDLE;
+    mdbRuntime.sessionStartMs = event.requestedAtMs > 0 ? event.requestedAtMs : millis();
+    mdbRuntime.sessionItemId = 0;
+    mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+    mdbRuntime.vendAmount = currentConfiguredHumanPrice();
+    mdbRuntime.vendApproved = false;
+    mdbRuntime.vendUsed = false;
+    mdbRuntime.vendDecisionSent = false;
+    mdbRuntime.endSessionPending = false;
+}
+
+void processMdbAsyncQueue() {
+    if (mdbAsyncQueue == nullptr) return;
+
+    MdbAsyncEvent event{};
+    if (xQueueReceive(mdbAsyncQueue, &event, 0) != pdPASS) return;
+
+    switch (event.type) {
+        case MDB_EVENT_START_SESSION:
+            startMdbSessionFromEvent(event);
+            break;
+        default:
+            MDB_LOG_EVENT("[MDB] Evento async desconocido: %u\n", (unsigned)event.type);
+            break;
+    }
+}
+
+void processMdbSessionTimeout() {
+    if (!mdbRuntime.pendingSession) return;
+
+    unsigned long elapsed = millis() - mdbRuntime.sessionStartMs;
+    if (elapsed <= SESSION_TIMEOUT_MS) return;
+
+    Serial.printf("[TMO] Timeout SESSION_IDLE — cancelando tap de %s\n",
+                  mdbRuntime.sessionUID.c_str());
+    logDiagEvent(EVT_SESSION_TIMEOUT, mdbRuntime.phase, elapsed);
+
+    String cancelUid = mdbRuntime.sessionUID;
+    bool wasOffline = mdbRuntime.sessionIsOffline;
+
+    mdbRuntime.sessionUID = "";
+    mdbRuntime.pendingSession = false;
+    mdbRuntime.phase = MDB_DISABLED;
+    mdbRuntime.vendApproved = false;
+    mdbRuntime.vendUsed = false;
+    mdbRuntime.vendDecisionSent = false;
+    mdbRuntime.endSessionPending = false;
+    mdbRuntime.sessionItemId = 0;
+    mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+    mdbRuntime.vendAmount = currentConfiguredHumanPrice();
+    mdbRuntime.sessionStartMs = 0;
+    mdbRuntime.sessionIsOffline = false;
+
+    mdbRuntime.sessionIsOffline = wasOffline;
+    notifyVendResult(cancelUid, 0, 0, false);
+    mdbRuntime.sessionIsOffline = false;
+
+    ledBlink(4, 150);
+}
+
+bool applyPricingConfig(const PricingConfig& nextConfigRaw, bool persistToNvs, const char* sourceLabel, uint32_t nextVersion = 0, const String& nextSource = String()) {
+    PricingConfig nextConfig = nextConfigRaw;
+    pricingNormalizeConfig(nextConfig);
+    uint32_t normalizedVersion = nextVersion > 0 ? nextVersion : technicalConfigVersion;
+    if (normalizedVersion == 0) normalizedVersion = 1;
+    String normalizedSource = nextSource;
+    normalizedSource.trim();
+    normalizedSource.toLowerCase();
+    if (normalizedSource.length() == 0) normalizedSource = technicalConfigSource;
+    if (normalizedSource.length() == 0) normalizedSource = "backend";
+
+    bool configChanged = !pricingEquals(nextConfig, pricingConfig);
+    bool metaChanged = normalizedVersion != technicalConfigVersion || normalizedSource != technicalConfigSource;
+    if (!configChanged && !metaChanged) return false;
+
+    pricingConfig = nextConfig;
+    technicalConfigVersion = normalizedVersion;
+    technicalConfigSource = normalizedSource;
+
+    if (persistToNvs) {
+        saveConfig(wifiSSID, wifiPass, backendBase, pricingConfig, technicalConfigVersion, technicalConfigSource);
+    }
+
+    Serial.printf("[CFG] Config tecnica sincronizada desde %s: precio=%u perfil=%s feature=%u country=0x%04X scale=%u decimals=%u resp=%u misc=%u version=%lu source=%s\n",
                   sourceLabel ? sourceLabel : "origen_desconocido",
                   (unsigned)pricingConfig.priceCents,
                   pricingProfileCode(pricingConfig.profile),
@@ -510,7 +1030,9 @@ bool applyPricingConfig(const PricingConfig& nextConfigRaw, bool persistToNvs, c
                   (unsigned)pricingConfig.scaleFactor,
                   (unsigned)pricingConfig.decimalPlaces,
                   (unsigned)pricingConfig.maxResponseTime,
-                  (unsigned)pricingConfig.miscOptions);
+                  (unsigned)pricingConfig.miscOptions,
+                  (unsigned long)technicalConfigVersion,
+                  technicalConfigSource.c_str());
     return true;
 }
 
@@ -531,7 +1053,9 @@ void mdbCommandTask(void*) {
             }
         }
 
+        processMdbAsyncQueue();
         handleMDB();
+        processMdbSessionTimeout();
 
         if (taskRegistered) {
             esp_task_wdt_reset();
@@ -561,16 +1085,19 @@ void readConfig() {
     wifiPass = config.wifiPass;
     backendBase = normalizeBackendUrl(config.backendBase);
     pricingConfig = config.pricing;
-    syncConfiguredPriceToMdbRuntime();
+    technicalConfigVersion = config.configVersion > 0 ? config.configVersion : 1;
+    technicalConfigSource = config.configSource.length() > 0 ? config.configSource : "backend";
 
     Serial.printf("[CFG] SSID guardada:   %s\n", wifiSSID.c_str());
     Serial.printf("[CFG] Backend guardado: %s\n", backendBase.c_str());
-    Serial.printf("[CFG] Precio guardado:  %u (perfil=%s)\n",
+    Serial.printf("[CFG] Precio guardado:  %u (perfil=%s, version=%lu, source=%s)\n",
                   (unsigned)pricingConfig.priceCents,
-                  pricingProfileCode(pricingConfig.profile));
+                  pricingProfileCode(pricingConfig.profile),
+                  (unsigned long)technicalConfigVersion,
+                  technicalConfigSource.c_str());
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing) {
+void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing, uint32_t configVersion, const String& configSource) {
     DeviceConfig config;
     deviceConfigSetDefaults(config, BACKEND_URL);
     config.wifiSSID = ssid;
@@ -578,14 +1105,20 @@ void saveConfig(const String& ssid, const String& pass, const String& url, const
     String urlNorm = normalizeBackendUrl(url);
     config.backendBase = urlNorm.length() > 0 ? urlNorm : String(BACKEND_URL);
     config.pricing = pricing;
+    config.configVersion = configVersion > 0 ? configVersion : 1;
+    config.configSource = configSource.length() > 0 ? configSource : String("backend");
     pricingNormalizeConfig(config.pricing);
 
     deviceConfigSave(prefs, config, BACKEND_URL);
     pricingConfig = config.pricing;
-    syncConfiguredPriceToMdbRuntime();
+    technicalConfigVersion = config.configVersion;
+    technicalConfigSource = config.configSource;
 
-    Serial.printf("[CFG] Config guardada — SSID: %s | precio: %u\n",
-                  ssid.c_str(), (unsigned)pricingConfig.priceCents);
+    Serial.printf("[CFG] Config guardada — SSID: %s | precio: %u | version=%lu | source=%s\n",
+                  ssid.c_str(),
+                  (unsigned)pricingConfig.priceCents,
+                  (unsigned long)technicalConfigVersion,
+                  technicalConfigSource.c_str());
 }
 
 void handleResetButtonRuntime() {
@@ -710,10 +1243,21 @@ bool fillDateFromRtcOrNtp(char* out, size_t outSize) {
     }
 
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) return false;
-    snprintf(out, outSize, "%04d-%02d-%02d",
-             1900 + timeinfo.tm_year, timeinfo.tm_mon + 1, timeinfo.tm_mday);
-    return true;
+    if (getLocalTime(&timeinfo)) {
+        snprintf(out, outSize, "%04d-%02d-%02d",
+                 1900 + timeinfo.tm_year, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+        return true;
+    }
+
+    uint32_t mdbTs = 0;
+    if (getMdbMachineTimeTs(&mdbTs)) {
+        DateTime now(mdbTs);
+        snprintf(out, outSize, "%04d-%02d-%02d",
+                 now.year(), now.month(), now.day());
+        return true;
+    }
+
+    return false;
 }
 
 bool advanceDateByOneDay(const char* currentDate, char* out, size_t outSize) {
@@ -789,6 +1333,10 @@ uint32_t getCurrentTs() {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
         return (uint32_t)mktime(&timeinfo);
+    }
+    uint32_t mdbTs = 0;
+    if (getMdbMachineTimeTs(&mdbTs)) {
+        return mdbTs;
     }
     return (uint32_t)(millis() / 1000);  // fallback: uptime
 }
@@ -1283,10 +1831,12 @@ void startPortal() {
                       "\"mode\":\"" DEPLOYMENT_MODE "\","
                       "\"requires_url\":" + String(String(DEPLOYMENT_MODE) == "saas" ? "false" : "true") + ","
                       "\"ssid\":\"" + jsonEscape(wifiSSID) + "\","
-                      "\"pass\":\"" + jsonEscape(wifiPass) + "\","
-                      "\"url\":\"" + jsonEscape(backendBase) + "\","
-                      "\"price\":" + String((unsigned long)pricingSanitizeHumanPrice(pricingConfig.priceCents)) + ","
-                      "\"price_profile\":\"" + jsonEscape(pricingProfileCode(pricingConfig.profile)) + "\"}";
+                      "\"pass\":\"" + jsonEscape(wifiPass) + "\"," 
+                      "\"url\":\"" + jsonEscape(backendBase) + "\"," 
+                      "\"price\":" + String((unsigned long)pricingSanitizeHumanPrice(pricingConfig.priceCents)) + "," 
+                      "\"price_profile\":\"" + jsonEscape(pricingProfileCode(pricingConfig.profile)) + "\"," 
+                      "\"config_version\":" + String((unsigned long)technicalConfigVersion) + "," 
+                      "\"config_source\":\"" + jsonEscape(technicalConfigSource) + "\"}";
         portalServer.sendHeader("Cache-Control", "no-store");
         portalServer.send(200, "application/json", json);
     });
@@ -1301,6 +1851,16 @@ void startPortal() {
 
     portalServer.on("/diag/mdb", HTTP_GET, []() {
         String json = buildMdbSetupJson();
+        portalServer.sendHeader("Cache-Control", "no-store");
+        portalServer.send(200, "application/json", json);
+    });
+
+    portalServer.on("/diag/mdb/request-time", HTTP_POST, []() {
+        mdbTimeDateProbePending = true;
+        mdbTimeDateProbeRequestedAtMs = millis();
+        String json = "{\"ok\":true,\"message\":\"Solicitud de hora MDB armada. Se enviara en el proximo POLL estando ENABLED.\",\"requested_at_ms\":";
+        json += mdbTimeDateProbeRequestedAtMs;
+        json += "}";
         portalServer.sendHeader("Cache-Control", "no-store");
         portalServer.send(200, "application/json", json);
     });
@@ -1364,7 +1924,7 @@ void startPortal() {
 
         PricingConfig nextPricing = pricingConfig;
         nextPricing.priceCents = priceValue;
-        saveConfig(ssid, pass, url, nextPricing);
+        saveConfig(ssid, pass, url, nextPricing, technicalConfigVersion + 1, "portal");
         portalServer.send(200, "text/plain", "ok");
         Serial.println("[PORTAL] Config guardada, reiniciando...");
         ledBlink(3, 200);
@@ -1560,6 +2120,8 @@ void registerMachine() {
     doc["backend_url"] = backendBase;
     doc["price_cents"] = pricingSanitizeHumanPrice(pricingConfig.priceCents);
     doc["pricing_profile"] = pricingProfileCode(pricingConfig.profile);
+    doc["config_version"] = technicalConfigVersion;
+    doc["config_source"] = technicalConfigSource;
     doc["mdb_feature_level"] = pricingConfig.featureLevel;
     doc["mdb_country_code"] = pricingConfig.countryCode;
     doc["mdb_scale_factor"] = pricingConfig.scaleFactor;
@@ -1586,6 +2148,8 @@ void registerMachine() {
             JsonObject config = responseDoc["config"].as<JsonObject>();
             if (!config.isNull()) {
                 PricingConfig nextConfig = pricingConfig;
+                uint32_t remoteVersion = (uint32_t)(config["config_version"] | technicalConfigVersion);
+                String remoteSource = String((const char*)(config["config_source"] | technicalConfigSource.c_str()));
                 uint32_t remotePrice = (uint32_t)(config["price_cents"] | 0);
                 if (remotePrice > 0) nextConfig.priceCents = remotePrice;
                 nextConfig.profile = pricingProfileFromCode(
@@ -1598,7 +2162,7 @@ void registerMachine() {
                 nextConfig.decimalPlaces = (uint8_t)(config["mdb_decimal_places"] | nextConfig.decimalPlaces);
                 nextConfig.maxResponseTime = (uint8_t)(config["mdb_max_response_time"] | nextConfig.maxResponseTime);
                 nextConfig.miscOptions = (uint8_t)(config["mdb_misc_options"] | nextConfig.miscOptions);
-                applyPricingConfig(nextConfig, true, "backend/register");
+                applyPricingConfig(nextConfig, true, "backend/register", remoteVersion, remoteSource);
             }
         } else {
             Serial.printf("[REG] JSON invalido en respuesta: %s\n", err.c_str());
@@ -1739,7 +2303,7 @@ bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
         return false;
     }
 
-    saveConfig(nextSSID, nextPass, nextUrl, pricingConfig);
+    saveConfig(nextSSID, nextPass, nextUrl, pricingConfig, technicalConfigVersion, technicalConfigSource);
     wifiSSID = nextSSID;
     wifiPass = nextPass;
     backendBase = nextUrl;
@@ -1755,6 +2319,8 @@ bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
 bool handleRemoteConfigUpdate(uint32_t commandId, JsonObject payload) {
     PricingConfig nextConfig = pricingConfig;
     bool touched = false;
+    uint32_t remoteVersion = (uint32_t)(payload["config_version"] | technicalConfigVersion);
+    String remoteSource = String((const char*)(payload["config_source"] | technicalConfigSource.c_str()));
 
     if (!payload["price_cents"].isNull()) {
         uint32_t nextPrice = (uint32_t)(payload["price_cents"] | 0);
@@ -1808,7 +2374,7 @@ bool handleRemoteConfigUpdate(uint32_t commandId, JsonObject payload) {
         return true;
     }
 
-    bool changed = applyPricingConfig(nextConfig, true, "backend/command");
+    bool changed = applyPricingConfig(nextConfig, true, "backend/command", remoteVersion, remoteSource);
     if (!ackRemoteCommand(commandId, "completed", changed
         ? "Configuracion aplicada sin reinicio"
         : "Configuracion ya vigente")) {
@@ -2016,15 +2582,12 @@ void handleNFC() {
         }
     }
 
-    // ── Iniciar sesión MDB ────────────────────────────
-    mdbRuntime.sessionUID       = uid;
-    mdbRuntime.sessionIsOffline = isOffline;
-    mdbRuntime.pendingSession   = true;
-    mdbRuntime.phase            = SESSION_IDLE;
-    mdbRuntime.sessionStartMs   = millis();   // Fix Bug 5: iniciar timeout
-    mdbRuntime.vendUsed         = false;      // Fix Bug 2: resetear flag de dispensado
-    mdbRuntime.vendDecisionSent = false;
-    mdbRuntime.endSessionPending = false;
+    if (!enqueueMdbStartSession(uid, isOffline)) {
+        Serial.println("[MDB] ERROR — no se pudo encolar inicio de sesion");
+        ledBlink(5, 80);
+        return;
+    }
+
     ledBlink(2, 100);
 }
 
@@ -2066,11 +2629,174 @@ void cmdReset() {
     mdbRuntime.sessionUID = "";
     mdbRuntime.sessionItemId = 0;
     mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+    mdbRuntime.vendAmount = currentConfiguredHumanPrice();
     mdbRuntime.sessionIsOffline = false;
+    mdbRuntime.sessionStartMs = 0;
     resetMdbSetupSnapshot();
     mdbSendACK();
     logDiagEvent(EVT_MDB_RESET, 0, 0);
     MDB_LOG_EVENT("[MDB] RESET recibido → INACTIVE (TX pin=%d)\n", PIN_MDB_TX);
+}
+
+void cmdGatewayReset() {
+    resetMdbGatewaySnapshot();
+    mdbGatewayRuntime.justReset = true;
+    mdbGatewayRuntime.enabled = false;
+    mdbGatewayRuntime.enabledFeatures = 0;
+    mdbGatewayRuntime.featureLevel = 0;
+    mdbGatewayRuntime.appMaxResponseSeconds = 5;
+    logDiagEvent(EVT_MDB_GATEWAY_RESET, 0, 0);
+    MDB_LOG_EVENTLN("[MDB-GW] RESET recibido");
+}
+
+void cmdGatewaySetup(uint8_t* d, uint8_t len) {
+    captureMdbGatewayCommand(MDB_CMD_SETUP, d, len);
+
+    if (len >= 1) mdbGatewayRuntime.vmcFeatureLevel = d[0];
+    const uint8_t featureLevel = gatewayFeatureLevelForVmc();
+    mdbGatewayRuntime.featureLevel = featureLevel;
+    mdbGatewayRuntime.appMaxResponseSeconds = pricingConfig.maxResponseTime > 0 ? pricingConfig.maxResponseTime : 5;
+    mdbGatewaySnapshot.gatewayFeatureLevel = featureLevel;
+    mdbGatewaySnapshot.appMaxResponseSeconds = mdbGatewayRuntime.appMaxResponseSeconds;
+
+    uint8_t response[4] = {
+        0x01,
+        featureLevel,
+        (uint8_t)((mdbGatewayRuntime.appMaxResponseSeconds >> 8) & 0xFF),
+        (uint8_t)(mdbGatewayRuntime.appMaxResponseSeconds & 0xFF)
+    };
+    mdbSendData(response, sizeof(response));
+}
+
+void cmdGatewayPoll() {
+    if (mdbGatewayRuntime.justReset) {
+        mdbSendByte(MDB_JUST_RESET);
+        mdbGatewayRuntime.justReset = false;
+    } else {
+        mdbSendACK();
+    }
+}
+
+void cmdGatewayReport(uint8_t* d, uint8_t len) {
+    captureMdbGatewayCommand(MDB_CMD_VEND, d, len);
+    mdbSendACK();
+}
+
+void cmdGatewayControl(uint8_t* d, uint8_t len) {
+    captureMdbGatewayCommand(MDB_CMD_READER, d, len);
+    if (len >= 1) {
+        if (d[0] == MDB_GW_CONTROL_ENABLE) mdbGatewayRuntime.enabled = true;
+        else if (d[0] == MDB_GW_CONTROL_DISABLE) mdbGatewayRuntime.enabled = false;
+    }
+    mdbSendACK();
+}
+
+bool buildGatewayTimeDateResponse(uint8_t* out, size_t outLen, const char** sourceLabel = nullptr) {
+    if (!out || outLen < 11) return false;
+
+    DateTime now(2000, 1, 1, 0, 0, 0);
+    if (!getGatewayCurrentTime(&now, sourceLabel)) return false;
+
+    const uint16_t fullYear = (uint16_t)now.year();
+    const uint8_t year = (uint8_t)(fullYear >= 2000 ? (fullYear - 2000) : fullYear % 100);
+    const uint8_t month = (uint8_t)now.month();
+    const uint8_t day = (uint8_t)now.day();
+    const uint8_t hour = (uint8_t)now.hour();
+    const uint8_t minute = (uint8_t)now.minute();
+    const uint8_t second = (uint8_t)now.second();
+    const uint8_t dayOfWeek = (uint8_t)now.dayOfTheWeek();
+    const uint8_t weekNumber = 0;
+
+    out[0] = 0x01;
+    out[1] = ((year / 10) << 4) | (year % 10);
+    out[2] = ((month / 10) << 4) | (month % 10);
+    out[3] = ((day / 10) << 4) | (day % 10);
+    out[4] = ((hour / 10) << 4) | (hour % 10);
+    out[5] = ((minute / 10) << 4) | (minute % 10);
+    out[6] = ((second / 10) << 4) | (second % 10);
+    out[7] = ((dayOfWeek / 10) << 4) | (dayOfWeek % 10);
+    out[8] = ((weekNumber / 10) << 4) | (weekNumber % 10);
+    out[9] = 0x00;
+    out[10] = 0x00;
+
+    mdbGatewaySnapshot.seenMask |= 0x10;
+    mdbGatewaySnapshot.timeDateYear = year;
+    mdbGatewaySnapshot.timeDateMonth = month;
+    mdbGatewaySnapshot.timeDateDay = day;
+    mdbGatewaySnapshot.timeDateHour = hour;
+    mdbGatewaySnapshot.timeDateMinute = minute;
+    mdbGatewaySnapshot.timeDateSecond = second;
+    mdbGatewaySnapshot.lastTimeDateResponseMs = millis();
+    return true;
+}
+
+void cmdGatewayExpansion(uint8_t* d, uint8_t len) {
+    if (len == 0) {
+        mdbSendNAK();
+        return;
+    }
+
+    captureMdbGatewayCommand(MDB_CMD_EXPANSION, d, len);
+
+    switch (d[0]) {
+        case MDB_GW_EXP_IDENTIFICATION: {
+            uint8_t response[34];
+            memset(response, ' ', sizeof(response));
+            response[0] = 0x06;
+            memcpy(&response[1], "SFT", 3);
+            String serial = macAddress;
+            serial.replace(":", "");
+            while (serial.length() < 12) serial += "0";
+            serial = serial.substring(0, 12);
+            memcpy(&response[4], serial.c_str(), 12);
+            const char* model = "CC-GATEWAY  ";
+            memcpy(&response[16], model, 12);
+            response[28] = 0x00;
+            response[29] = 0x01;
+            const uint32_t features = gatewaySupportedFeatures();
+            response[30] = (uint8_t)((features >> 24) & 0xFF);
+            response[31] = (uint8_t)((features >> 16) & 0xFF);
+            response[32] = (uint8_t)((features >> 8) & 0xFF);
+            response[33] = (uint8_t)(features & 0xFF);
+            mdbSendData(response, sizeof(response));
+            break;
+        }
+        case MDB_GW_EXP_FEATURE_ENABLE: {
+            if (len >= 5) {
+                mdbGatewayRuntime.enabledFeatures =
+                    ((uint32_t)d[1] << 24) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 8) | (uint32_t)d[4];
+                mdbGatewaySnapshot.enabledFeatures = mdbGatewayRuntime.enabledFeatures;
+            }
+            mdbSendACK();
+            break;
+        }
+        case MDB_GW_EXP_TIME_DATE_REQUEST: {
+            uint8_t response[11];
+            const char* timeSource = nullptr;
+            if ((mdbGatewayRuntime.enabledFeatures & MDB_GW_FEATURE_TIME_DATE) == 0) {
+                mdbSendNAK();
+                break;
+            }
+            if (!buildGatewayTimeDateResponse(response, sizeof(response), &timeSource)) {
+                mdbSendNAK();
+                break;
+            }
+            logDiagEvent(
+                EVT_MDB_GATEWAY_TIME_DATE_REQUEST,
+                (int16_t)((mdbGatewaySnapshot.timeDateHour << 8) | mdbGatewaySnapshot.timeDateMinute),
+                ((uint32_t)mdbGatewaySnapshot.timeDateYear << 24)
+                    | ((uint32_t)mdbGatewaySnapshot.timeDateMonth << 16)
+                    | ((uint32_t)mdbGatewaySnapshot.timeDateDay << 8)
+                    | (uint32_t)mdbGatewaySnapshot.timeDateSecond
+            );
+            MDB_LOG_EVENT("[MDB-GW] TIME/DATE respondido desde %s\n", timeSource ? timeSource : "unknown");
+            mdbSendData(response, sizeof(response));
+            break;
+        }
+        default:
+            mdbSendACK();
+            break;
+    }
 }
 
 void cmdSetup(uint8_t* d, uint8_t len) {
@@ -2094,6 +2820,7 @@ void cmdSetup(uint8_t* d, uint8_t len) {
 
 void cmdExpansion(uint8_t* d, uint8_t len) {
     if (len == 0) { mdbSendNAK(); return; }
+    captureMdbExpansion(d, len);
 
     if (d[0] == EXPANSION_REQUEST_ID) {
         MDB_LOG_EVENTLN("[MDB] EXPANSION REQUEST_ID");
@@ -2118,10 +2845,12 @@ void cmdPoll() {
         mdbRuntime.sessionUID = "";
         mdbRuntime.sessionItemId = 0;
         mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+        mdbRuntime.vendAmount = currentConfiguredHumanPrice();
         mdbRuntime.vendApproved = false;
         mdbRuntime.vendDecisionSent = false;
         mdbRuntime.vendUsed = false;
         mdbRuntime.sessionIsOffline = false;
+        mdbRuntime.sessionStartMs = 0;
         return;
     }
 
@@ -2136,8 +2865,20 @@ void cmdPoll() {
             }
             break;
 
-        case MDB_DISABLED: mdbSendACK(); break;
-        case ENABLED:  mdbSendACK(); break;
+        case MDB_DISABLED:
+            mdbSendACK();
+            break;
+
+        case ENABLED:
+            if (mdbTimeDateProbePending) {
+                MDB_LOG_EVENTLN("[MDB] TIME/DATE REQUEST manual");
+                mdbSendByte(MDB_TIME_DATE_REQUEST);
+                logDiagEvent(EVT_MDB_TIME_DATE_REQUEST_SENT, 1, millis() - mdbTimeDateProbeRequestedAtMs);
+                mdbTimeDateProbePending = false;
+            } else {
+                mdbSendACK();
+            }
+            break;
 
         case SESSION_IDLE:
             if (mdbRuntime.pendingSession) {
@@ -2172,7 +2913,9 @@ void cmdPoll() {
                     mdbRuntime.sessionUID = "";
                     mdbRuntime.sessionItemId = 0;
                     mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+                    mdbRuntime.vendAmount = currentConfiguredHumanPrice();
                     mdbRuntime.sessionIsOffline = false;
+                    mdbRuntime.sessionStartMs = 0;
                 }
             } else {
                 mdbSendACK();
@@ -2276,11 +3019,13 @@ void cmdReader(uint8_t* d, uint8_t len) {
         mdbRuntime.sessionUID = "";
         mdbRuntime.sessionItemId = 0;
         mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+        mdbRuntime.vendAmount = currentConfiguredHumanPrice();
         mdbRuntime.vendUsed = false;
         mdbRuntime.vendDecisionSent = false;
         mdbRuntime.endSessionPending = false;
         mdbRuntime.pendingSession = false;
         mdbRuntime.sessionIsOffline = false;
+        mdbRuntime.sessionStartMs = 0;
     }
     mdbSendACK();
 }
@@ -2291,10 +3036,13 @@ void handleMDB() {
 
     unsigned long t0 = micros();  // timing debug
 
-    // Filtrar: solo procesar cashless
+    // Filtrar: procesar cashless y communications gateway
     if (!MDB9bit::isAddress(first)) return;
     uint8_t addr = MDB9bit::value(first);
-    if ((addr & 0xF8) != MDB_ADDR_CASHLESS) return;
+    const uint8_t addrBase = addr & 0xF8;
+    const bool isCashless = (addrBase == MDB_ADDR_CASHLESS);
+    const bool isGateway = (addrBase == MDB_ADDR_GATEWAY);
+    if (!isCashless && !isGateway) return;
 
     uint8_t cmd = addr & 0x07;
 
@@ -2302,7 +3050,8 @@ void handleMDB() {
     if (cmd == MDB_CMD_RESET) {
         // Drenar checksum byte que ya está en el ring buffer
         mdb.read(1);
-        cmdReset();
+        if (isGateway) cmdGatewayReset();
+        else           cmdReset();
         unsigned long dt = micros() - t0;
         MDB_LOG_TIMING("[MDB] RESET → ACK inmediato dt=%luus\n", dt);
         return;
@@ -2318,13 +3067,24 @@ void handleMDB() {
     }
 
     // ── Responder al VMC (deadline ≤5ms) ──
-    switch (cmd) {
-        case MDB_CMD_SETUP:  cmdSetup(d, dataLen);  break;
-        case MDB_CMD_POLL:   cmdPoll();             break;
-        case MDB_CMD_VEND:   cmdVend(d, dataLen);   break;
-        case MDB_CMD_READER: cmdReader(d, dataLen); break;
-        case MDB_CMD_EXPANSION: cmdExpansion(d, dataLen); break;
-        default: mdbSendNAK(); break;
+    if (isGateway) {
+        switch (cmd) {
+            case MDB_CMD_SETUP:     cmdGatewaySetup(d, dataLen);     break;
+            case MDB_CMD_POLL:      cmdGatewayPoll();                break;
+            case MDB_CMD_VEND:      cmdGatewayReport(d, dataLen);    break;
+            case MDB_CMD_READER:    cmdGatewayControl(d, dataLen);   break;
+            case MDB_CMD_EXPANSION: cmdGatewayExpansion(d, dataLen); break;
+            default: mdbSendNAK(); break;
+        }
+    } else {
+        switch (cmd) {
+            case MDB_CMD_SETUP:  cmdSetup(d, dataLen);  break;
+            case MDB_CMD_POLL:   cmdPoll();             break;
+            case MDB_CMD_VEND:   cmdVend(d, dataLen);   break;
+            case MDB_CMD_READER: cmdReader(d, dataLen); break;
+            case MDB_CMD_EXPANSION: cmdExpansion(d, dataLen); break;
+            default: mdbSendNAK(); break;
+        }
     }
 
     // ── Después de responder, loguear ──
@@ -2403,6 +3163,11 @@ void setup() {
     Serial.println("[MDB] UART HW listo (TX=GPIO20, RX=GPIO21)");
 
     // Arrancar tarea MDB independiente para responder al VMC durante boot
+    mdbAsyncQueue = xQueueCreate(MDB_ASYNC_QUEUE_LEN, sizeof(MdbAsyncEvent));
+    if (mdbAsyncQueue == nullptr) {
+        Serial.println("[MDB] ERROR — no se pudo crear la cola async");
+    }
+
     xTaskCreatePinnedToCore(
         mdbCommandTask,
         "mdb_cmd", 4096, NULL, 4, NULL, 1
@@ -2463,30 +3228,6 @@ void loop() {
 
     // Modo normal: NFC (MDB ahora corre en tarea independiente)
     handleNFC();
-
-    // ── Fix Bug 5: timeout SESSION_IDLE ──────────────
-    if (mdbRuntime.pendingSession && (millis() - mdbRuntime.sessionStartMs > SESSION_TIMEOUT_MS)) {
-        Serial.printf("[TMO] Timeout SESSION_IDLE — cancelando tap de %s\n",
-                      mdbRuntime.sessionUID.c_str());
-        logDiagEvent(EVT_SESSION_TIMEOUT, mdbRuntime.phase, millis() - mdbRuntime.sessionStartMs);
-        String cancelUid    = mdbRuntime.sessionUID;
-        bool   wasOffline   = mdbRuntime.sessionIsOffline;
-        mdbRuntime.sessionUID       = "";
-        mdbRuntime.pendingSession   = false;
-        mdbRuntime.phase            = MDB_DISABLED;
-        mdbRuntime.vendApproved     = false;
-        mdbRuntime.vendUsed         = false;
-        mdbRuntime.vendDecisionSent = false;
-        mdbRuntime.endSessionPending = false;
-        mdbRuntime.sessionIsOffline = false;
-
-        // wasOffline afecta cómo notifyVendResult enruta el evento
-        mdbRuntime.sessionIsOffline = wasOffline;
-        notifyVendResult(cancelUid, 0, 0, false);
-        mdbRuntime.sessionIsOffline = false;
-
-        ledBlink(4, 150);
-    }
 
     // ── Reconexión WiFi cada 30s ──────────────────────
     static unsigned long lastWifiCheck = 0;

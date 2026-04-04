@@ -23,6 +23,7 @@
     deviceInfo: document.getElementById("deviceInfo"),
     diagEventsBtn: document.getElementById("diagEventsBtn"),
     diagMdbBtn: document.getElementById("diagMdbBtn"),
+    diagTimeBtn: document.getElementById("diagTimeBtn"),
     diagStatus: document.getElementById("diagStatus"),
     diagEventsOutput: document.getElementById("diagEventsOutput"),
     diagMdbOutput: document.getElementById("diagMdbOutput")
@@ -304,11 +305,46 @@
         return "Se capturó SETUP CONFIG del VMC. Level " + arg1 + ".";
       case "MDB_SETUP_PRICES":
         return "Se capturó SETUP PRICES. Min " + arg1 + ", max " + arg2 + ".";
-      case "REMOTE_CONFIG_APPLIED":
-        return arg1 ? "Se aplicó una configuración remota nueva." : "Llegó una configuración remota pero ya estaba vigente.";
-      default:
-        return "Evento técnico sin traducción específica.";
+      case "MDB_EXPANSION_REQUEST_ID":
+        return "El VMC consultó el REQUEST ID del lector cashless.";
+      case "MDB_TIME_DATE_REQUEST_SENT":
+        return "El lector pidió la hora MDB al VMC en el siguiente POLL.";
+        case "MDB_TIME_DATE_FILE": {
+        const hour = (arg1 >> 8) & 0xFF;
+        const minute = arg1 & 0xFF;
+        const year = (arg2 >> 24) & 0xFF;
+        const month = (arg2 >> 16) & 0xFF;
+        const day = (arg2 >> 8) & 0xFF;
+        const second = arg2 & 0xFF;
+        return "La máquina envió fecha/hora MDB: 20" + String(year).padStart(2, "0") + "-" + String(month).padStart(2, "0") + "-" + String(day).padStart(2, "0") + " " + String(hour).padStart(2, "0") + ":" + String(minute).padStart(2, "0") + ":" + String(second).padStart(2, "0") + ".";
+        }
+        case "MDB_GATEWAY_RESET":
+          return "La máquina reinició el Communications Gateway 0x18.";
+        case "MDB_GATEWAY_SETUP":
+          return "La máquina hizo SETUP del gateway. Feature level " + arg1 + ".";
+        case "MDB_GATEWAY_CONTROL":
+          return "La máquina cambió el estado del gateway con CONTROL " + arg1 + ".";
+        case "MDB_GATEWAY_IDENTIFICATION":
+          return "La máquina consultó la identificación del gateway 0x18.";
+        case "MDB_GATEWAY_FEATURE_ENABLE":
+          return "La máquina habilitó features del gateway. Máscara " + arg2 + ".";
+        case "MDB_GATEWAY_TIME_DATE_REQUEST":
+          return "La máquina pidió fecha/hora al gateway para sincronizar su reloj.";
+        case "MDB_GATEWAY_REPORT":
+          return "La máquina envió un REPORT al gateway.";
+        case "REMOTE_CONFIG_APPLIED":
+          return arg1 ? "Se aplicó una configuración remota nueva." : "Llegó una configuración remota pero ya estaba vigente.";
+        default:
+          return "Evento técnico sin traducción específica.";
+      }
+  }
+
+  function formatMdbTimeDate(payload) {
+    const timeDate = payload?.time_date || {};
+    if (timeDate?.valid && timeDate?.iso) {
+      return String(timeDate.iso);
     }
+    return "—";
   }
 
   function renderDiagEventsPayload(payload) {
@@ -335,11 +371,15 @@
     return lines.join("\n").trim();
   }
 
-  function renderDiagMdbPayload(payload) {
-    const raw = Array.isArray(payload?.raw) ? payload.raw.join(", ") : "—";
-    return [
-      "Config vista: " + (payload?.seen_config ? "Sí" : "No"),
-      "Precios vistos: " + (payload?.seen_prices ? "Sí" : "No"),
+    function renderDiagMdbPayload(payload) {
+      const raw = Array.isArray(payload?.raw) ? payload.raw.join(", ") : "—";
+      const expansionRaw = Array.isArray(payload?.expansion_raw) ? payload.expansion_raw.join(", ") : "—";
+      const cashlessLines = [
+        "Config vista: " + (payload?.seen_config ? "Sí" : "No"),
+        "Precios vistos: " + (payload?.seen_prices ? "Sí" : "No"),
+        "REQUEST ID visto: " + (payload?.seen_request_id ? "Sí" : "No"),
+        "Time/Date visto: " + (payload?.seen_time_date ? "Sí" : "No"),
+        "Solicitud manual pendiente: " + (payload?.time_date_probe_pending ? "Sí" : "No"),
       "Último subcmd: " + String(payload?.last_subcmd ?? "—"),
       "Último largo: " + String(payload?.last_len ?? "—"),
       "VMC level: " + String(payload?.vmc_level ?? "—"),
@@ -348,8 +388,58 @@
       "Max price: " + String(payload?.max_price ?? "—"),
       "Min price: " + String(payload?.min_price ?? "—"),
       "Último visto: " + formatUptime(payload?.last_seen_ms || 0),
-      "Raw: " + raw
-    ].join("\n");
+      "Último expansion subcmd: " + String(payload?.last_expansion_subcmd ?? "—"),
+        "Último expansion visto: " + formatUptime(payload?.last_expansion_seen_ms || 0),
+        "Fecha/hora MDB: " + formatMdbTimeDate(payload),
+        "Raw setup: " + raw,
+        "Raw expansion: " + expansionRaw
+      ];
+      const gateway = payload?.gateway || null;
+      if (!gateway) return cashlessLines.join("\n");
+      const gatewayRaw = Array.isArray(gateway?.raw) ? gateway.raw.join(", ") : "—";
+      const gatewayTime = gateway?.time_date?.valid && gateway?.time_date?.iso ? String(gateway.time_date.iso) : "—";
+      const gatewayLines = [
+        "",
+        "Gateway 0x18",
+        "Setup visto: " + (gateway?.seen_setup ? "Sí" : "No"),
+        "Control visto: " + (gateway?.seen_control ? "Sí" : "No"),
+        "Identificación vista: " + (gateway?.seen_identification ? "Sí" : "No"),
+        "Feature enable visto: " + (gateway?.seen_feature_enable ? "Sí" : "No"),
+        "Time/Date request vista: " + (gateway?.seen_time_date_request ? "Sí" : "No"),
+        "Gateway enabled: " + (gateway?.gateway_enabled ? "Sí" : "No"),
+        "Feature level VMC: " + String(gateway?.vmc_feature_level ?? "—"),
+        "Feature level gateway: " + String(gateway?.gateway_feature_level ?? "—"),
+        "Features habilitadas: " + String(gateway?.enabled_features ?? "—"),
+        "Control state: " + String(gateway?.control_state ?? "—"),
+        "Último cmd: " + String(gateway?.last_cmd ?? "—"),
+        "Último visto: " + formatUptime(gateway?.last_seen_ms || 0),
+        "Última hora entregada: " + gatewayTime,
+        "Raw gateway: " + gatewayRaw
+      ];
+      return cashlessLines.concat(gatewayLines).join("\n");
+    }
+
+  async function requestMdbTimeDate() {
+    if (elements.diagTimeBtn) {
+      elements.diagTimeBtn.disabled = true;
+      elements.diagTimeBtn.textContent = "Solicitando...";
+    }
+    showDiagStatus("Armando solicitud manual de hora MDB para el próximo POLL...");
+
+    try {
+      const response = await fetch("/diag/mdb/request-time", { method: "POST", cache: "no-store" });
+      if (!response.ok) throw new Error("time-probe");
+      const payload = await response.json();
+      showDiagStatus(payload?.message || "Solicitud de hora MDB armada.");
+      await loadDiagnostics("mdb");
+    } catch (_error) {
+      showDiagStatus("No se pudo armar la solicitud manual de hora MDB.");
+    } finally {
+      if (elements.diagTimeBtn) {
+        elements.diagTimeBtn.disabled = false;
+        elements.diagTimeBtn.textContent = "Solicitar hora MDB";
+      }
+    }
   }
 
   function renderDiagOutput(node, payload, formatter) {
@@ -566,6 +656,7 @@
   elements.testBtn?.addEventListener("click", testConnection);
   elements.diagEventsBtn?.addEventListener("click", () => loadDiagnostics("events"));
   elements.diagMdbBtn?.addEventListener("click", () => loadDiagnostics("mdb"));
+  elements.diagTimeBtn?.addEventListener("click", requestMdbTimeDate);
   elements.ssidInput?.addEventListener("input", syncTypedSSID);
   elements.showPass?.addEventListener("change", function () {
     if (!elements.passInput) return;

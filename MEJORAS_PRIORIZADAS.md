@@ -31,6 +31,7 @@ Lineas ya acordadas:
 - estado actual: backend ya registra el precio humano correcto aunque la máquina negocie unidades MDB internas distintas
 - estado actual: configuración técnica remota integral ya disponible solo para `admin`, `tecnico` y `distribuidor`
 - estado actual: el panel ya ofrece `Compatibilidad asistida` en `Máquinas > Diag` y botón `Sugerir según último SETUP MDB` en `Config técnica`, sin autoaplicar cambios
+- estado actual: se agregó y probó un experimento controlado de `Communications Gateway` MDB (`0x18`); la Rubino evaluada no lo interroga, así que por ahora el reloj operativo queda con `NTP` como fuente principal y el cashless `0x10` sigue siendo el camino real de integración
 
 ## Criterio de priorización
 
@@ -756,12 +757,14 @@ Razón:
 Pendiente para retomar después del cierre Rubino:
 
 1. Consolidar la configuración técnica remota como fuente principal desde backend.
-2. Definir si hace falta sumar `config_version` para resolver conflictos portal/backend.
-3. Ampliar el modo asistido si hace falta:
+2. [x] Resolver conflictos portal/backend con `config_version`, `config_source` y `config_updated_at`.
+3. [x] Exponer trazabilidad técnica de máquina: última config reportada por ESP, drift y último cambio backend auditado.
+4. Ampliar el modo asistido si hace falta:
    - sugerencias más finas por perfil de máquina
    - comparación con más señales del handshake MDB
    - eventualmente precarga guiada de parámetros avanzados
-4. Verificar en campo cambios de:
+   - fecha/hora MDB si la máquina emite `WRITE TIME/DATE FILE`
+5. Verificar en campo cambios de:
    - `pricing_profile`
    - `feature_level`
    - `country_code`
@@ -769,9 +772,17 @@ Pendiente para retomar después del cierre Rubino:
    - `decimal_places`
    - `max_response_time`
    - `misc_options`
-5. Solo después de eso, seguir con ownership final del estado MDB entre tarea dedicada y `loop()`.
+6. [x] Resolver ownership conservador del estado MDB entre tarea dedicada y `loop()`.
+   - inicio de sesión aprobado por NFC ahora entra por `mdbAsyncQueue`
+   - timeout de `SESSION_IDLE` ahora vive en la tarea MDB
+   - `readConfig()/saveConfig()/applyPricingConfig()` ya no pisan el runtime MDB operativo
+
+Documento operativo para ese bloque:
+
+- [PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md)
 
 Objetivo:
 
 - pasar de compatibilidad MDB validada a operación remota técnica completa
 - mantener la UI gerencial limpia, reservando lo fino a soporte técnico
+- dejar explícita la precedencia backend/portal sin depender de “última escritura gana”

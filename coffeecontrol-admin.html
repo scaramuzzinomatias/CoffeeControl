@@ -2140,6 +2140,40 @@ function describeRemoteDiagEvent(event){
       return `Se capturó SETUP CONFIG del VMC. Level ${arg1}.`;
     case 'MDB_SETUP_PRICES':
       return `Se capturó SETUP PRICES. Min ${arg1}, max ${arg2}.`;
+    case 'MDB_EXPANSION_REQUEST_ID':
+      return 'El VMC consultó el REQUEST ID del lector cashless.';
+    case 'MDB_TIME_DATE_REQUEST_SENT':
+      return 'El lector pidió la hora MDB al VMC en el siguiente POLL.';
+    case 'MDB_TIME_DATE_FILE': {
+      const hour=(arg1>>8)&0xFF;
+      const minute=arg1&0xFF;
+      const year=(arg2>>24)&0xFF;
+      const month=(arg2>>16)&0xFF;
+      const day=(arg2>>8)&0xFF;
+      const second=arg2&0xFF;
+      return `La máquina envió fecha/hora MDB: 20${String(year).padStart(2,'0')}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')} ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:${String(second).padStart(2,'0')}.`;
+    }
+    case 'MDB_GATEWAY_RESET':
+      return 'La máquina reinició el Communications Gateway 0x18.';
+    case 'MDB_GATEWAY_SETUP':
+      return `La máquina hizo SETUP del gateway. Feature level ${arg1}.`;
+    case 'MDB_GATEWAY_CONTROL':
+      return `La máquina cambió el estado del gateway con CONTROL ${arg1}.`;
+    case 'MDB_GATEWAY_IDENTIFICATION':
+      return 'La máquina consultó la identificación del gateway 0x18.';
+    case 'MDB_GATEWAY_FEATURE_ENABLE':
+      return `La máquina habilitó features del gateway. Máscara ${formatReportInt(arg2)}.`;
+    case 'MDB_GATEWAY_TIME_DATE_REQUEST': {
+      const hour=(arg1>>8)&0xFF;
+      const minute=arg1&0xFF;
+      const year=(arg2>>24)&0xFF;
+      const month=(arg2>>16)&0xFF;
+      const day=(arg2>>8)&0xFF;
+      const second=arg2&0xFF;
+      return `La máquina pidió hora al gateway. Se respondió 20${String(year).padStart(2,'0')}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')} ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:${String(second).padStart(2,'0')}.`;
+    }
+    case 'MDB_GATEWAY_REPORT':
+      return 'La máquina envió un REPORT al gateway.';
     case 'REMOTE_CONFIG_APPLIED':
       return arg1 ? 'Se aplicó una configuración remota nueva.' : 'Llegó una configuración remota pero ya estaba vigente.';
     default:
@@ -2147,8 +2181,14 @@ function describeRemoteDiagEvent(event){
   }
 }
 
+function formatRemoteDiagMdbTimeDate(setup){
+  const timeDate=setup?.time_date||{};
+  if(timeDate?.valid && timeDate?.iso) return String(timeDate.iso);
+  return '—';
+}
+
 function describeRemoteDiagMdb(setup){
-  if(!setup?.seen_config && !setup?.seen_prices){
+  if(!setup?.seen_config && !setup?.seen_prices && !setup?.seen_request_id && !setup?.seen_time_date){
     return 'Todavía no se capturó SETUP MDB. Reiniciá la máquina o esperá un nuevo handshake cashless.';
   }
   const parts=[];
@@ -2159,11 +2199,49 @@ function describeRemoteDiagMdb(setup){
   if(setup?.seen_prices){
     parts.push(`SETUP PRICES visto. Min ${formatDiagValue(setup.min_price)}, max ${formatDiagValue(setup.max_price)}.`);
   }
+  if(setup?.seen_request_id){
+    parts.push('El VMC ya consultó el REQUEST ID del lector.');
+  }
+  if(setup?.seen_time_date){
+    parts.push(`Fecha/hora MDB vista: ${formatRemoteDiagMdbTimeDate(setup)}.`);
+  }
+    if(setup?.time_date_probe_pending){
+      parts.push('Hay una solicitud manual de hora MDB pendiente para el próximo POLL.');
+    }
   if(setup?.last_seen_ms!==null && setup?.last_seen_ms!==undefined){
     parts.push(`Último paquete capturado hace ${formatDiagUptime(setup.last_seen_ms)} desde el boot.`);
   }
-  return parts.join(' ');
-}
+  if(setup?.last_expansion_seen_ms!==null && setup?.last_expansion_seen_ms!==undefined && Number(setup.last_expansion_seen_ms)>0){
+    parts.push(`Último EXPANSION capturado hace ${formatDiagUptime(setup.last_expansion_seen_ms)} desde el boot.`);
+  }
+    return parts.join(' ');
+  }
+
+  function describeRemoteDiagGateway(gateway){
+    if(!gateway?.seen_setup && !gateway?.seen_identification && !gateway?.seen_time_date_request && !gateway?.seen_feature_enable && !gateway?.seen_control){
+      return 'Todavía no se capturó actividad del gateway 0x18. Si la Rubino lo soporta, debería verse setup/control o alguna expansión del gateway.';
+    }
+    const parts=[];
+    if(gateway?.seen_setup){
+      parts.push(`Gateway SETUP visto. VMC feature ${formatDiagValue(gateway.vmc_feature_level)}.`);
+    }
+    if(gateway?.seen_identification){
+      parts.push('La máquina ya consultó la identificación del gateway.');
+    }
+    if(gateway?.seen_feature_enable){
+      parts.push(`La máquina habilitó features del gateway. Máscara ${formatDiagValue(gateway.enabled_features)}.`);
+    }
+    if(gateway?.seen_time_date_request){
+      parts.push(`La máquina pidió fecha/hora al gateway. Última entregada: ${formatDiagValue(gateway?.time_date?.iso,'—')}.`);
+    }
+    if(gateway?.seen_control){
+      parts.push(`Último CONTROL del gateway: ${formatDiagValue(gateway.control_state)}.`);
+    }
+    if(gateway?.last_seen_ms!==null && gateway?.last_seen_ms!==undefined){
+      parts.push(`Último paquete gateway capturado hace ${formatDiagUptime(gateway.last_seen_ms)} desde el boot.`);
+    }
+    return parts.join(' ');
+  }
 
 function remoteDiagLatestMatchingEvent(result,predicate){
   const list=result?.events?.events||[];
@@ -2205,6 +2283,21 @@ function describeRemoteDiagPrice(result){
   return `Precio humano activo ${formatMachinePriceValue(result?.price_cents)} con perfil ${formatDiagValue(result?.pricing_profile,'desconocido')}.`;
 }
 
+function describeRemoteDiagClock(result){
+  switch(String(result?.clock_source||'')){
+    case 'ds3231':
+      return 'Reloj base: DS3231 local.';
+    case 'ntp':
+      return 'Reloj base: hora del sistema sincronizada por NTP.';
+    case 'mdb':
+      return 'Reloj base: fecha/hora recibida desde la máquina por MDB.';
+    case 'uptime':
+      return 'Reloj base: sin hora real; solo uptime.';
+    default:
+      return 'Reloj base: origen no informado.';
+  }
+}
+
 function machineHumanPriceToMdbUnits(priceCents, profile){
   const human=Math.max(0, Number(priceCents)||0);
   switch(String(profile||'')){
@@ -2235,6 +2328,8 @@ function formatRemoteDiagCountryCode(value){
 
 function describeRemoteDiagTechnicalConfig(result){
   return [
+    `v${formatDiagValue(result?.config_version)}`,
+    `source ${formatDiagValue(result?.config_source,'desconocido')}`,
     `Perfil ${formatDiagValue(result?.pricing_profile,'desconocido')}`,
     `feature ${formatDiagValue(result?.mdb_feature_level)}`,
     `country ${formatRemoteDiagCountryCode(result?.mdb_country_code)}`,
@@ -2373,6 +2468,7 @@ function buildRemoteDiagnosticsExportText(result){
     `- Backend: ${describeRemoteDiagBackend(result)}`,
     `- Cola offline: ${describeRemoteDiagQueue(result)}`,
     `- Precio: ${describeRemoteDiagPrice(result)}`,
+    `- Reloj: ${describeRemoteDiagClock(result)}`,
     `- Config técnica: ${describeRemoteDiagTechnicalConfig(result)}`,
     `- Capturado: ${formatDiagUptime(result?.captured_at_ms||0)} desde el boot`,
     '',
@@ -2398,13 +2494,38 @@ function buildRemoteDiagnosticsExportText(result){
   lines.push(`- ${describeRemoteDiagMdb(result?.mdb||{})}`);
   lines.push(`- Config vista: ${result?.mdb?.seen_config?'Sí':'No'}`);
   lines.push(`- Precios vistos: ${result?.mdb?.seen_prices?'Sí':'No'}`);
+  lines.push(`- REQUEST ID visto: ${result?.mdb?.seen_request_id?'Sí':'No'}`);
+  lines.push(`- Time/Date visto: ${result?.mdb?.seen_time_date?'Sí':'No'}`);
   lines.push(`- VMC level: ${formatDiagValue(result?.mdb?.vmc_level)}`);
   lines.push(`- Display: ${formatDiagValue(result?.mdb?.display_columns)} x ${formatDiagValue(result?.mdb?.display_rows)}`);
   lines.push(`- Max price: ${formatDiagValue(result?.mdb?.max_price)}`);
   lines.push(`- Min price: ${formatDiagValue(result?.mdb?.min_price)}`);
   lines.push(`- Último visto: ${formatDiagUptime(result?.mdb?.last_seen_ms||0)}`);
+  lines.push(`- Último EXPANSION: ${formatDiagUptime(result?.mdb?.last_expansion_seen_ms||0)}`);
+  lines.push(`- Fecha/hora MDB: ${formatRemoteDiagMdbTimeDate(result?.mdb)}`);
   if(Array.isArray(result?.mdb?.raw)){
-    lines.push(`- Raw: ${result.mdb.raw.join(', ')}`);
+    lines.push(`- Raw setup: ${result.mdb.raw.join(', ')}`);
+  }
+  if(Array.isArray(result?.mdb?.expansion_raw)){
+    lines.push(`- Raw expansion: ${result.mdb.expansion_raw.join(', ')}`);
+  }
+  lines.push('');
+  lines.push('Gateway MDB');
+  lines.push(`- ${describeRemoteDiagGateway(result?.gateway||{})}`);
+  lines.push(`- Setup visto: ${result?.gateway?.seen_setup?'Sí':'No'}`);
+  lines.push(`- Control visto: ${result?.gateway?.seen_control?'Sí':'No'}`);
+  lines.push(`- Identificación vista: ${result?.gateway?.seen_identification?'Sí':'No'}`);
+  lines.push(`- Feature enable visto: ${result?.gateway?.seen_feature_enable?'Sí':'No'}`);
+  lines.push(`- Time/Date request vista: ${result?.gateway?.seen_time_date_request?'Sí':'No'}`);
+  lines.push(`- Gateway enabled: ${result?.gateway?.gateway_enabled?'Sí':'No'}`);
+  lines.push(`- Feature level VMC: ${formatDiagValue(result?.gateway?.vmc_feature_level)}`);
+  lines.push(`- Feature level gateway: ${formatDiagValue(result?.gateway?.gateway_feature_level)}`);
+  lines.push(`- Features habilitadas: ${formatDiagValue(result?.gateway?.enabled_features)}`);
+  lines.push(`- Control state: ${formatDiagValue(result?.gateway?.control_state)}`);
+  lines.push(`- Último visto: ${formatDiagUptime(result?.gateway?.last_seen_ms||0)}`);
+  lines.push(`- Fecha/hora gateway: ${formatDiagValue(result?.gateway?.time_date?.iso,'—')}`);
+  if(Array.isArray(result?.gateway?.raw)){
+    lines.push(`- Raw gateway: ${result.gateway.raw.join(', ')}`);
   }
   return lines.join('\n');
 }
@@ -2468,12 +2589,14 @@ function renderRemoteDiagnosticsResult(result){
         <div class="metric"><div class="mlbl">Backend</div><div class="mval" style="font-size:16px">${result?.backend_ready?'OK':'Pendiente'}</div></div>
         <div class="metric"><div class="mlbl">Cola offline</div><div class="mval" style="font-size:16px">${formatReportInt(result?.queue_pending||0)}</div></div>
         <div class="metric"><div class="mlbl">Precio</div><div class="mval" style="font-size:16px">${formatMachinePriceValue(result?.price_cents)}</div></div>
+        <div class="metric"><div class="mlbl">Reloj</div><div class="mval" style="font-size:16px">${escHtml(String(result?.clock_source||'—').toUpperCase())}</div></div>
       </div>
       <div style="display:grid;gap:8px;margin-bottom:12px">
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>WiFi:</strong> ${escHtml(describeRemoteDiagWifi(result))}</div>
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Backend:</strong> ${escHtml(describeRemoteDiagBackend(result))}</div>
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Cola offline:</strong> ${escHtml(describeRemoteDiagQueue(result))}</div>
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Precio:</strong> ${escHtml(describeRemoteDiagPrice(result))}</div>
+        <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Reloj:</strong> ${escHtml(describeRemoteDiagClock(result))}</div>
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Config técnica:</strong> ${escHtml(describeRemoteDiagTechnicalConfig(result))}</div>
       </div>
       <div class="section-lbl" style="margin-bottom:8px">Compatibilidad asistida</div>
@@ -2507,6 +2630,8 @@ function renderRemoteDiagnosticsResult(result){
   if(mdb){
     const setup=result?.mdb||{};
     const raw=Array.isArray(setup.raw)?setup.raw.map(v=>formatReportInt(v)).join(', '):'—';
+    const gateway=result?.gateway||{};
+    const gatewayRaw=Array.isArray(gateway.raw)?gateway.raw.map(v=>formatReportInt(v)).join(', '):'—';
     mdb.innerHTML=`
       <div class="section-lbl" style="margin-bottom:8px">Último setup MDB</div>
       <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45;margin-bottom:12px">${escHtml(describeRemoteDiagMdb(setup))}</div>
@@ -2520,6 +2645,8 @@ function renderRemoteDiagnosticsResult(result){
         <div><span style="color:var(--tx3)">Subcmd:</span> ${formatDiagValue(setup.last_subcmd)}</div>
         <div><span style="color:var(--tx3)">Último visto:</span> ${escHtml(formatDiagUptime(setup.last_seen_ms||0))}</div>
         <div><span style="color:var(--tx3)">Feature level:</span> ${formatDiagValue(result?.mdb_feature_level)}</div>
+        <div><span style="color:var(--tx3)">Config version:</span> ${formatDiagValue(result?.config_version)}</div>
+        <div><span style="color:var(--tx3)">Config source:</span> ${formatDiagValue(result?.config_source,'desconocido')}</div>
         <div><span style="color:var(--tx3)">Country code:</span> ${escHtml(formatRemoteDiagCountryCode(result?.mdb_country_code))}</div>
         <div><span style="color:var(--tx3)">Scale factor:</span> ${formatDiagValue(result?.mdb_scale_factor)}</div>
         <div><span style="color:var(--tx3)">Decimal places:</span> ${formatDiagValue(result?.mdb_decimal_places)}</div>
@@ -2528,6 +2655,24 @@ function renderRemoteDiagnosticsResult(result){
       </div>
       <div style="font-size:12px;color:var(--tx3);margin-bottom:6px">Raw bytes</div>
       <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.45">${escHtml(raw)}</div>
+      <div class="section-lbl" style="margin:16px 0 8px">Gateway 0x18</div>
+      <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45;margin-bottom:12px">${escHtml(describeRemoteDiagGateway(gateway))}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:13px;margin-bottom:14px">
+        <div><span style="color:var(--tx3)">Setup visto:</span> ${gateway.seen_setup?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Control visto:</span> ${gateway.seen_control?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Identificación vista:</span> ${gateway.seen_identification?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Feature enable visto:</span> ${gateway.seen_feature_enable?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Time/Date request vista:</span> ${gateway.seen_time_date_request?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Gateway enabled:</span> ${gateway.gateway_enabled?'Sí':'No'}</div>
+        <div><span style="color:var(--tx3)">Feature VMC:</span> ${formatDiagValue(gateway.vmc_feature_level)}</div>
+        <div><span style="color:var(--tx3)">Feature gateway:</span> ${formatDiagValue(gateway.gateway_feature_level)}</div>
+        <div><span style="color:var(--tx3)">Features habilitadas:</span> ${formatDiagValue(gateway.enabled_features)}</div>
+        <div><span style="color:var(--tx3)">Control state:</span> ${formatDiagValue(gateway.control_state)}</div>
+        <div><span style="color:var(--tx3)">Último visto:</span> ${escHtml(formatDiagUptime(gateway.last_seen_ms||0))}</div>
+        <div><span style="color:var(--tx3)">Fecha/hora gateway:</span> ${escHtml(formatDiagValue(gateway?.time_date?.iso,'—'))}</div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);margin-bottom:6px">Raw gateway</div>
+      <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.45">${escHtml(gatewayRaw)}</div>
     `;
   }
 }
@@ -2965,6 +3110,71 @@ function setMachineTechnicalSuggestStatus(msg,tone='info'){
   el.textContent=msg||'';
 }
 
+function formatMachineTechnicalSupportValue(field,value){
+  if(value===null || value===undefined || value==='') return '—';
+  if(field==='price_cents') return formatMachinePriceValue(value);
+  if(field==='mdb_country_code') return formatMachineTechnicalCountryCode(value);
+  if(field==='config_version') return `v${value}`;
+  return String(value);
+}
+
+function describeMachineTechnicalConfigSummary(cfg){
+  if(!cfg) return 'Sin snapshot reportado todavía.';
+  return [
+    `v${Number(cfg.config_version||1)}`,
+    `source ${cfg.config_source||'desconocido'}`,
+    `Perfil ${cfg.pricing_profile||'desconocido'}`,
+    `feature ${cfg.mdb_feature_level ?? '—'}`,
+    `country ${formatMachineTechnicalCountryCode(cfg.mdb_country_code)}`,
+    `scale ${cfg.mdb_scale_factor ?? '—'}`,
+    `decimals ${cfg.mdb_decimal_places ?? '—'}`,
+    `resp ${cfg.mdb_max_response_time ?? '—'}`,
+    `misc ${cfg.mdb_misc_options ?? '—'}`
+  ].join(' · ');
+}
+
+function renderMachineTechnicalSupportHtml(support){
+  const status=support?.status||'not_reported';
+  const reported=support?.reported_config||null;
+  const drift=Array.isArray(support?.drift)?support.drift:[];
+  const lastChange=support?.last_backend_change||null;
+  const statusMap={
+    in_sync:{label:'Alineada con backend',bg:'rgba(34,197,94,.10)',bd:'rgba(34,197,94,.28)',tx:'var(--txs)'},
+    drift:{label:'Difiere del backend',bg:'rgba(245,158,11,.12)',bd:'rgba(245,158,11,.28)',tx:'var(--txw)'},
+    not_reported:{label:'Sin snapshot reportado',bg:'rgba(59,130,246,.10)',bd:'rgba(59,130,246,.24)',tx:'var(--tx2)'}
+  };
+  const style=statusMap[status]||statusMap.not_reported;
+  const driftHtml=drift.length
+    ? `<div style="margin-top:8px;font-size:12px;color:var(--tx2);line-height:1.5">
+        <strong>Diferencias detectadas:</strong>
+        <div style="margin-top:6px;display:grid;gap:6px">
+          ${drift.map(item=>`<div style="padding:8px 10px;border-radius:10px;background:var(--bg2);border:1px solid var(--br)">
+            <strong>${escHtml(item.label||item.field||'Campo')}</strong> · equipo <code>${escHtml(formatMachineTechnicalSupportValue(item.field,item.reported))}</code> · backend <code>${escHtml(formatMachineTechnicalSupportValue(item.field,item.desired))}</code>
+          </div>`).join('')}
+        </div>
+      </div>`
+    : `<div style="margin-top:8px;font-size:12px;color:var(--tx3)">No se detectan diferencias entre lo último reportado por el equipo y la configuración deseada de backend.</div>`;
+  const lastChangeHtml=lastChange
+    ? `<div style="margin-top:10px;font-size:12px;color:var(--tx2);line-height:1.5">
+        <strong>Último cambio backend:</strong> ${escHtml(lastChange.actor_username||'Sistema')} · ${escHtml(lastChange.actor_role||'—')} · ${escHtml(formatAuditDate(lastChange.created_at))}<br>
+        <span style="color:var(--tx3)">${escHtml(lastChange.summary||'—')}${lastChange.config_sync?` · sync ${escHtml(lastChange.config_sync)}`:''}</span>
+      </div>`
+    : `<div style="margin-top:10px;font-size:12px;color:var(--tx3)">Todavía no hay cambios técnicos auditados para esta máquina.</div>`;
+  return `
+    <div style="padding:12px 14px;border-radius:14px;background:var(--bg2);border:1px solid var(--line);margin-bottom:14px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:${style.bg};border:1px solid ${style.bd};color:${style.tx};font-size:11px;font-weight:700">${escHtml(style.label)}</span>
+        <span style="font-size:11px;color:var(--tx3)">Último reporte ESP: ${escHtml(support?.reported_at?formatAuditDate(support.reported_at):'—')}</span>
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--tx2);line-height:1.5">
+        <strong>Última config reportada por el equipo:</strong> ${escHtml(describeMachineTechnicalConfigSummary(reported))}
+      </div>
+      ${driftHtml}
+      ${lastChangeHtml}
+    </div>
+  `;
+}
+
 function readMachineTechnicalConfigForm(){
   const price=parseInt(document.getElementById('mtPrice')?.value||'0',10);
   const feature=parseInt(document.getElementById('mtFeature')?.value||'',10);
@@ -3145,6 +3355,7 @@ async function openMachineTechnicalConfig(id){
     const data=await api('GET',`/api/machines/${id}/technical-config`);
     const machine=data.machine||{};
     const cfg=data.technical_config||{};
+    const support=data.support||{};
     const machineState=(allMachines||[]).find(m=>Number(m.id)===Number(id))||{};
     openModal(`Config técnica: ${machine.name||'Máquina'}`,`
       <div style="font-size:12px;color:var(--tx2);line-height:1.45;margin-bottom:14px">
@@ -3153,6 +3364,10 @@ async function openMachineTechnicalConfig(id){
       <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-bottom:14px">
         Usá <strong>Diag</strong> para ver el modo asistido: compara el último SETUP real del VMC con esta configuración antes de tocar parámetros finos.
       </div>
+      <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-bottom:14px">
+        Versión actual <strong>v${Number(cfg.config_version||1)}</strong> · fuente <strong>${escHtml(cfg.config_source||'backend')}</strong>
+      </div>
+      ${renderMachineTechnicalSupportHtml(support)}
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
         <button type="button" class="btn btn-ghost btn-sm" id="mtSuggestBtn" onclick="suggestMachineTechnicalConfig(${id})" ${machineState?.online?'':'disabled title="La máquina debe estar online para pedir un snapshot remoto"'}>Sugerir según último SETUP MDB</button>
         <div style="font-size:11px;color:var(--tx3)">${machineState?.online?'La máquina está online.':'La máquina está offline; el modo asistido necesita conexión.'}</div>

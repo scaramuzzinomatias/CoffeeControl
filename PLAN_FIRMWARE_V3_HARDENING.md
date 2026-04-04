@@ -178,13 +178,16 @@ Estado actual:
   - `cmdPoll`
   - `cmdVend`
   - `cmdReader`
-  - timeout de sesion en `loop()`
+  - timeout de sesion en la tarea MDB dedicada
+- el inicio de sesion MDB aprobado por NFC ya entra por una cola async chica (`mdbAsyncQueue`) y deja de escribir runtime operativo directo desde `handleNFC()`
+- la sincronizacion de precio ya no pisa `mdbRuntime` desde `readConfig()`, `saveConfig()` ni `applyPricingConfig()`
+- estado actual experimental: el firmware ya expone un `Communications Gateway` MDB mínimo en `0x18` para evaluar soporte real del VMC sin tocar el `cashless 0x10` validado; por ahora se limita a `RESET`, `SETUP`, `CONTROL`, `IDENTIFICATION`, `FEATURE ENABLE` y `TIME/DATE REQUEST`
+- resultado real en Rubino: el `gateway 0x18` no fue interrogado por la máquina (`Setup/Control/Identification/Feature Enable/Time-Date` quedaron en `No`), así que no sirve hoy como vía práctica para sincronizar reloj o ampliar telemetría en esta instalación
 
 Pendiente dentro de esta etapa:
 
-- terminar de desacoplar el precio del resto de globals runtime
 - capturar mejor los frames `SETUP` del VMC como hint de compatibilidad, sin convertirlos en fuente de verdad
-- resolver el ownership final del estado MDB entre la tarea MDB y el `loop()` sin cambiar primero el comportamiento visible
+- si hiciera falta, seguir encapsulando helpers de limpieza/cancelacion para reducir aun mas la manipulacion directa del runtime dentro del propio task MDB
 
 ### Etapa 2. Event log compacto
 
@@ -333,6 +336,16 @@ Regla:
 - backend y portal editan el mismo concepto humano: `price_cents`
 - solo el firmware conoce la conversion interna MDB
 
+Estado actual:
+
+- firmware ya persiste `configVersion` y `configSource` en `DeviceConfig`
+- `POST /api/machines/register` ya reporta `config_version` y `config_source`
+- backend ya persiste `technical_config_version`, `technical_config_source` y `technical_config_updated_at`
+- si el dispositivo vuelve con una config local distinta, backend detecta el desvío y responde con una nueva versión autoritativa (`backend`)
+- `config_update` y `diagnostics_snapshot` ya transportan versión y fuente para soporte
+- backend ya guarda la última config técnica reportada por el equipo y el panel la compara contra la config deseada
+- `Config técnica` ya muestra drift y último cambio backend auditado para soporte de campo
+
 ### Captura de `SETUP` MDB como hint
 
 Objetivo:
@@ -357,8 +370,14 @@ Estado actual:
 - eventos nuevos de soporte:
   - `EVT_MDB_SETUP_CONFIG`
   - `EVT_MDB_SETUP_PRICES`
+  - `EVT_MDB_EXPANSION_REQUEST_ID`
+  - `EVT_MDB_TIME_DATE_FILE`
 - el panel admin ya muestra `Compatibilidad asistida` en `Máquinas > Diag`
 - `Config técnica` ya puede pedir un snapshot remoto y precargar sugerencias con el botón `Sugerir según último SETUP MDB`, siempre sin autoaplicar cambios
+- el snapshot MDB ya guarda también:
+  - último `EXPANSION` visto
+  - `REQUEST_ID` consultado por el VMC
+  - fecha/hora MDB si llega `WRITE TIME/DATE FILE`
 
 Regla:
 
@@ -368,6 +387,7 @@ Regla:
   - compara rango de precios MDB vs precio convertido por perfil
   - compara `VMC level` detectado vs `feature level` configurado
   - sirve para orientar a técnico/admin, no para que la máquina se reconfigure sola
+- la identificación comercial/modelo del VMC no viene por el flujo cashless estándar que hoy usamos; para eso haría falta otro canal o extensiones específicas del fabricante
 
 ### Etapa 6. Watchdog
 
@@ -442,9 +462,13 @@ Siguiente trabajo recomendado:
    - cambio de `decimal_places`
    - cambio de `max_response_time`
    - cambio de `misc_options`
-2. decidir si hace falta `config_version` para resolver conflictos entre backend y portal local
+2. [x] resolver conflictos entre backend y portal local con `config_version` / `config_source`
 3. si hace falta, ampliar el modo asistido con más heurísticas específicas por máquina
 4. terminar de mover ownership del runtime MDB hacia la tarea dedicada, manteniendo el comportamiento ya validado
+
+Documento operativo sugerido para correr ese bloque en máquina real:
+
+- [PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md)
 
 Regla para este bloque:
 

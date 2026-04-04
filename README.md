@@ -28,7 +28,7 @@ Una empresa con 4 expendedoras gasta $4 millones/mes en café sin saber qué emp
 | Capa | Tecnología |
 |---|---|
 | Firmware | C++ Arduino / PlatformIO — ESP32-C3 Super Mini |
-| Protocolo expendedora | MDB Cashless Peripheral (9-bit, bit-banging) |
+| Protocolo expendedora | MDB Cashless Peripheral (9-bit, bit-banging) + experimento controlado de Communications Gateway evaluado en Rubino |
 | Lector NFC | RC522 via SPI |
 | Config WiFi | Portal cautivo (captive portal en AP `CoffeeControl-Setup`) |
 | Backend | Node.js + Express |
@@ -273,6 +273,8 @@ El precio del café ahora se maneja como un valor **humano** por máquina:
 - soporte asistido en panel:
   - `Máquinas > Diag` muestra `Compatibilidad asistida` comparando el último `SETUP MDB` capturado contra la config técnica actual
   - `Máquinas > Config técnica` ofrece `Sugerir según último SETUP MDB` para precargar valores conservadores sin guardarlos automáticamente
+- protocolo específico de validación en campo:
+  - [PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md)
 
 Si el precio cambia desde `Máquinas`:
 
@@ -287,6 +289,18 @@ La configuración técnica avanzada quedó separada del flujo gerencial:
 - visible/editable solo para `admin`, `tecnico` y `distribuidor`
 - `gerente` y `supervisor` no ven ni editan parámetros MDB finos
 - el backend sigue siendo la fuente principal de la configuración técnica y el portal local queda como herramienta de recuperación/onboarding
+- cada máquina mantiene además:
+  - `config_version`
+  - `config_source`
+  - `config_updated_at`
+- backend guarda también la última config técnica reportada por el ESP (`last_reported_technical_config`) y cuándo la reportó
+- si el portal local cambia una config, el ESP incrementa su versión local y marca `config_source=portal`
+- cuando el ESP vuelve a registrarse con una config distinta, el backend detecta el desvío, genera una nueva versión autoritativa (`config_source=backend`) y le devuelve explícitamente la configuración efectiva
+- `Máquinas > Diag` y `Máquinas > Config técnica` ya muestran esa versión/fuente para soporte
+- `Máquinas > Config técnica` también muestra:
+  - última config reportada por el equipo
+  - drift contra la config deseada de backend
+  - último cambio hecho desde panel con actor y fecha
 
 ### Diagnóstico rápido en el ESP32-C3
 
@@ -655,6 +669,7 @@ Notas:
 
 - `POST /api/machines/register` devuelve la configuración efectiva aprobada por backend, incluyendo precio humano, perfil MDB y parámetros técnicos
 - cuando cambia el precio o la configuración técnica de una máquina desde el backend, se puede encolar un `config_update` completo para que el ESP lo aplique sin recompilar
+- la máquina reporta también `config_version` y `config_source`, para que backend y portal no queden en conflicto silencioso
 
 ### Panel admin (auth JWT — header Authorization: Bearer token)
 ```
@@ -726,7 +741,7 @@ Qué hace cada uno:
 - `db:restore`: restaura un backup `.sql` o `.dump`; acepta `--recreate` para reconstruir la base antes de restaurar.
 - `db:rebuild`: reconstruye la base desde cero usando `schema.sql` y luego aplica las migraciones faltantes del repo.
 - `support:doctor`: valida `.env`, conexión PostgreSQL, tablas clave, SMTP y `/health` del backend.
-- `test:integration`: levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos (incluyendo `diagnostics_snapshot`), permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor`, cuentas protegidas y la capa móvil (`mobile-auth` + `mobile-tech`).
+- `test:integration`: corre migraciones pendientes automáticamente, levanta un backend temporal en puerto alternativo y valida login, scopes multi-área, `403` fuera de alcance, estados de TAG NFC, comandos remotos (incluyendo `diagnostics_snapshot`), permisos sobre `Notificaciones`/`Auditoría`, jerarquías de acceso, política efectiva en `tap` / `tap/cards`, filtros de reportes por jerarquía, configuración de stock, alertas de stock, reportes de stock, el rol `tecnico`, el rol `distribuidor`, cuentas protegidas y la capa móvil (`mobile-auth` + `mobile-tech`).
 - `support:reset-admin`: wrapper para resetear o crear el usuario `admin` del panel.
 - `support:user`: crea o actualiza cualquier usuario del panel (`admin`, `gerente`, `supervisor`, `tecnico`, `distribuidor`). Si el rol es `supervisor`, acepta múltiples áreas con `--departments`. También permite marcar o desmarcar cuentas protegidas con `--protected` / `--unprotect`.
 - `support:create-supervisor`: wrapper cómodo de `support:user` para supervisores; igual requiere `--username`, `--password` y opcionalmente `--departments`.

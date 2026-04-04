@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 04/04/2026 — el firmware ya quedó validado en una Rubino real con venta completa y precio humano correcto (`1200` backend vs `600` interno MDB cuando aplica el perfil `rubino_half_credit`). Además ya quedó implementada la configuración técnica remota integral por máquina: backend, tests y panel admin con visibilidad restringida a `admin`, `tecnico` y `distribuidor`. El portal sigue desacoplado en `LittleFS`, el `event log` compacto sigue disponible por `GET /diag/events`, el snapshot de `SETUP` MDB sigue en `GET /diag/mdb`, la cola offline ya usa journal append-only y el watchdog conservador de `20s` sigue activo sobre `loopTask` + tarea MDB. El timing MDB continúa fuera del bloque inicial. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
+> Última actualización: 04/04/2026 — el firmware ya quedó validado en una Rubino real con venta completa y precio humano correcto (`1200` backend vs `600` interno MDB cuando aplica el perfil `rubino_half_credit`). Además ya quedó implementada la configuración técnica remota integral por máquina: backend, tests y panel admin con visibilidad restringida a `admin`, `tecnico` y `distribuidor`. La resolución de conflictos backend/portal ya quedó versionada con `config_version`, `config_source` y `config_updated_at`: el portal local puede seguir usándose para recovery, pero backend conserva el rol de fuente de verdad y devuelve una configuración autoritativa explícita cuando detecta desvíos. El portal sigue desacoplado en `LittleFS`, el `event log` compacto sigue disponible por `GET /diag/events`, el snapshot de `SETUP` MDB sigue en `GET /diag/mdb`, la cola offline ya usa journal append-only y el watchdog conservador de `20s` sigue activo sobre `loopTask` + tarea MDB. El timing MDB continúa fuera del bloque inicial. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
 >
 > **Punto de restauración general:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 >
@@ -27,6 +27,11 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 - Estado actual: el panel técnico ya muestra `Compatibilidad asistida` en `Máquinas > Diag` y permite precargar sugerencias en `Config técnica` con `Sugerir según último SETUP MDB`, sin autoaplicar nada
 - Estado actual: Rubino validada en campo con `VEND_REQUEST` / `VEND_SUCCESS` / `VEND_END` completos y persistencia humana correcta en backend
 - Estado actual: configuración técnica avanzada de máquina disponible solo para `admin`, `tecnico` y `distribuidor`
+- Estado actual: backend/portal ya resuelven conflictos de configuración por `config_version` + `config_source`, visible en `Diag` y `Config técnica`
+- Estado actual: `Config técnica` ya muestra la última config reportada por el ESP, el drift respecto de backend y el último cambio técnico auditado desde panel
+- Estado actual: ownership conservador del runtime MDB ya resuelto; `handleNFC()` encola inicio de sesión, el timeout de `SESSION_IDLE` corre en la tarea MDB y la carga de config ya no pisa el runtime operativo
+- Estado actual: `GET /diag/mdb` ya expone también `EXPANSION` y fecha/hora MDB si la máquina envía `WRITE TIME/DATE FILE`; eso se ve tanto en portal como en `Máquinas > Diag`
+- Estado actual: firmware con experimento controlado de `Communications Gateway` MDB (`0x18`) para evaluar si la Rubino usa identificación, feature enable y `TIME/DATE REQUEST`; no reemplaza el cashless `0x10`, lo acompaña. Resultado real en esta Rubino: no lo interroga, así que el reloj operativo queda en `NTP` y el gateway se considera evaluado pero no adoptado como camino principal
 
 ### Hardware por máquina (v2 — target de producción)
 - **Microcontrolador:** ESP32-C3 Super Mini — ~$2-3 USD
