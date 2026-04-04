@@ -27,6 +27,10 @@ Lineas ya acordadas:
 - estado actual: captura del `SETUP` MDB agregada como diagnóstico (`GET /diag/mdb`) sin cambiar todavía la negociación ni el cálculo actual del precio
 - estado actual: runtime MDB consolidado en `MdbRuntimeState`, reduciendo estado disperso sin tocar todavía timing ni secuencia visible
 - estado actual: el portal ya expone botones para ver `Eventos` y `Setup MDB`, y el panel/backend ya puede pedir un snapshot remoto `diagnostics_snapshot` para soporte técnico
+- estado actual: validación real en Rubino completada; el flujo `NFC -> BEGIN_SESSION -> VEND_REQUEST -> VEND_SUCCESS -> VEND_END` ya cierra sin reset espurio
+- estado actual: backend ya registra el precio humano correcto aunque la máquina negocie unidades MDB internas distintas
+- estado actual: configuración técnica remota integral ya disponible solo para `admin`, `tecnico` y `distribuidor`
+- estado actual: el panel ya ofrece `Compatibilidad asistida` en `Máquinas > Diag` y botón `Sugerir según último SETUP MDB` en `Config técnica`, sin autoaplicar cambios
 
 ## Criterio de priorización
 
@@ -746,3 +750,28 @@ Razón:
 - El producto actual ya cubre bien el escenario objetivo de piloto.
 - El mayor valor inmediato está en validar uso real y, en paralelo, diseñar bien la capa móvil.
 - El reemplazo del TAG por NFC móvil requiere otro tipo de arquitectura y no conviene mezclarlo con el cierre del piloto.
+
+## Próximo bloque firmware a retomar
+
+Pendiente para retomar después del cierre Rubino:
+
+1. Consolidar la configuración técnica remota como fuente principal desde backend.
+2. Definir si hace falta sumar `config_version` para resolver conflictos portal/backend.
+3. Ampliar el modo asistido si hace falta:
+   - sugerencias más finas por perfil de máquina
+   - comparación con más señales del handshake MDB
+   - eventualmente precarga guiada de parámetros avanzados
+4. Verificar en campo cambios de:
+   - `pricing_profile`
+   - `feature_level`
+   - `country_code`
+   - `scale_factor`
+   - `decimal_places`
+   - `max_response_time`
+   - `misc_options`
+5. Solo después de eso, seguir con ownership final del estado MDB entre tarea dedicada y `loop()`.
+
+Objetivo:
+
+- pasar de compatibilidad MDB validada a operación remota técnica completa
+- mantener la UI gerencial limpia, reservando lo fino a soporte técnico

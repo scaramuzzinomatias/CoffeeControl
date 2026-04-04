@@ -1162,6 +1162,10 @@ function canManageMachineSetup(){
   return isManagerRole() || CURRENT_ROLE==='distribuidor';
 }
 
+function canManageMachineTechnicalConfig(){
+  return CURRENT_ROLE==='admin' || isTechnicalRole();
+}
+
 function canOperateMachines(){
   return isManagerRole() || isTechnicalRole();
 }
@@ -1631,7 +1635,7 @@ function renderDashboard(today,monthly,machinesData){
   const mTotal=(machinesData.machines||[]).length;
 
   const metricsHtml=[
-    ['Gasto mensual','$'+Math.round(mc/100).toLocaleString('es-AR'),''],
+    ['Gasto mensual',formatReportMoney(mc),''],
     ['Cafés este mes',mt.toLocaleString(),''],
     ['Empleados bloqueados hoy',blk,blk>0?'danger':''],
     ...(isManagerRole()
@@ -1650,7 +1654,7 @@ function renderDashboard(today,monthly,machinesData){
     return `<tr>
       <td><div style="display:flex;align-items:center;gap:8px"><div class="avatar" style="background:${av.bg};color:${av.c}">${ini}</div><div><div style="font-weight:500;font-size:13px">${e.employee_name}</div><div style="font-size:11px;color:var(--tx3)">${e.department||''}</div></div></div></td>
       <td>${e.taps_today}/${e.daily_limit}</td>
-      <td>$${Math.round((e.spent_today_cents||0)/100).toLocaleString('es-AR')}</td>
+      <td>${formatReportMoney(e.spent_today_cents||0)}</td>
       <td>${stBadge(st)}</td>
       <td><button class="btn btn-ghost btn-xs" onclick="showEmployeeDetail(${e.employee_id})">Ver</button></td>
     </tr>`;
@@ -1709,6 +1713,7 @@ async function loadMachines(){
 function renderMachines(){
   const manager=isManagerRole();
   const installer=canManageMachineSetup();
+  const technicalConfig=canManageMachineTechnicalConfig();
   render(`
   ${installer?'<div id="pendingContainer"></div>':''}
   <div class="topbar">
@@ -1758,6 +1763,7 @@ function applyMachineFilters(){
   const q=(document.getElementById('mfSearch')?.value||'').toLowerCase().trim();
   const st=document.getElementById('mfStatus')?.value||'';
   const act=document.getElementById('mfActivity')?.value||'';
+  const technicalConfig=canManageMachineTechnicalConfig();
   const filtered=allMachines.filter(m=>{
     if(q && !`${m.name} ${m.location||''} ${m.wifi_ssid||''} ${m.wifi_ip||''} ${m.backend_error||''}`.toLowerCase().includes(q)) return false;
     if(st){const s=m.blocked?'blocked':m.active?'active':'inactive'; if(s!==st) return false;}
@@ -1781,7 +1787,7 @@ function applyMachineFilters(){
       <td><span class="badge ${stBg}">${stLbl}</span><span class="badge ${backend.cls}" style="margin-left:6px">${backend.label}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.blocked_reason||'')}</div>`:''}<div style="font-size:11px;color:var(--tx3);margin-top:4px">Último contacto ${lastSeen}</div>${backendError}</td>
       <td>${m.taps_today||0}</td>
       <td>${m.taps_month||0}</td>
-      <td>$${Math.round((m.cost_month_cents||0)/100).toLocaleString('es-AR')}</td>
+      <td>${formatReportMoney(m.cost_month_cents||0)}</td>
       <td style="font-size:11px;color:var(--tx3)">${since}</td>
       <td style="white-space:nowrap">
         ${manager ? (m.blocked
@@ -1790,6 +1796,7 @@ function applyMachineFilters(){
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openRemoteWifi(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>WiFi</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="restartMachine(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>Reiniciar</button>
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openRemoteDiagnostics(${m.id},'${m.name.replace(/'/g,"&#39;")}',${m.online?'true':'false'})" ${m.online?'':'disabled title="Solo disponible si la máquina está online"'}>Diag</button>
+        ${technicalConfig?`<button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openMachineTechnicalConfig(${m.id})">Config técnica</button>`:''}
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick='openMachineStock(${m.id},${JSON.stringify(m.name)})'>Stock</button>
         ${manager?`<button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openEditMachine(${m.id})">Editar</button>`:''}
         <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="machineDetail(${m.id},'${m.name}')">Ver</button>
@@ -2198,6 +2205,122 @@ function describeRemoteDiagPrice(result){
   return `Precio humano activo ${formatMachinePriceValue(result?.price_cents)} con perfil ${formatDiagValue(result?.pricing_profile,'desconocido')}.`;
 }
 
+function machineHumanPriceToMdbUnits(priceCents, profile){
+  const human=Math.max(0, Number(priceCents)||0);
+  switch(String(profile||'')){
+    case 'rubino_half_credit':
+      return Math.round(human/2);
+    case 'identity':
+    default:
+      return human;
+  }
+}
+
+function pricingProfileAssistLabel(profile){
+  switch(String(profile||'')){
+    case 'rubino_half_credit':
+      return 'rubino_half_credit (convierte 1200 en 600 para MDB)';
+    case 'identity':
+      return 'identity (usa el mismo valor humano en MDB)';
+    default:
+      return formatDiagValue(profile,'desconocido');
+  }
+}
+
+function formatRemoteDiagCountryCode(value){
+  const parsed=Number(value);
+  if(!Number.isInteger(parsed) || parsed<0) return '—';
+  return `0x${parsed.toString(16).toUpperCase().padStart(4,'0')} (${parsed})`;
+}
+
+function describeRemoteDiagTechnicalConfig(result){
+  return [
+    `Perfil ${formatDiagValue(result?.pricing_profile,'desconocido')}`,
+    `feature ${formatDiagValue(result?.mdb_feature_level)}`,
+    `country ${formatRemoteDiagCountryCode(result?.mdb_country_code)}`,
+    `scale ${formatDiagValue(result?.mdb_scale_factor)}`,
+    `decimals ${formatDiagValue(result?.mdb_decimal_places)}`,
+    `resp ${formatDiagValue(result?.mdb_max_response_time)}`,
+    `misc ${formatDiagValue(result?.mdb_misc_options)}`
+  ].join(' · ');
+}
+
+function remoteDiagCompatibilityHints(result){
+  const hints=[];
+  const setup=result?.mdb||{};
+  const humanPrice=Math.max(0, Number(result?.price_cents)||0);
+  const mdbUnits=machineHumanPriceToMdbUnits(humanPrice, result?.pricing_profile);
+
+  if(!setup?.seen_config && !setup?.seen_prices){
+    return [{
+      tone:'info',
+      text:'Todavía no hay un SETUP MDB capturado, así que no se puede comparar compatibilidad. Reiniciá la máquina o esperá un nuevo handshake cashless.'
+    }];
+  }
+
+  hints.push({
+    tone:'info',
+    text:`Perfil activo ${pricingProfileAssistLabel(result?.pricing_profile)}. El precio humano ${formatMachinePriceValue(humanPrice)} se traduce a ${formatReportInt(mdbUnits)} unidades MDB.`
+  });
+
+  if(setup?.seen_prices){
+    const min=Number(setup?.min_price);
+    const max=Number(setup?.max_price);
+    if(Number.isFinite(min) && Number.isFinite(max)){
+      const withinMin=mdbUnits>=min;
+      const withinMax=max<=0 ? true : mdbUnits<=max;
+      if(withinMin && withinMax){
+        hints.push({
+          tone:'ok',
+          text:`El precio convertido cae dentro del rango que anunció el VMC (${formatReportInt(min)} a ${formatReportInt(max)} unidades MDB).`
+        });
+      }else{
+        hints.push({
+          tone:'warn',
+          text:`El precio convertido (${formatReportInt(mdbUnits)} unidades MDB) queda fuera del rango que anunció el VMC (${formatReportInt(min)} a ${formatReportInt(max)}). Revisá precio humano, perfil MDB o parámetros avanzados.`
+        });
+      }
+    }
+  }
+
+  if(setup?.seen_config){
+    const vmcLevel=Number(setup?.vmc_level);
+    const featureLevel=Number(result?.mdb_feature_level);
+    if(Number.isFinite(vmcLevel) && Number.isFinite(featureLevel)){
+      if(featureLevel===vmcLevel){
+        hints.push({
+          tone:'ok',
+          text:`El feature level del lector (${formatReportInt(featureLevel)}) coincide con el level detectado en el VMC (${formatReportInt(vmcLevel)}).`
+        });
+      }else if(featureLevel<vmcLevel){
+        hints.push({
+          tone:'info',
+          text:`El VMC anunció level ${formatReportInt(vmcLevel)} y el lector está en feature ${formatReportInt(featureLevel)}. Esto suele funcionar en modo conservador; solo subilo si ves incompatibilidades reales.`
+        });
+      }else{
+        hints.push({
+          tone:'warn',
+          text:`El lector anuncia feature ${formatReportInt(featureLevel)} por encima del level ${formatReportInt(vmcLevel)} detectado en el VMC. Si aparecen resets o secuencias fuera de orden, conviene igualarlo o bajarlo.`
+        });
+      }
+    }
+  }
+
+  return hints;
+}
+
+function renderRemoteDiagCompatibilityHints(result){
+  const palette={
+    ok:{bg:'rgba(34,197,94,.10)',bd:'rgba(34,197,94,.28)',tx:'var(--txs)'},
+    info:{bg:'rgba(59,130,246,.10)',bd:'rgba(59,130,246,.24)',tx:'var(--tx2)'},
+    warn:{bg:'rgba(245,158,11,.12)',bd:'rgba(245,158,11,.28)',tx:'var(--txw)'}
+  };
+  return remoteDiagCompatibilityHints(result).map(hint=>{
+    const style=palette[hint.tone]||palette.info;
+    return `<div style="padding:10px 12px;border-radius:12px;background:${style.bg};border:1px solid ${style.bd};font-size:13px;line-height:1.45;color:${style.tx}">${escHtml(hint.text)}</div>`;
+  }).join('');
+}
+
 function remoteDiagContextMeta(){
   let backendLabel=BASE||CURRENT_ORIGIN||window.location.origin||'—';
   let instanceLabel=backendLabel;
@@ -2250,10 +2373,16 @@ function buildRemoteDiagnosticsExportText(result){
     `- Backend: ${describeRemoteDiagBackend(result)}`,
     `- Cola offline: ${describeRemoteDiagQueue(result)}`,
     `- Precio: ${describeRemoteDiagPrice(result)}`,
+    `- Config técnica: ${describeRemoteDiagTechnicalConfig(result)}`,
     `- Capturado: ${formatDiagUptime(result?.captured_at_ms||0)} desde el boot`,
+    '',
+    'Compatibilidad asistida',
     '',
     'Eventos'
   ];
+  remoteDiagCompatibilityHints(result).forEach(hint=>{
+    lines.splice(lines.length-2,0,`- ${hint.text}`);
+  });
   const events=result?.events?.events||[];
   if(!events.length){
     lines.push('- Sin eventos registrados');
@@ -2345,6 +2474,11 @@ function renderRemoteDiagnosticsResult(result){
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Backend:</strong> ${escHtml(describeRemoteDiagBackend(result))}</div>
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Cola offline:</strong> ${escHtml(describeRemoteDiagQueue(result))}</div>
         <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Precio:</strong> ${escHtml(describeRemoteDiagPrice(result))}</div>
+        <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:13px;line-height:1.45"><strong>Config técnica:</strong> ${escHtml(describeRemoteDiagTechnicalConfig(result))}</div>
+      </div>
+      <div class="section-lbl" style="margin-bottom:8px">Compatibilidad asistida</div>
+      <div style="display:grid;gap:8px;margin-bottom:12px">
+        ${renderRemoteDiagCompatibilityHints(result)}
       </div>
       <div style="font-size:12px;color:var(--tx3);margin-bottom:10px">
         Perfil MDB: <strong>${escHtml(formatDiagValue(result?.pricing_profile,'desconocido'))}</strong> ·
@@ -2385,6 +2519,12 @@ function renderRemoteDiagnosticsResult(result){
         <div><span style="color:var(--tx3)">Min price:</span> ${formatDiagValue(setup.min_price)}</div>
         <div><span style="color:var(--tx3)">Subcmd:</span> ${formatDiagValue(setup.last_subcmd)}</div>
         <div><span style="color:var(--tx3)">Último visto:</span> ${escHtml(formatDiagUptime(setup.last_seen_ms||0))}</div>
+        <div><span style="color:var(--tx3)">Feature level:</span> ${formatDiagValue(result?.mdb_feature_level)}</div>
+        <div><span style="color:var(--tx3)">Country code:</span> ${escHtml(formatRemoteDiagCountryCode(result?.mdb_country_code))}</div>
+        <div><span style="color:var(--tx3)">Scale factor:</span> ${formatDiagValue(result?.mdb_scale_factor)}</div>
+        <div><span style="color:var(--tx3)">Decimal places:</span> ${formatDiagValue(result?.mdb_decimal_places)}</div>
+        <div><span style="color:var(--tx3)">Max response:</span> ${formatDiagValue(result?.mdb_max_response_time)}</div>
+        <div><span style="color:var(--tx3)">Misc options:</span> ${formatDiagValue(result?.mdb_misc_options)}</div>
       </div>
       <div style="font-size:12px;color:var(--tx3);margin-bottom:6px">Raw bytes</div>
       <div style="padding:10px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;line-height:1.45">${escHtml(raw)}</div>
@@ -2506,6 +2646,7 @@ async function machineDetail(id,name){
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">
           <button type="button" class="btn btn-ghost btn-sm" onclick='openMachineStock(${id},${JSON.stringify(name)})'>Actualizar stock</button>
           <button type="button" class="btn btn-primary btn-sm" onclick="openRemoteDiagnostics(${id},'${name.replace(/'/g,"&#39;")}',${machineState?.online?'true':'false'})" ${machineState?.online?'':'disabled title="Solo disponible si la máquina está online"'}>Diagnóstico remoto</button>
+          ${canManageMachineTechnicalConfig()?`<button type="button" class="btn btn-ghost btn-sm" onclick="openMachineTechnicalConfig(${id})">Config técnica</button>`:''}
         </div>
         <div class="metrics" style="margin-bottom:18px">
           <div class="metric"><div class="mlbl">Selecciones activas</div><div class="mval">${formatReportInt(summary.configured_items||0)}</div></div>
@@ -2793,6 +2934,309 @@ async function saveMachineEdit(id){
   }catch(e){showModalErr('meErr',e.message);}
 }
 
+function formatMachineTechnicalCountryCode(value){
+  const parsed=Number(value);
+  if(!Number.isInteger(parsed) || parsed<0) return '0x0032';
+  return `0x${parsed.toString(16).toUpperCase().padStart(4,'0')}`;
+}
+
+function parseMachineTechnicalCountryCode(raw){
+  const value=(raw||'').trim();
+  if(!value) return null;
+  if(/^0x[0-9a-f]+$/i.test(value)) return parseInt(value,16);
+  if(/^\d+$/.test(value)) return parseInt(value,10);
+  return null;
+}
+
+function setMachineTechnicalSuggestStatus(msg,tone='info'){
+  const el=document.getElementById('mtSuggestStatus');
+  if(!el) return;
+  const palette={
+    info:{bg:'rgba(59,130,246,.10)',bd:'rgba(59,130,246,.24)',tx:'var(--tx2)'},
+    ok:{bg:'rgba(34,197,94,.10)',bd:'rgba(34,197,94,.28)',tx:'var(--txs)'},
+    warn:{bg:'rgba(245,158,11,.12)',bd:'rgba(245,158,11,.28)',tx:'var(--txw)'},
+    error:{bg:'rgba(239,68,68,.12)',bd:'rgba(239,68,68,.26)',tx:'var(--txd)'}
+  };
+  const style=palette[tone]||palette.info;
+  el.style.display=msg?'block':'none';
+  el.style.background=style.bg;
+  el.style.border=`1px solid ${style.bd}`;
+  el.style.color=style.tx;
+  el.textContent=msg||'';
+}
+
+function readMachineTechnicalConfigForm(){
+  const price=parseInt(document.getElementById('mtPrice')?.value||'0',10);
+  const feature=parseInt(document.getElementById('mtFeature')?.value||'',10);
+  const country=parseMachineTechnicalCountryCode(document.getElementById('mtCountry')?.value||'');
+  const scale=parseInt(document.getElementById('mtScale')?.value||'',10);
+  const decimals=parseInt(document.getElementById('mtDecimals')?.value||'',10);
+  const responseTime=parseInt(document.getElementById('mtResp')?.value||'',10);
+  const misc=parseInt(document.getElementById('mtMisc')?.value||'',10);
+  const profile=document.getElementById('mtProfile')?.value||'';
+  return {
+    price_cents:Number.isInteger(price) && price>0 ? price : 1200,
+    pricing_profile:['rubino_half_credit','identity'].includes(profile) ? profile : 'rubino_half_credit',
+    mdb_feature_level:Number.isInteger(feature) && feature>=0 ? feature : 1,
+    mdb_country_code:Number.isInteger(country) && country>=0 ? country : 0x0032,
+    mdb_scale_factor:Number.isInteger(scale) && scale>=0 ? scale : 100,
+    mdb_decimal_places:Number.isInteger(decimals) && decimals>=0 ? decimals : 2,
+    mdb_max_response_time:Number.isInteger(responseTime) && responseTime>=0 ? responseTime : 5,
+    mdb_misc_options:Number.isInteger(misc) && misc>=0 ? misc : 0
+  };
+}
+
+function writeMachineTechnicalConfigForm(cfg){
+  const safe=cfg||{};
+  const setters=[
+    ['mtPrice', safe.price_cents],
+    ['mtProfile', safe.pricing_profile],
+    ['mtFeature', safe.mdb_feature_level],
+    ['mtCountry', formatMachineTechnicalCountryCode(safe.mdb_country_code)],
+    ['mtScale', safe.mdb_scale_factor],
+    ['mtDecimals', safe.mdb_decimal_places],
+    ['mtResp', safe.mdb_max_response_time],
+    ['mtMisc', safe.mdb_misc_options]
+  ];
+  setters.forEach(([id,value])=>{
+    const el=document.getElementById(id);
+    if(el && value!==undefined && value!==null) el.value=String(value);
+  });
+}
+
+function delayMs(ms){
+  return new Promise(resolve=>setTimeout(resolve,ms));
+}
+
+async function requestMachineDiagnosticsSnapshotInline(machineId){
+  const start=await api('POST',`/api/machines/${machineId}/commands`,{type:'diagnostics_snapshot'});
+  const commandId=start.command?.id;
+  if(!commandId) throw new Error('No se recibió ID de comando para el diagnóstico.');
+  for(let attempt=0;attempt<=20;attempt++){
+    const d=await api('GET',`/api/machines/${machineId}/commands/${commandId}`);
+    const cmd=d.command;
+    if(!cmd) throw new Error('Sin estado de comando');
+    if(cmd.status==='completed') return cmd.result||{};
+    if(cmd.status==='failed') throw new Error(cmd.result?.message||'No se pudo obtener el diagnóstico remoto.');
+    if(attempt===20) break;
+    await delayMs(2000);
+  }
+  throw new Error('La máquina tardó demasiado en responder el diagnóstico.');
+}
+
+function machineMdbRangeContains(value,min,max){
+  const num=Number(value);
+  const minValue=Number(min);
+  const maxValue=Number(max);
+  if(!Number.isFinite(num)) return false;
+  if(Number.isFinite(minValue) && num<minValue) return false;
+  if(Number.isFinite(maxValue) && maxValue>0 && num>maxValue) return false;
+  return true;
+}
+
+function suggestMachineTechnicalConfigFromSnapshot(current,result){
+  const setup=result?.mdb||{};
+  const suggested={...current};
+  const notes=[];
+  const changedFields=[];
+
+  if(!setup?.seen_config && !setup?.seen_prices){
+    return {
+      suggested,
+      changedFields,
+      notes:['Todavía no hay un SETUP MDB capturado. Primero generá handshake con la máquina y volvé a intentar.']
+    };
+  }
+
+  if(setup?.seen_prices){
+    const min=Number(setup?.min_price);
+    const max=Number(setup?.max_price);
+    const currentUnits=machineHumanPriceToMdbUnits(current.price_cents, current.pricing_profile);
+    const rubinoUnits=machineHumanPriceToMdbUnits(current.price_cents, 'rubino_half_credit');
+    const identityUnits=machineHumanPriceToMdbUnits(current.price_cents, 'identity');
+    const currentFits=machineMdbRangeContains(currentUnits,min,max);
+    const rubinoFits=machineMdbRangeContains(rubinoUnits,min,max);
+    const identityFits=machineMdbRangeContains(identityUnits,min,max);
+
+    if(!currentFits){
+      if(rubinoFits && !identityFits && suggested.pricing_profile!=='rubino_half_credit'){
+        suggested.pricing_profile='rubino_half_credit';
+        changedFields.push('Perfil MDB');
+        notes.push(`Se sugiere perfil rubino_half_credit porque ${formatReportInt(rubinoUnits)} unidades MDB entran en el rango ${formatReportInt(min)}-${formatReportInt(max)}.`);
+      }else if(identityFits && !rubinoFits && suggested.pricing_profile!=='identity'){
+        suggested.pricing_profile='identity';
+        changedFields.push('Perfil MDB');
+        notes.push(`Se sugiere perfil identity porque ${formatReportInt(identityUnits)} unidades MDB entran en el rango ${formatReportInt(min)}-${formatReportInt(max)}.`);
+      }else{
+        notes.push(`El precio convertido actual (${formatReportInt(currentUnits)} unidades MDB) no coincide claramente con el rango ${formatReportInt(min)}-${formatReportInt(max)}; revisalo manualmente.`);
+      }
+    }else{
+      notes.push(`El precio convertido actual (${formatReportInt(currentUnits)} unidades MDB) ya cae dentro del rango ${formatReportInt(min)}-${formatReportInt(max)}.`);
+    }
+  }
+
+  if(setup?.seen_config){
+    const vmcLevel=Number(setup?.vmc_level);
+    if(Number.isFinite(vmcLevel)){
+      if(suggested.mdb_feature_level>vmcLevel){
+        suggested.mdb_feature_level=vmcLevel;
+        changedFields.push('Feature level');
+        notes.push(`Se sugiere bajar feature level a ${formatReportInt(vmcLevel)} para no anunciar más que el level detectado en el VMC.`);
+      }else if(suggested.mdb_feature_level<vmcLevel){
+        notes.push(`El VMC anunció level ${formatReportInt(vmcLevel)} y el lector quedó en feature ${formatReportInt(suggested.mdb_feature_level)}. Se mantiene así por compatibilidad conservadora.`);
+      }else{
+        notes.push(`El feature level ya coincide con el level detectado en el VMC (${formatReportInt(vmcLevel)}).`);
+      }
+    }
+  }
+
+  if(!Number.isInteger(suggested.mdb_scale_factor) || suggested.mdb_scale_factor<=0){
+    suggested.mdb_scale_factor=100;
+    changedFields.push('Scale factor');
+    notes.push('Se normalizó scale factor a 100.');
+  }
+  if(!Number.isInteger(suggested.mdb_decimal_places) || suggested.mdb_decimal_places<0){
+    suggested.mdb_decimal_places=2;
+    changedFields.push('Decimal places');
+    notes.push('Se normalizó decimal places a 2.');
+  }
+  if(!Number.isInteger(suggested.mdb_max_response_time) || suggested.mdb_max_response_time<=0){
+    suggested.mdb_max_response_time=5;
+    changedFields.push('Max response time');
+    notes.push('Se normalizó max response time a 5.');
+  }
+
+  return {
+    suggested,
+    changedFields:[...new Set(changedFields)],
+    notes
+  };
+}
+
+async function suggestMachineTechnicalConfig(id){
+  const machineState=(allMachines||[]).find(m=>Number(m.id)===Number(id))||{};
+  if(!machineState?.online){
+    setMachineTechnicalSuggestStatus('La máquina está offline. El modo asistido necesita un snapshot remoto para comparar el último SETUP MDB.','warn');
+    return;
+  }
+  const btn=document.getElementById('mtSuggestBtn');
+  try{
+    if(btn){btn.disabled=true;btn.textContent='Sugiriendo...';}
+    setMachineTechnicalSuggestStatus('Pidiendo un snapshot remoto a la máquina para comparar el último SETUP MDB...','info');
+    const current=readMachineTechnicalConfigForm();
+    const result=await requestMachineDiagnosticsSnapshotInline(id);
+    const suggestion=suggestMachineTechnicalConfigFromSnapshot(current,result);
+    if(suggestion.changedFields.length){
+      writeMachineTechnicalConfigForm(suggestion.suggested);
+      setMachineTechnicalSuggestStatus(`Se precargaron sugerencias en: ${suggestion.changedFields.join(', ')}. ${suggestion.notes.join(' ')}`,'ok');
+    }else{
+      setMachineTechnicalSuggestStatus(`No hizo falta cambiar valores. ${suggestion.notes.join(' ')}`,'info');
+    }
+  }catch(e){
+    setMachineTechnicalSuggestStatus(e.message||'No se pudo calcular la sugerencia asistida.','error');
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='Sugerir según último SETUP MDB';}
+  }
+}
+
+async function openMachineTechnicalConfig(id){
+  if(!canManageMachineTechnicalConfig()){alert('Este rol no puede editar configuración técnica.');return;}
+  try{
+    const data=await api('GET',`/api/machines/${id}/technical-config`);
+    const machine=data.machine||{};
+    const cfg=data.technical_config||{};
+    const machineState=(allMachines||[]).find(m=>Number(m.id)===Number(id))||{};
+    openModal(`Config técnica: ${machine.name||'Máquina'}`,`
+      <div style="font-size:12px;color:var(--tx2);line-height:1.45;margin-bottom:14px">
+        Esta configuración se reserva para instalación y compatibilidad MDB. No aparece para roles gerenciales.
+      </div>
+      <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-bottom:14px">
+        Usá <strong>Diag</strong> para ver el modo asistido: compara el último SETUP real del VMC con esta configuración antes de tocar parámetros finos.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <button type="button" class="btn btn-ghost btn-sm" id="mtSuggestBtn" onclick="suggestMachineTechnicalConfig(${id})" ${machineState?.online?'':'disabled title="La máquina debe estar online para pedir un snapshot remoto"'}>Sugerir según último SETUP MDB</button>
+        <div style="font-size:11px;color:var(--tx3)">${machineState?.online?'La máquina está online.':'La máquina está offline; el modo asistido necesita conexión.'}</div>
+      </div>
+      <div id="mtSuggestStatus" style="display:none;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.45;margin-bottom:14px"></div>
+      <div class="field-row">
+        <div class="field"><label>Precio humano *</label><input id="mtPrice" type="number" min="1" step="1" value="${Number(cfg.price_cents||1200)}" placeholder="1200"></div>
+        <div class="field">
+          <label>Perfil MDB *</label>
+          <select id="mtProfile">
+            <option value="rubino_half_credit" ${(cfg.pricing_profile||'rubino_half_credit')==='rubino_half_credit'?'selected':''}>Rubino half credit</option>
+            <option value="identity" ${(cfg.pricing_profile||'')==='identity'?'selected':''}>Identity</option>
+          </select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Feature level</label><input id="mtFeature" type="number" min="0" max="255" step="1" value="${Number(cfg.mdb_feature_level??1)}"></div>
+        <div class="field"><label>Country code MDB</label><input id="mtCountry" value="${formatMachineTechnicalCountryCode(cfg.mdb_country_code)}" placeholder="0x0032"></div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-top:-4px;margin-bottom:12px">
+        El country code se guarda en valor raw MDB. Ejemplo: <code>0x0032</code> para Argentina.
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Scale factor</label><input id="mtScale" type="number" min="0" max="255" step="1" value="${Number(cfg.mdb_scale_factor??100)}"></div>
+        <div class="field"><label>Decimal places</label><input id="mtDecimals" type="number" min="0" max="255" step="1" value="${Number(cfg.mdb_decimal_places??2)}"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Max response time</label><input id="mtResp" type="number" min="0" max="255" step="1" value="${Number(cfg.mdb_max_response_time??5)}"></div>
+        <div class="field"><label>Misc options</label><input id="mtMisc" type="number" min="0" max="255" step="1" value="${Number(cfg.mdb_misc_options??0)}"></div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-top:-4px;margin-bottom:12px">
+        Si la máquina está online y no tiene otro comando pendiente, la nueva configuración se envía automáticamente sin reinicio.
+      </div>
+      <div class="err-banner" id="mtErr"></div>
+    `,`saveMachineTechnicalConfig(${id})`);
+  }catch(e){
+    alert('Error: '+e.message);
+  }
+}
+
+async function saveMachineTechnicalConfig(id){
+  const price=parseInt(document.getElementById('mtPrice')?.value||'0',10);
+  const feature=parseInt(document.getElementById('mtFeature')?.value||'',10);
+  const country=parseMachineTechnicalCountryCode(document.getElementById('mtCountry')?.value||'');
+  const scale=parseInt(document.getElementById('mtScale')?.value||'',10);
+  const decimals=parseInt(document.getElementById('mtDecimals')?.value||'',10);
+  const responseTime=parseInt(document.getElementById('mtResp')?.value||'',10);
+  const misc=parseInt(document.getElementById('mtMisc')?.value||'',10);
+  const profile=document.getElementById('mtProfile')?.value||'';
+
+  if(!Number.isInteger(price) || price<=0){showModalErr('mtErr','El precio humano debe ser un entero mayor a cero.');return;}
+  if(!['rubino_half_credit','identity'].includes(profile)){showModalErr('mtErr','El perfil MDB es inválido.');return;}
+  if(!Number.isInteger(feature) || feature<0 || feature>255){showModalErr('mtErr','Feature level fuera de rango (0-255).');return;}
+  if(!Number.isInteger(country) || country<0 || country>65535){showModalErr('mtErr','Country code MDB inválido. Usá decimal o formato 0xNNNN.');return;}
+  if(!Number.isInteger(scale) || scale<0 || scale>255){showModalErr('mtErr','Scale factor fuera de rango (0-255).');return;}
+  if(!Number.isInteger(decimals) || decimals<0 || decimals>255){showModalErr('mtErr','Decimal places fuera de rango (0-255).');return;}
+  if(!Number.isInteger(responseTime) || responseTime<0 || responseTime>255){showModalErr('mtErr','Max response time fuera de rango (0-255).');return;}
+  if(!Number.isInteger(misc) || misc<0 || misc>255){showModalErr('mtErr','Misc options fuera de rango (0-255).');return;}
+
+  try{
+    const d=await api('PATCH',`/api/machines/${id}/technical-config`,{
+      price_cents:price,
+      pricing_profile:profile,
+      mdb_feature_level:feature,
+      mdb_country_code:`0x${country.toString(16).toUpperCase().padStart(4,'0')}`,
+      mdb_scale_factor:scale,
+      mdb_decimal_places:decimals,
+      mdb_max_response_time:responseTime,
+      mdb_misc_options:misc
+    });
+    closeModal();
+    loadMachines();
+    if(d.config_sync==='queued'){
+      alert('Configuración técnica actualizada. La sincronización remota quedó encolada para esta máquina.');
+    }else if(d.config_sync==='pending_reconnect'){
+      alert('Configuración técnica actualizada. La máquina está offline; se aplicará al reconectarse.');
+    }else if(d.config_sync==='queued_command_exists'){
+      alert('Configuración técnica actualizada. Ya había otro comando pendiente; si no llega una sincronización remota, la máquina tomará esta configuración al reconectarse.');
+    }else{
+      alert('Configuración técnica actualizada.');
+    }
+  }catch(e){showModalErr('mtErr',e.message);}
+}
+
 // ══════════════════════════════════════════════════════
 //  EMPLEADOS
 // ══════════════════════════════════════════════════════
@@ -2895,7 +3339,7 @@ async function showEmployeeDetail(id){
   try{
     const d=await api('GET',`/api/employees/${id}`);
     const e=d.employee;
-    const machRows=(d.machines_this_month||[]).map(m=>`<tr><td>${m.machine_name}</td><td>${m.location||'—'}</td><td>${m.taps_count}</td><td>$${Math.round((m.spent_cents||0)/100).toLocaleString('es-AR')}</td></tr>`).join('');
+    const machRows=(d.machines_this_month||[]).map(m=>`<tr><td>${m.machine_name}</td><td>${m.location||'—'}</td><td>${m.taps_count}</td><td>${formatReportMoney(m.spent_cents||0)}</td></tr>`).join('');
     const tapRows=(d.recent_taps||[]).map(t=>`<tr><td>${t.machine_name}</td><td style="color:${t.approved?'var(--txs)':'var(--txd)'}">${t.approved?'✓':'✕'}</td><td style="font-size:11px;color:var(--tx3)">${new Date(t.tapped_at).toLocaleString('es-AR')}</td></tr>`).join('');
     const empId=e.id;
     const cardRows=(e.nfc_cards||[]).map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--br)">
@@ -3231,7 +3675,7 @@ function reportQueryString(extraParams={}){
 }
 
 function formatReportMoney(cents){
-  return '$'+Math.round((Number(cents)||0)/100).toLocaleString('es-AR');
+  return '$'+Math.round(Number(cents)||0).toLocaleString('es-AR');
 }
 
 function formatReportInt(value){
@@ -3574,8 +4018,8 @@ function reportSectionExcelValue(row,column){
   const raw=reportSectionValue(row,column);
   if(raw===null || raw===undefined || raw==='') return '';
   if(column.type==='currency'){
-    const cents=Number(raw);
-    return Number.isFinite(cents) ? cents/100 : '';
+    const amount=Number(raw);
+    return Number.isFinite(amount) ? amount : '';
   }
   if(column.type==='number'){
     const num=Number(raw);
@@ -5086,7 +5530,7 @@ function renderLive(){
         ${t.nfc_uid?`<div style="font-size:10px;color:var(--tx3);font-family:monospace;margin-top:1px">${t.nfc_uid}</div>`:''}
       </div>
       <div style="text-align:right;flex-shrink:0">
-        <div style="font-size:12px;color:${col}">${ok&&t.amount_cents?'$'+Math.round(t.amount_cents/100).toLocaleString('es-AR'):ok?'OK':'Rechazado'}</div>
+        <div style="font-size:12px;color:${col}">${ok&&t.amount_cents?formatReportMoney(t.amount_cents):ok?'OK':'Rechazado'}</div>
         <div style="font-size:10px;color:var(--tx3)">${hora}</div>
       </div>
     </div>`;

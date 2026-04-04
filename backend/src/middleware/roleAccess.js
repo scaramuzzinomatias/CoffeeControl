@@ -2,6 +2,7 @@ const {
     isManagerRole,
     isTechnicalRole,
     canManageMachineSetup,
+    canManageMachineTechnicalConfig,
     canOperateMachines,
     canOperateCards,
     canViewAnalytics
@@ -22,6 +23,11 @@ function requireMachineSetup(req, res, next) {
     return res.status(403).json({ error: 'Acceso solo para gerente/admin/distribuidor' });
 }
 
+function requireMachineTechnicalConfig(req, res, next) {
+    if (canManageMachineTechnicalConfig(req.user?.role)) return next();
+    return res.status(403).json({ error: 'Acceso solo para admin/técnico/distribuidor' });
+}
+
 function requireCardOperator(req, res, next) {
     if (canOperateCards(req.user?.role)) return next();
     return res.status(403).json({ error: 'Acceso solo para gerente/admin/técnico/distribuidor' });
@@ -38,6 +44,7 @@ module.exports = {
     requireManager,
     requireMachineOperator,
     requireMachineSetup,
+    requireMachineTechnicalConfig,
     requireCardOperator,
     requireAnalyticsViewer,
 };

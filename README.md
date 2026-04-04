@@ -269,6 +269,10 @@ El precio del café ahora se maneja como un valor **humano** por máquina:
 - panel admin: edición como `1200`, `1500`, etc.
 - portal del ESP32-C3: edición del mismo valor humano
 - firmware: conversión interna automática a las unidades MDB que requiere la máquina actual
+- configuración técnica avanzada: `pricing_profile`, `mdb_feature_level`, `mdb_country_code`, `mdb_scale_factor`, `mdb_decimal_places`, `mdb_max_response_time`, `mdb_misc_options`
+- soporte asistido en panel:
+  - `Máquinas > Diag` muestra `Compatibilidad asistida` comparando el último `SETUP MDB` capturado contra la config técnica actual
+  - `Máquinas > Config técnica` ofrece `Sugerir según último SETUP MDB` para precargar valores conservadores sin guardarlos automáticamente
 
 Si el precio cambia desde `Máquinas`:
 
@@ -277,6 +281,12 @@ Si el precio cambia desde `Máquinas`:
 - si ya había otro comando pendiente, el panel avisa que la sincronización remota quedó diferida
 
 El operador nunca tiene que cargar el valor técnico MDB interno.
+
+La configuración técnica avanzada quedó separada del flujo gerencial:
+
+- visible/editable solo para `admin`, `tecnico` y `distribuidor`
+- `gerente` y `supervisor` no ven ni editan parámetros MDB finos
+- el backend sigue siendo la fuente principal de la configuración técnica y el portal local queda como herramienta de recuperación/onboarding
 
 ### Diagnóstico rápido en el ESP32-C3
 
@@ -638,13 +648,13 @@ POST /api/auth/login          { username, password } → { token, role }
 POST /api/tap                 { nfc_uid } → 200 | 403 | 401
 POST /api/tap/confirm         { nfc_uid, item_id, amount }
 POST /api/tap/cancel          { nfc_uid }
-POST /api/machines/register   { mac, price_cents?, pricing_profile? } → 200 | 202 (pendiente)
+POST /api/machines/register   { mac, price_cents?, pricing_profile?, mdb_feature_level?, mdb_country_code?, mdb_scale_factor?, mdb_decimal_places?, mdb_max_response_time?, mdb_misc_options? } → 200 | 202 (pendiente)
 ```
 
 Notas:
 
-- `POST /api/machines/register` devuelve la configuración efectiva aprobada por backend, incluyendo `config.price_cents`
-- cuando cambia el precio de una máquina desde el panel, el backend puede encolar un `config_update` para que el ESP lo aplique sin recompilar
+- `POST /api/machines/register` devuelve la configuración efectiva aprobada por backend, incluyendo precio humano, perfil MDB y parámetros técnicos
+- cuando cambia el precio o la configuración técnica de una máquina desde el backend, se puede encolar un `config_update` completo para que el ESP lo aplique sin recompilar
 
 ### Panel admin (auth JWT — header Authorization: Bearer token)
 ```
@@ -658,6 +668,8 @@ GET  /api/machines/pending
 POST /api/machines/pending/:id/approve  { name, location, price_cents }
 POST /api/machines                      { name, location, mac, price_cents }
 PATCH /api/machines/:id                { name?, location?, price_cents? } → { machine, config_sync }
+GET  /api/machines/:id/technical-config
+PATCH /api/machines/:id/technical-config { price_cents?, pricing_profile?, mdb_feature_level?, mdb_country_code?, mdb_scale_factor?, mdb_decimal_places?, mdb_max_response_time?, mdb_misc_options? }
 POST /api/machines/:id/block    { reason }
 POST /api/machines/:id/unblock
 

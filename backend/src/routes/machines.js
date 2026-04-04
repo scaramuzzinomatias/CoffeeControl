@@ -1,13 +1,40 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { broadcast } = require('../ws');
-const { requireManager, requireMachineOperator, requireMachineSetup } = require('../middleware/roleAccess');
+const {
+    requireManager,
+    requireMachineOperator,
+    requireMachineSetup,
+    requireMachineTechnicalConfig
+} = require('../middleware/roleAccess');
 const alerts = require('../services/alerts');
 const audit = require('../services/audit');
 const stock = require('../services/stock');
 
 const router = express.Router();
 const MACHINE_ONLINE_WINDOW_MS = 180000;
+const DEFAULT_MACHINE_TECH_CONFIG = Object.freeze({
+    price_cents: 1200,
+    pricing_profile: 'rubino_half_credit',
+    mdb_feature_level: 1,
+    mdb_country_code: 50,
+    mdb_scale_factor: 100,
+    mdb_decimal_places: 2,
+    mdb_max_response_time: 5,
+    mdb_misc_options: 0
+});
+const MACHINE_TECH_CONFIG_FIELDS = Object.freeze([
+    'price_cents',
+    'pricing_profile',
+    'mdb_feature_level',
+    'mdb_country_code',
+    'mdb_scale_factor',
+    'mdb_decimal_places',
+    'mdb_max_response_time',
+    'mdb_misc_options'
+]);
+const MACHINE_TECH_CONFIG_SQL = MACHINE_TECH_CONFIG_FIELDS.join(', ');
+const MACHINE_TECH_CONFIG_SELECT = `id, name, location, last_seen, ${MACHINE_TECH_CONFIG_SQL}`;
 
 function isMachineOnline(lastSeen) {
     if (!lastSeen) return false;
@@ -33,9 +60,160 @@ function normalizePositiveInteger(value) {
     return parsed > 0 ? parsed : null;
 }
 
+function normalizePricingProfile(value) {
+    if (typeof value !== 'string') return null;
+    const profile = value.trim();
+    if (!profile) return null;
+    return ['rubino_half_credit', 'identity'].includes(profile) ? profile : null;
+}
+
+function normalizeByteValue(value) {
+    const parsed = normalizeOptionalInteger(value);
+    if (parsed === null) return null;
+    return parsed >= 0 && parsed <= 255 ? parsed : null;
+}
+
+function normalizeWordValue(value) {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'number') {
+        return Number.isInteger(value) && value >= 0 && value <= 65535 ? value : null;
+    }
+
+    const raw = String(value).trim();
+    if (!raw) return null;
+    let parsed = null;
+    if (/^0x[0-9a-f]+$/i.test(raw)) {
+        parsed = Number.parseInt(raw, 16);
+    } else if (/^\d+$/.test(raw)) {
+        parsed = Number.parseInt(raw, 10);
+    }
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) return null;
+    return parsed;
+}
+
 function parseMachineId(value) {
     const parsed = parseInt(value, 10);
     return Number.isInteger(parsed) ? parsed : null;
+}
+
+function buildMachineTechnicalConfig(machine) {
+    return {
+        price_cents: Number(machine?.price_cents || DEFAULT_MACHINE_TECH_CONFIG.price_cents),
+        pricing_profile: normalizePricingProfile(machine?.pricing_profile) || DEFAULT_MACHINE_TECH_CONFIG.pricing_profile,
+        mdb_feature_level: Number(machine?.mdb_feature_level ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_feature_level),
+        mdb_country_code: Number(machine?.mdb_country_code ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_country_code),
+        mdb_scale_factor: Number(machine?.mdb_scale_factor ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_scale_factor),
+        mdb_decimal_places: Number(machine?.mdb_decimal_places ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_decimal_places),
+        mdb_max_response_time: Number(machine?.mdb_max_response_time ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_max_response_time),
+        mdb_misc_options: Number(machine?.mdb_misc_options ?? DEFAULT_MACHINE_TECH_CONFIG.mdb_misc_options)
+    };
+}
+
+function machineTechnicalConfigChanged(previousMachine, updatedMachine) {
+    const previous = buildMachineTechnicalConfig(previousMachine);
+    const next = buildMachineTechnicalConfig(updatedMachine);
+    return MACHINE_TECH_CONFIG_FIELDS.some(field => previous[field] !== next[field]);
+}
+
+async function syncMachineTechnicalConfig({ req, previousMachine, updatedMachine }) {
+    if (!machineTechnicalConfigChanged(previousMachine, updatedMachine)) {
+        return 'unchanged';
+    }
+
+    const existing = await pool.query(
+        `SELECT id
+         FROM machine_commands
+         WHERE machine_id = $1
+           AND status = 'queued'
+         ORDER BY queued_at DESC
+         LIMIT 1`,
+        [updatedMachine.id]
+    );
+
+    if (existing.rowCount > 0) {
+        return 'queued_command_exists';
+    }
+
+    if (!isMachineOnline(updatedMachine.last_seen)) {
+        return 'pending_reconnect';
+    }
+
+    await queueMachineCommand({
+        machineId: updatedMachine.id,
+        machineName: updatedMachine.name,
+        commandType: 'config_update',
+        payload: buildMachineTechnicalConfig(updatedMachine),
+        req
+    });
+    return 'queued';
+}
+
+function parseTechnicalConfigBody(body = {}) {
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(body, key);
+    const patch = {};
+    let touched = false;
+
+    if (hasOwn('price_cents')) {
+        const value = normalizePositiveInteger(body.price_cents);
+        if (value === null) throw new Error('price_cents inválido');
+        patch.price_cents = value;
+        touched = true;
+    }
+
+    if (hasOwn('pricing_profile')) {
+        const value = normalizePricingProfile(body.pricing_profile);
+        if (!value) throw new Error('pricing_profile inválido');
+        patch.pricing_profile = value;
+        touched = true;
+    }
+
+    if (hasOwn('mdb_feature_level')) {
+        const value = normalizeByteValue(body.mdb_feature_level);
+        if (value === null) throw new Error('mdb_feature_level inválido');
+        patch.mdb_feature_level = value;
+        touched = true;
+    }
+
+    if (hasOwn('mdb_country_code')) {
+        const value = normalizeWordValue(body.mdb_country_code);
+        if (value === null) throw new Error('mdb_country_code inválido');
+        patch.mdb_country_code = value;
+        touched = true;
+    }
+
+    if (hasOwn('mdb_scale_factor')) {
+        const value = normalizeByteValue(body.mdb_scale_factor);
+        if (value === null) throw new Error('mdb_scale_factor inválido');
+        patch.mdb_scale_factor = value;
+        touched = true;
+    }
+
+    if (hasOwn('mdb_decimal_places')) {
+        const value = normalizeByteValue(body.mdb_decimal_places);
+        if (value === null) throw new Error('mdb_decimal_places inválido');
+        patch.mdb_decimal_places = value;
+        touched = true;
+    }
+
+    if (hasOwn('mdb_max_response_time')) {
+        const value = normalizeByteValue(body.mdb_max_response_time);
+        if (value === null) throw new Error('mdb_max_response_time inválido');
+        patch.mdb_max_response_time = value;
+        touched = true;
+    }
+
+    if (hasOwn('mdb_misc_options')) {
+        const value = normalizeByteValue(body.mdb_misc_options);
+        if (value === null) throw new Error('mdb_misc_options inválido');
+        patch.mdb_misc_options = value;
+        touched = true;
+    }
+
+    if (!touched) {
+        throw new Error('Sin cambios de configuración técnica');
+    }
+
+    return patch;
 }
 
 async function queueMachineCommand({ machineId, machineName, commandType, payload, req }) {
@@ -148,7 +326,7 @@ router.post('/register', async (req, res) => {
     const wifiSsid = normalizeOptionalString(wifi_ssid, 64);
     const backendUrl = normalizeOptionalString(backend_url, 255);
     const reportedPriceCents = normalizePositiveInteger(price_cents);
-    const pricingProfile = normalizeOptionalString(pricing_profile, 40);
+    const pricingProfile = normalizePricingProfile(pricing_profile);
     const wifiRssi = normalizeOptionalInteger(wifi_rssi);
     const wifiIp = normalizeOptionalString(wifi_ip, 45);
     const backendOk = typeof backend_ok === 'boolean' ? backend_ok : null;
@@ -156,22 +334,25 @@ router.post('/register', async (req, res) => {
 
     try {
         const approved = await pool.query(
-            'SELECT id, name, price_cents FROM machines WHERE mac = $1 AND active = true',
+            `SELECT id, name, ${MACHINE_TECH_CONFIG_SQL}
+             FROM machines
+             WHERE mac = $1
+               AND active = true`,
             [macClean]
         );
 
         if (approved.rowCount > 0) {
             const updateResult = await pool.query(
                 `UPDATE machines
-                 SET last_seen = NOW(),
-                     wifi_ssid = COALESCE($2, wifi_ssid),
-                     backend_url = COALESCE($3, backend_url),
+                SET last_seen = NOW(),
+                    wifi_ssid = COALESCE($2, wifi_ssid),
+                    backend_url = COALESCE($3, backend_url),
                      wifi_rssi = COALESCE($4, wifi_rssi),
                      wifi_ip = COALESCE($5, wifi_ip),
                      backend_ok = COALESCE($6, backend_ok),
                      backend_error = $7
                  WHERE mac = $1
-                 RETURNING id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, backend_ok, backend_error, price_cents`,
+                 RETURNING id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, backend_ok, backend_error, ${MACHINE_TECH_CONFIG_SQL}`,
                 [macClean, wifiSsid, backendUrl, wifiRssi, wifiIp, backendOk, backendError]
             );
             const machineState = updateResult.rows[0];
@@ -179,10 +360,11 @@ router.post('/register', async (req, res) => {
             return res.status(200).json({
                 status: 'approved',
                 machine: approved.rows[0].name,
-                config: {
-                    price_cents: Number(machineState.price_cents || reportedPriceCents || 1200),
-                    pricing_profile: pricingProfile || 'rubino_half_credit'
-                }
+                config: buildMachineTechnicalConfig({
+                    ...machineState,
+                    price_cents: machineState.price_cents || reportedPriceCents || DEFAULT_MACHINE_TECH_CONFIG.price_cents,
+                    pricing_profile: machineState.pricing_profile || pricingProfile || DEFAULT_MACHINE_TECH_CONFIG.pricing_profile
+                })
             });
         }
 
@@ -339,6 +521,103 @@ router.post('/', requireManager, async (req, res) => {
     }
 });
 
+router.get('/:id/technical-config', requireMachineTechnicalConfig, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+             FROM machines
+             WHERE id = $1`,
+            [req.params.id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
+        const machine = result.rows[0];
+        res.json({
+            machine: {
+                id: machine.id,
+                name: machine.name,
+                location: machine.location
+            },
+            technical_config: buildMachineTechnicalConfig(machine)
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req, res) => {
+    let patch;
+    try {
+        patch = parseTechnicalConfigBody(req.body || {});
+    } catch (err) {
+        return res.status(400).json({ error: err.message });
+    }
+
+    try {
+        const before = await pool.query(
+            `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+             FROM machines
+             WHERE id = $1`,
+            [req.params.id]
+        );
+        if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
+
+        const previousMachine = before.rows[0];
+        const result = await pool.query(
+            `UPDATE machines
+             SET price_cents = COALESCE($1, price_cents),
+                 pricing_profile = COALESCE($2, pricing_profile),
+                 mdb_feature_level = COALESCE($3, mdb_feature_level),
+                 mdb_country_code = COALESCE($4, mdb_country_code),
+                 mdb_scale_factor = COALESCE($5, mdb_scale_factor),
+                 mdb_decimal_places = COALESCE($6, mdb_decimal_places),
+                 mdb_max_response_time = COALESCE($7, mdb_max_response_time),
+                 mdb_misc_options = COALESCE($8, mdb_misc_options)
+             WHERE id = $9
+             RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
+            [
+                patch.price_cents,
+                patch.pricing_profile,
+                patch.mdb_feature_level,
+                patch.mdb_country_code,
+                patch.mdb_scale_factor,
+                patch.mdb_decimal_places,
+                patch.mdb_max_response_time,
+                patch.mdb_misc_options,
+                req.params.id
+            ]
+        );
+
+        const updatedMachine = result.rows[0];
+        const configSync = await syncMachineTechnicalConfig({ req, previousMachine, updatedMachine });
+
+        await audit.logAuditEvent({
+            req,
+            action: 'machine.update_technical_config',
+            entityType: 'machine',
+            entityId: updatedMachine.id,
+            entityLabel: updatedMachine.name,
+            summary: `Actualizó la configuración técnica de ${updatedMachine.name}`,
+            details: {
+                before: buildMachineTechnicalConfig(previousMachine),
+                after: buildMachineTechnicalConfig(updatedMachine),
+                config_sync: configSync
+            }
+        });
+
+        res.json({
+            machine: {
+                id: updatedMachine.id,
+                name: updatedMachine.name,
+                location: updatedMachine.location
+            },
+            technical_config: buildMachineTechnicalConfig(updatedMachine),
+            config_sync: configSync
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 router.patch('/:id', requireMachineSetup, async (req, res) => {
     const { name, location, price_cents } = req.body;
     const priceCents = price_cents === undefined ? undefined : normalizePositiveInteger(price_cents);
@@ -347,46 +626,24 @@ router.patch('/:id', requireMachineSetup, async (req, res) => {
     }
     try {
         const before = await pool.query(
-            'SELECT id, name, location, price_cents, last_seen FROM machines WHERE id = $1',
+            `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+             FROM machines
+             WHERE id = $1`,
             [req.params.id]
         );
         if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         const previousMachine = before.rows[0];
         const result = await pool.query(
-            'UPDATE machines SET name = COALESCE($1, name), location = COALESCE($2, location), price_cents = COALESCE($3, price_cents) WHERE id = $4 RETURNING *',
+            `UPDATE machines
+             SET name = COALESCE($1, name),
+                 location = COALESCE($2, location),
+                 price_cents = COALESCE($3, price_cents)
+             WHERE id = $4
+             RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
             [name, location, priceCents, req.params.id]
         );
         const updatedMachine = result.rows[0];
-        let configSync = 'unchanged';
-
-        if (priceCents !== undefined && Number(previousMachine.price_cents) !== Number(updatedMachine.price_cents)) {
-            const existing = await pool.query(
-                `SELECT id
-                 FROM machine_commands
-                 WHERE machine_id = $1
-                   AND status = 'queued'
-                 ORDER BY queued_at DESC
-                 LIMIT 1`,
-                [updatedMachine.id]
-            );
-
-            if (existing.rowCount > 0) {
-                configSync = 'queued_command_exists';
-            } else if (isMachineOnline(updatedMachine.last_seen)) {
-                await queueMachineCommand({
-                    machineId: updatedMachine.id,
-                    machineName: updatedMachine.name,
-                    commandType: 'config_update',
-                    payload: {
-                        price_cents: Number(updatedMachine.price_cents)
-                    },
-                    req
-                });
-                configSync = 'queued';
-            } else {
-                configSync = 'pending_reconnect';
-            }
-        }
+        const configSync = await syncMachineTechnicalConfig({ req, previousMachine, updatedMachine });
 
         await audit.logAuditEvent({
             req,

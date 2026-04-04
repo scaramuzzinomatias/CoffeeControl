@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 03/04/2026 — ya quedó iniciada la etapa `DeviceConfig + PricingConfig` en `CoffeeControl_v3`: se limpió el ruido MDB, el portal ya guarda precio humano editable (`1200`), el backend ya persiste `machines.price_cents`, el registro de máquina devuelve la config efectiva y el panel puede editar precio con sincronización remota (`config_update`) cuando la máquina está online. Además ya quedó implementado un `event log` compacto de 64 entradas en RAM, accesible por `GET /diag/events` cuando el portal del ESP está activo, la cola offline ya migró a journal append-only (`/queue.log`) con migración automática desde `queue.json`, el firmware ya corre con `task watchdog` conservador de `20s` sobre `loopTask` + tarea MDB, la UI del portal ya fue desacoplada del `main.cpp` hacia `CoffeeControl_v3/data/portal/` con fallback mínimo si falta `uploadfs`, ya existe captura de `SETUP` MDB como hint de compatibilidad disponible en `GET /diag/mdb`, y el runtime MDB principal ahora quedó consolidado en una sola estructura `MdbRuntimeState` sin cambiar todavía la secuencia visible del protocolo. El timing MDB sigue fuera del bloque inicial. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
+> Última actualización: 04/04/2026 — el firmware ya quedó validado en una Rubino real con venta completa y precio humano correcto (`1200` backend vs `600` interno MDB cuando aplica el perfil `rubino_half_credit`). Además ya quedó implementada la configuración técnica remota integral por máquina: backend, tests y panel admin con visibilidad restringida a `admin`, `tecnico` y `distribuidor`. El portal sigue desacoplado en `LittleFS`, el `event log` compacto sigue disponible por `GET /diag/events`, el snapshot de `SETUP` MDB sigue en `GET /diag/mdb`, la cola offline ya usa journal append-only y el watchdog conservador de `20s` sigue activo sobre `loopTask` + tarea MDB. El timing MDB continúa fuera del bloque inicial. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
 >
 > **Punto de restauración general:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 >
@@ -24,6 +24,9 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 - Estado actual: `offline_queue.*` ya agregado con journal append-only y compactación post-flush
 - Estado actual: watchdog ya agregado con reset reason visible al boot
 - Estado actual: portal con botones `Ver eventos` / `Ver setup MDB` y snapshot remoto `diagnostics_snapshot` disponible desde panel/backend para usuarios técnicos
+- Estado actual: el panel técnico ya muestra `Compatibilidad asistida` en `Máquinas > Diag` y permite precargar sugerencias en `Config técnica` con `Sugerir según último SETUP MDB`, sin autoaplicar nada
+- Estado actual: Rubino validada en campo con `VEND_REQUEST` / `VEND_SUCCESS` / `VEND_END` completos y persistencia humana correcta en backend
+- Estado actual: configuración técnica avanzada de máquina disponible solo para `admin`, `tecnico` y `distribuidor`
 
 ### Hardware por máquina (v2 — target de producción)
 - **Microcontrolador:** ESP32-C3 Super Mini — ~$2-3 USD

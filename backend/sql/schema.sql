@@ -59,6 +59,13 @@ CREATE TABLE machines (
     location    VARCHAR(100),
     secret      VARCHAR(64) NOT NULL,         -- X-Machine-Secret del firmware
     price_cents INT NOT NULL DEFAULT 1200,    -- precio humano configurable por máquina
+    pricing_profile VARCHAR(40) NOT NULL DEFAULT 'rubino_half_credit',
+    mdb_feature_level SMALLINT NOT NULL DEFAULT 1,
+    mdb_country_code INT NOT NULL DEFAULT 50, -- raw 0x0032 (Argentina)
+    mdb_scale_factor SMALLINT NOT NULL DEFAULT 100,
+    mdb_decimal_places SMALLINT NOT NULL DEFAULT 2,
+    mdb_max_response_time SMALLINT NOT NULL DEFAULT 5,
+    mdb_misc_options SMALLINT NOT NULL DEFAULT 0,
     wifi_ssid   VARCHAR(64),
     backend_url VARCHAR(255),
     wifi_rssi   INT,
@@ -66,7 +73,15 @@ CREATE TABLE machines (
     backend_ok  BOOLEAN,
     backend_error VARCHAR(255),
     active      BOOLEAN NOT NULL DEFAULT true,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (price_cents > 0),
+    CHECK (pricing_profile IN ('rubino_half_credit', 'identity')),
+    CHECK (mdb_feature_level BETWEEN 0 AND 255),
+    CHECK (mdb_country_code BETWEEN 0 AND 65535),
+    CHECK (mdb_scale_factor BETWEEN 0 AND 255),
+    CHECK (mdb_decimal_places BETWEEN 0 AND 255),
+    CHECK (mdb_max_response_time BETWEEN 0 AND 255),
+    CHECK (mdb_misc_options BETWEEN 0 AND 255)
 );
 
 CREATE TABLE alert_events (

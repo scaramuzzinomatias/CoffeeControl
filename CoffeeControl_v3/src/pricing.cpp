@@ -24,6 +24,26 @@ uint32_t pricingSanitizeHumanPrice(uint32_t priceCents) {
     return priceCents;
 }
 
+void pricingNormalizeConfig(PricingConfig& config) {
+    PricingConfig defaults = pricingDefaultConfig();
+    config.priceCents = pricingSanitizeHumanPrice(config.priceCents);
+    if (config.profile != MDB_PRICING_PROFILE_RUBINO_HALF_CREDIT
+        && config.profile != MDB_PRICING_PROFILE_IDENTITY) {
+        config.profile = defaults.profile;
+    }
+}
+
+bool pricingEquals(const PricingConfig& a, const PricingConfig& b) {
+    return a.priceCents == b.priceCents
+        && a.profile == b.profile
+        && a.featureLevel == b.featureLevel
+        && a.countryCode == b.countryCode
+        && a.scaleFactor == b.scaleFactor
+        && a.decimalPlaces == b.decimalPlaces
+        && a.maxResponseTime == b.maxResponseTime
+        && a.miscOptions == b.miscOptions;
+}
+
 uint16_t pricingBeginSessionFunds(const PricingConfig& config) {
     uint32_t humanPrice = pricingSanitizeHumanPrice(config.priceCents);
 
@@ -69,4 +89,13 @@ const char* pricingProfileCode(uint8_t profile) {
         default:
             return "unknown";
     }
+}
+
+uint8_t pricingProfileFromCode(const String& profileCode, uint8_t fallbackProfile) {
+    String code = profileCode;
+    code.trim();
+    code.toLowerCase();
+    if (code == "rubino_half_credit") return MDB_PRICING_PROFILE_RUBINO_HALF_CREDIT;
+    if (code == "identity") return MDB_PRICING_PROFILE_IDENTITY;
+    return fallbackProfile;
 }

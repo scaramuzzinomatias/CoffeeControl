@@ -20,8 +20,11 @@ struct PricingConfig {
 
 PricingConfig pricingDefaultConfig();
 uint32_t pricingSanitizeHumanPrice(uint32_t priceCents);
+void pricingNormalizeConfig(PricingConfig& config);
+bool pricingEquals(const PricingConfig& a, const PricingConfig& b);
 uint16_t pricingBeginSessionFunds(const PricingConfig& config);
 uint16_t pricingDefaultVendAmount(const PricingConfig& config);
 uint32_t pricingMdbAmountToHuman(const PricingConfig& config, uint16_t mdbAmount);
 void pricingBuildSetupConfigResponse(const PricingConfig& config, uint8_t out[7]);
 const char* pricingProfileCode(uint8_t profile);
+uint8_t pricingProfileFromCode(const String& profileCode, uint8_t fallbackProfile);

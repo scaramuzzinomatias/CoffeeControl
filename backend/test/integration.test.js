@@ -612,8 +612,17 @@ test('técnico puede solicitar diagnostics_snapshot remoto y consultar el result
 
 test('registro de máquina devuelve la configuración efectiva de precio desde backend', async () => {
     await withDb(client => client.query(
-        'UPDATE machines SET price_cents = $1 WHERE id = $2',
-        [1450, fixture.machine.id]
+        `UPDATE machines
+         SET price_cents = $1,
+             pricing_profile = $2,
+             mdb_feature_level = $3,
+             mdb_country_code = $4,
+             mdb_scale_factor = $5,
+             mdb_decimal_places = $6,
+             mdb_max_response_time = $7,
+             mdb_misc_options = $8
+         WHERE id = $9`,
+        [1450, 'identity', 2, 0x0032, 100, 2, 6, 1, fixture.machine.id]
     ));
 
     const registration = await requestJson('POST', '/api/machines/register', {
@@ -633,13 +642,31 @@ test('registro de máquina devuelve la configuración efectiva de precio desde b
     assert.equal(registration.status, 200);
     assert.equal(registration.json.status, 'approved');
     assert.equal(registration.json.config.price_cents, 1450);
-    assert.equal(registration.json.config.pricing_profile, 'rubino_half_credit');
+    assert.equal(registration.json.config.pricing_profile, 'identity');
+    assert.equal(registration.json.config.mdb_feature_level, 2);
+    assert.equal(registration.json.config.mdb_country_code, 0x0032);
+    assert.equal(registration.json.config.mdb_scale_factor, 100);
+    assert.equal(registration.json.config.mdb_decimal_places, 2);
+    assert.equal(registration.json.config.mdb_max_response_time, 6);
+    assert.equal(registration.json.config.mdb_misc_options, 1);
 });
 
 test('actualizar precio de máquina encola config_update cuando la máquina está online', async () => {
     await withDb(async (client) => {
         await client.query('DELETE FROM machine_commands WHERE machine_id = $1', [fixture.machine.id]);
-        await client.query('UPDATE machines SET last_seen = NOW() WHERE id = $1', [fixture.machine.id]);
+        await client.query(
+            `UPDATE machines
+             SET last_seen = NOW(),
+                 pricing_profile = 'rubino_half_credit',
+                 mdb_feature_level = 1,
+                 mdb_country_code = 50,
+                 mdb_scale_factor = 100,
+                 mdb_decimal_places = 2,
+                 mdb_max_response_time = 5,
+                 mdb_misc_options = 0
+             WHERE id = $1`,
+            [fixture.machine.id]
+        );
     });
 
     const updated = await requestJson('PATCH', `/api/machines/${fixture.machine.id}`, {
@@ -660,12 +687,92 @@ test('actualizar precio de máquina encola config_update cuando la máquina est�
     assert.equal(next.status, 200);
     assert.equal(next.json.command.type, 'config_update');
     assert.equal(next.json.command.payload.price_cents, 1550);
+    assert.equal(next.json.command.payload.pricing_profile, 'rubino_half_credit');
+    assert.equal(next.json.command.payload.mdb_feature_level, 1);
+    assert.equal(next.json.command.payload.mdb_country_code, 50);
+    assert.equal(next.json.command.payload.mdb_scale_factor, 100);
+    assert.equal(next.json.command.payload.mdb_decimal_places, 2);
+    assert.equal(next.json.command.payload.mdb_max_response_time, 5);
+    assert.equal(next.json.command.payload.mdb_misc_options, 0);
 
     const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
         headers: machineHeaders(fixture.machine.mac),
         body: {
             status: 'completed',
             result: { message: 'price applied' }
+        }
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(ack.json.ok, true);
+});
+
+test('configuración técnica remota solo está disponible para admin/técnico/distribuidor', async () => {
+    const forbidden = await requestJson('GET', `/api/machines/${fixture.machine.id}/technical-config`, {
+        token: managerToken
+    });
+    assert.equal(forbidden.status, 403);
+
+    const visibleForTechnician = await requestJson('GET', `/api/machines/${fixture.machine.id}/technical-config`, {
+        token: technicianToken
+    });
+    assert.equal(visibleForTechnician.status, 200);
+    assert.equal(visibleForTechnician.json.technical_config.price_cents > 0, true);
+
+    const visibleForDistributor = await requestJson('GET', `/api/machines/${fixture.machine.id}/technical-config`, {
+        token: distributorToken
+    });
+    assert.equal(visibleForDistributor.status, 200);
+});
+
+test('técnico puede actualizar configuración técnica completa y encola config_update integral', async () => {
+    await withDb(async (client) => {
+        await client.query('DELETE FROM machine_commands WHERE machine_id = $1', [fixture.machine.id]);
+        await client.query('UPDATE machines SET last_seen = NOW() WHERE id = $1', [fixture.machine.id]);
+    });
+
+    const updated = await requestJson('PATCH', `/api/machines/${fixture.machine.id}/technical-config`, {
+        token: technicianToken,
+        body: {
+            price_cents: 1700,
+            pricing_profile: 'identity',
+            mdb_feature_level: 2,
+            mdb_country_code: '0x0032',
+            mdb_scale_factor: 100,
+            mdb_decimal_places: 2,
+            mdb_max_response_time: 7,
+            mdb_misc_options: 1
+        }
+    });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.json.technical_config.price_cents, 1700);
+    assert.equal(updated.json.technical_config.pricing_profile, 'identity');
+    assert.equal(updated.json.technical_config.mdb_feature_level, 2);
+    assert.equal(updated.json.technical_config.mdb_country_code, 0x0032);
+    assert.equal(updated.json.technical_config.mdb_max_response_time, 7);
+    assert.equal(updated.json.technical_config.mdb_misc_options, 1);
+    assert.equal(updated.json.config_sync, 'queued');
+
+    const next = await requestJson('GET', '/api/machine-control/commands/next', {
+        headers: {
+            'X-Machine-Mac': fixture.machine.mac
+        }
+    });
+    assert.equal(next.status, 200);
+    assert.equal(next.json.command.type, 'config_update');
+    assert.equal(next.json.command.payload.price_cents, 1700);
+    assert.equal(next.json.command.payload.pricing_profile, 'identity');
+    assert.equal(next.json.command.payload.mdb_feature_level, 2);
+    assert.equal(next.json.command.payload.mdb_country_code, 0x0032);
+    assert.equal(next.json.command.payload.mdb_scale_factor, 100);
+    assert.equal(next.json.command.payload.mdb_decimal_places, 2);
+    assert.equal(next.json.command.payload.mdb_max_response_time, 7);
+    assert.equal(next.json.command.payload.mdb_misc_options, 1);
+
+    const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
+        headers: machineHeaders(fixture.machine.mac),
+        body: {
+            status: 'completed',
+            result: { message: 'full config applied' }
         }
     });
     assert.equal(ack.status, 200);

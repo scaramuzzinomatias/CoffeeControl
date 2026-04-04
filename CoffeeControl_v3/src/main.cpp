@@ -350,7 +350,19 @@ String buildDiagnosticsSnapshotJson(uint8_t eventLimit = 20) {
     json += pricingSanitizeHumanPrice(pricingConfig.priceCents);
     json += ",\"pricing_profile\":\"";
     json += pricingProfileCode(pricingConfig.profile);
-    json += "\",\"events\":";
+    json += "\",\"mdb_feature_level\":";
+    json += pricingConfig.featureLevel;
+    json += ",\"mdb_country_code\":";
+    json += pricingConfig.countryCode;
+    json += ",\"mdb_scale_factor\":";
+    json += pricingConfig.scaleFactor;
+    json += ",\"mdb_decimal_places\":";
+    json += pricingConfig.decimalPlaces;
+    json += ",\"mdb_max_response_time\":";
+    json += pricingConfig.maxResponseTime;
+    json += ",\"mdb_misc_options\":";
+    json += pricingConfig.miscOptions;
+    json += ",\"events\":";
     json += eventLogBuildJson(diagEventLog, eventLimit);
     json += ",\"mdb\":";
     json += buildMdbSetupJson();
@@ -442,7 +454,7 @@ bool hasHttpScheme(const String& url) {
 void handleMDB();
 
 void startPortal();
-void saveConfig(const String& ssid, const String& pass, const String& url, uint32_t priceCents);
+void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing);
 uint16_t currentConfiguredHumanPrice();
 
 bool parseUnsignedLongStrict(const String& raw, uint32_t& out) {
@@ -477,21 +489,35 @@ void syncConfiguredPriceToMdbRuntime() {
     mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
 }
 
-bool applyConfiguredPrice(uint32_t priceCents, bool persistToNvs, const char* sourceLabel) {
-    uint32_t sanitized = pricingSanitizeHumanPrice(priceCents);
-    if (sanitized == pricingConfig.priceCents) return false;
+bool applyPricingConfig(const PricingConfig& nextConfigRaw, bool persistToNvs, const char* sourceLabel) {
+    PricingConfig nextConfig = nextConfigRaw;
+    pricingNormalizeConfig(nextConfig);
+    if (pricingEquals(nextConfig, pricingConfig)) return false;
 
-    pricingConfig.priceCents = sanitized;
+    pricingConfig = nextConfig;
     syncConfiguredPriceToMdbRuntime();
 
     if (persistToNvs) {
-        saveConfig(wifiSSID, wifiPass, backendBase, pricingConfig.priceCents);
+        saveConfig(wifiSSID, wifiPass, backendBase, pricingConfig);
     }
 
-    Serial.printf("[CFG] Precio sincronizado desde %s: %u\n",
+    Serial.printf("[CFG] Config tecnica sincronizada desde %s: precio=%u perfil=%s feature=%u country=0x%04X scale=%u decimals=%u resp=%u misc=%u\n",
                   sourceLabel ? sourceLabel : "origen_desconocido",
-                  (unsigned)pricingConfig.priceCents);
+                  (unsigned)pricingConfig.priceCents,
+                  pricingProfileCode(pricingConfig.profile),
+                  (unsigned)pricingConfig.featureLevel,
+                  (unsigned)pricingConfig.countryCode,
+                  (unsigned)pricingConfig.scaleFactor,
+                  (unsigned)pricingConfig.decimalPlaces,
+                  (unsigned)pricingConfig.maxResponseTime,
+                  (unsigned)pricingConfig.miscOptions);
     return true;
+}
+
+bool applyConfiguredPrice(uint32_t priceCents, bool persistToNvs, const char* sourceLabel) {
+    PricingConfig nextConfig = pricingConfig;
+    nextConfig.priceCents = pricingSanitizeHumanPrice(priceCents);
+    return applyPricingConfig(nextConfig, persistToNvs, sourceLabel);
 }
 
 void mdbCommandTask(void*) {
@@ -544,15 +570,15 @@ void readConfig() {
                   pricingProfileCode(pricingConfig.profile));
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& url, uint32_t priceCents) {
+void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing) {
     DeviceConfig config;
     deviceConfigSetDefaults(config, BACKEND_URL);
     config.wifiSSID = ssid;
     config.wifiPass = pass;
     String urlNorm = normalizeBackendUrl(url);
     config.backendBase = urlNorm.length() > 0 ? urlNorm : String(BACKEND_URL);
-    config.pricing = pricingConfig;
-    config.pricing.priceCents = pricingSanitizeHumanPrice(priceCents);
+    config.pricing = pricing;
+    pricingNormalizeConfig(config.pricing);
 
     deviceConfigSave(prefs, config, BACKEND_URL);
     pricingConfig = config.pricing;
@@ -1336,7 +1362,9 @@ void startPortal() {
             return;
         }
 
-        saveConfig(ssid, pass, url, priceValue);
+        PricingConfig nextPricing = pricingConfig;
+        nextPricing.priceCents = priceValue;
+        saveConfig(ssid, pass, url, nextPricing);
         portalServer.send(200, "text/plain", "ok");
         Serial.println("[PORTAL] Config guardada, reiniciando...");
         ledBlink(3, 200);
@@ -1526,12 +1554,18 @@ void registerMachine() {
     http.addHeader("X-Registration-Secret", REGISTRATION_SECRET);
     http.setTimeout(HTTP_TIMEOUT_MS);
 
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(768);
     doc["mac"] = macAddress;
     doc["wifi_ssid"] = wifiSSID;
     doc["backend_url"] = backendBase;
     doc["price_cents"] = pricingSanitizeHumanPrice(pricingConfig.priceCents);
     doc["pricing_profile"] = pricingProfileCode(pricingConfig.profile);
+    doc["mdb_feature_level"] = pricingConfig.featureLevel;
+    doc["mdb_country_code"] = pricingConfig.countryCode;
+    doc["mdb_scale_factor"] = pricingConfig.scaleFactor;
+    doc["mdb_decimal_places"] = pricingConfig.decimalPlaces;
+    doc["mdb_max_response_time"] = pricingConfig.maxResponseTime;
+    doc["mdb_misc_options"] = pricingConfig.miscOptions;
     doc["wifi_rssi"] = WiFi.RSSI();
     doc["wifi_ip"] = WiFi.localIP().toString();
     doc["backend_ok"] = backendReady;
@@ -1546,15 +1580,25 @@ void registerMachine() {
     feedWatchdog();
 
     if (code == 200 && responseBody.length() > 0) {
-        DynamicJsonDocument responseDoc(512);
+        DynamicJsonDocument responseDoc(768);
         DeserializationError err = deserializeJson(responseDoc, responseBody);
         if (!err) {
             JsonObject config = responseDoc["config"].as<JsonObject>();
             if (!config.isNull()) {
+                PricingConfig nextConfig = pricingConfig;
                 uint32_t remotePrice = (uint32_t)(config["price_cents"] | 0);
-                if (remotePrice > 0) {
-                    applyConfiguredPrice(remotePrice, true, "backend/register");
-                }
+                if (remotePrice > 0) nextConfig.priceCents = remotePrice;
+                nextConfig.profile = pricingProfileFromCode(
+                    String((const char*)(config["pricing_profile"] | "")),
+                    nextConfig.profile
+                );
+                nextConfig.featureLevel = (uint8_t)(config["mdb_feature_level"] | nextConfig.featureLevel);
+                nextConfig.countryCode = (uint16_t)(config["mdb_country_code"] | nextConfig.countryCode);
+                nextConfig.scaleFactor = (uint8_t)(config["mdb_scale_factor"] | nextConfig.scaleFactor);
+                nextConfig.decimalPlaces = (uint8_t)(config["mdb_decimal_places"] | nextConfig.decimalPlaces);
+                nextConfig.maxResponseTime = (uint8_t)(config["mdb_max_response_time"] | nextConfig.maxResponseTime);
+                nextConfig.miscOptions = (uint8_t)(config["mdb_misc_options"] | nextConfig.miscOptions);
+                applyPricingConfig(nextConfig, true, "backend/register");
             }
         } else {
             Serial.printf("[REG] JSON invalido en respuesta: %s\n", err.c_str());
@@ -1695,7 +1739,7 @@ bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
         return false;
     }
 
-    saveConfig(nextSSID, nextPass, nextUrl, pricingConfig.priceCents);
+    saveConfig(nextSSID, nextPass, nextUrl, pricingConfig);
     wifiSSID = nextSSID;
     wifiPass = nextPass;
     backendBase = nextUrl;
@@ -1709,13 +1753,62 @@ bool handleRemoteWifiUpdate(uint32_t commandId, JsonObject payload) {
 }
 
 bool handleRemoteConfigUpdate(uint32_t commandId, JsonObject payload) {
-    uint32_t nextPrice = (uint32_t)(payload["price_cents"] | 0);
-    if (nextPrice == 0) {
-        ackRemoteCommand(commandId, "failed", "price_cents remoto invalido");
+    PricingConfig nextConfig = pricingConfig;
+    bool touched = false;
+
+    if (!payload["price_cents"].isNull()) {
+        uint32_t nextPrice = (uint32_t)(payload["price_cents"] | 0);
+        if (nextPrice == 0) {
+            ackRemoteCommand(commandId, "failed", "price_cents remoto invalido");
+            return true;
+        }
+        nextConfig.priceCents = nextPrice;
+        touched = true;
+    }
+
+    if (!payload["pricing_profile"].isNull()) {
+        nextConfig.profile = pricingProfileFromCode(
+            String((const char*)(payload["pricing_profile"] | "")),
+            0xFF
+        );
+        if (nextConfig.profile == 0xFF) {
+            ackRemoteCommand(commandId, "failed", "pricing_profile remoto invalido");
+            return true;
+        }
+        touched = true;
+    }
+
+    if (!payload["mdb_feature_level"].isNull()) {
+        nextConfig.featureLevel = (uint8_t)(payload["mdb_feature_level"] | nextConfig.featureLevel);
+        touched = true;
+    }
+    if (!payload["mdb_country_code"].isNull()) {
+        nextConfig.countryCode = (uint16_t)(payload["mdb_country_code"] | nextConfig.countryCode);
+        touched = true;
+    }
+    if (!payload["mdb_scale_factor"].isNull()) {
+        nextConfig.scaleFactor = (uint8_t)(payload["mdb_scale_factor"] | nextConfig.scaleFactor);
+        touched = true;
+    }
+    if (!payload["mdb_decimal_places"].isNull()) {
+        nextConfig.decimalPlaces = (uint8_t)(payload["mdb_decimal_places"] | nextConfig.decimalPlaces);
+        touched = true;
+    }
+    if (!payload["mdb_max_response_time"].isNull()) {
+        nextConfig.maxResponseTime = (uint8_t)(payload["mdb_max_response_time"] | nextConfig.maxResponseTime);
+        touched = true;
+    }
+    if (!payload["mdb_misc_options"].isNull()) {
+        nextConfig.miscOptions = (uint8_t)(payload["mdb_misc_options"] | nextConfig.miscOptions);
+        touched = true;
+    }
+
+    if (!touched) {
+        ackRemoteCommand(commandId, "failed", "config_update remoto vacio");
         return true;
     }
 
-    bool changed = applyConfiguredPrice(nextPrice, true, "backend/command");
+    bool changed = applyPricingConfig(nextConfig, true, "backend/command");
     if (!ackRemoteCommand(commandId, "completed", changed
         ? "Configuracion aplicada sin reinicio"
         : "Configuracion ya vigente")) {
@@ -1723,7 +1816,7 @@ bool handleRemoteConfigUpdate(uint32_t commandId, JsonObject payload) {
     }
 
     ledBlink(changed ? 3 : 1, 70);
-    logDiagEvent(EVT_REMOTE_CONFIG_APPLIED, changed ? 1 : 0, nextPrice);
+    logDiagEvent(EVT_REMOTE_CONFIG_APPLIED, changed ? 1 : 0, pricingSanitizeHumanPrice(nextConfig.priceCents));
     return true;
 }
 

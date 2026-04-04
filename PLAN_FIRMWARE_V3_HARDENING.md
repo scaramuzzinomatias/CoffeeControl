@@ -153,9 +153,24 @@ Estado actual:
 - el firmware convierte internamente la sesion MDB inicial segun el perfil actual
 - `registerMachine()` ya reporta `price_cents` y `pricing_profile` al backend como preparacion para sync futura
 - backend ya persiste `machines.price_cents` y responde la configuracion efectiva en `POST /api/machines/register`
+- backend ya persiste tambien:
+  - `pricing_profile`
+  - `mdb_feature_level`
+  - `mdb_country_code`
+  - `mdb_scale_factor`
+  - `mdb_decimal_places`
+  - `mdb_max_response_time`
+  - `mdb_misc_options`
 - el panel admin ya permite crear/aprobar/editar maquinas con `price_cents`
 - el backend ya encola `config_update` cuando cambia el precio y la maquina esta online
-- el firmware ya acepta `config_update` para aplicar el nuevo precio sin recompilar
+- el firmware ya acepta `config_update` para aplicar configuracion tecnica completa sin recompilar
+- el panel admin ya expone una vista dedicada de configuracion tecnica solo para `admin`, `tecnico` y `distribuidor`
+- la validacion real sobre Rubino ya confirmo:
+  - `MDB_BEGIN_SESSION`
+  - `MDB_VEND_REQUEST`
+  - `MDB_VEND_SUCCESS`
+  - `MDB_VEND_END`
+- el backend ya registra el importe humano correcto aunque la maquina negocie unidades MDB internas distintas
 - el runtime MDB principal ya fue consolidado en `MdbRuntimeState`
 - ya se migraron a esa estructura:
   - NFC
@@ -342,11 +357,17 @@ Estado actual:
 - eventos nuevos de soporte:
   - `EVT_MDB_SETUP_CONFIG`
   - `EVT_MDB_SETUP_PRICES`
+- el panel admin ya muestra `Compatibilidad asistida` en `Máquinas > Diag`
+- `Config técnica` ya puede pedir un snapshot remoto y precargar sugerencias con el botón `Sugerir según último SETUP MDB`, siempre sin autoaplicar cambios
 
 Regla:
 
 - por ahora se usa solo para diagnóstico
 - no cambia todavía el flujo MDB ni el cálculo efectivo del precio
+- la sugerencia es conservadora:
+  - compara rango de precios MDB vs precio convertido por perfil
+  - compara `VMC level` detectado vs `feature level` configurado
+  - sirve para orientar a técnico/admin, no para que la máquina se reconfigure sola
 
 ### Etapa 6. Watchdog
 
@@ -408,3 +429,25 @@ Cuando se retome:
 - partir desde el tag `firmware-baseline-2026-04-03` si hace falta volver
 - revisar este documento antes de tocar `main.cpp`
 - no tocar timing MDB en la primera etapa
+
+## Bloque marcado para retomar luego del cierre Rubino
+
+Siguiente trabajo recomendado:
+
+1. validar en campo la configuracion tecnica remota completa:
+   - cambio de `pricing_profile`
+   - cambio de `feature_level`
+   - cambio de `country_code`
+   - cambio de `scale_factor`
+   - cambio de `decimal_places`
+   - cambio de `max_response_time`
+   - cambio de `misc_options`
+2. decidir si hace falta `config_version` para resolver conflictos entre backend y portal local
+3. si hace falta, ampliar el modo asistido con más heurísticas específicas por máquina
+4. terminar de mover ownership del runtime MDB hacia la tarea dedicada, manteniendo el comportamiento ya validado
+
+Regla para este bloque:
+
+- no tocar timing MDB sin una prueba real delante
+- mantener `backend -> config_update -> persistencia local` como camino principal
+- dejar el portal local como herramienta de recovery/onboarding, no como la fuente principal de verdad

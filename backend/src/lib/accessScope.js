@@ -3,6 +3,7 @@ const pool = require('../db/pool');
 const MANAGER_ROLES = new Set(['admin', 'gerente']);
 const TECHNICAL_ROLES = new Set(['tecnico', 'distribuidor']);
 const MACHINE_SETUP_ROLES = new Set(['admin', 'gerente', 'distribuidor']);
+const MACHINE_TECH_CONFIG_ROLES = new Set(['admin', 'tecnico', 'distribuidor']);
 const ANALYTICS_ROLES = new Set(['admin', 'gerente', 'supervisor']);
 
 function isManagerRole(role) {
@@ -15,6 +16,10 @@ function isTechnicalRole(role) {
 
 function canManageMachineSetup(role) {
     return MACHINE_SETUP_ROLES.has(role);
+}
+
+function canManageMachineTechnicalConfig(role) {
+    return MACHINE_TECH_CONFIG_ROLES.has(role);
 }
 
 function canOperateMachines(role) {
@@ -122,6 +127,7 @@ module.exports = {
     isManagerRole,
     isTechnicalRole,
     canManageMachineSetup,
+    canManageMachineTechnicalConfig,
     canOperateMachines,
     canOperateCards,
     canViewAnalytics,

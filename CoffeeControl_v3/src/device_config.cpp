@@ -36,6 +36,13 @@ void deviceConfigLoad(Preferences& prefs, DeviceConfig& config, const char* defa
         (uint32_t)prefs.getULong("price_cents", config.pricing.priceCents)
     );
     config.pricing.profile = (uint8_t)prefs.getUChar("price_profile", config.pricing.profile);
+    config.pricing.featureLevel = (uint8_t)prefs.getUChar("feat_lvl", config.pricing.featureLevel);
+    config.pricing.countryCode = (uint16_t)prefs.getUInt("country", config.pricing.countryCode);
+    config.pricing.scaleFactor = (uint8_t)prefs.getUChar("scale", config.pricing.scaleFactor);
+    config.pricing.decimalPlaces = (uint8_t)prefs.getUChar("decimal", config.pricing.decimalPlaces);
+    config.pricing.maxResponseTime = (uint8_t)prefs.getUChar("resp_ms", config.pricing.maxResponseTime);
+    config.pricing.miscOptions = (uint8_t)prefs.getUChar("misc_opt", config.pricing.miscOptions);
+    pricingNormalizeConfig(config.pricing);
     prefs.end();
 }
 
@@ -49,7 +56,15 @@ void deviceConfigSave(Preferences& prefs, const DeviceConfig& config, const char
         url = String(defaultBackendUrl);
     }
     prefs.putString("url", url);
-    prefs.putULong("price_cents", pricingSanitizeHumanPrice(config.pricing.priceCents));
-    prefs.putUChar("price_profile", config.pricing.profile);
+    PricingConfig pricing = config.pricing;
+    pricingNormalizeConfig(pricing);
+    prefs.putULong("price_cents", pricing.priceCents);
+    prefs.putUChar("price_profile", pricing.profile);
+    prefs.putUChar("feat_lvl", pricing.featureLevel);
+    prefs.putUInt("country", pricing.countryCode);
+    prefs.putUChar("scale", pricing.scaleFactor);
+    prefs.putUChar("decimal", pricing.decimalPlaces);
+    prefs.putUChar("resp_ms", pricing.maxResponseTime);
+    prefs.putUChar("misc_opt", pricing.miscOptions);
     prefs.end();
 }
