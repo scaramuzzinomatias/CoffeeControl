@@ -40,6 +40,16 @@ uint16_t pricingDefaultVendAmount(const PricingConfig& config) {
     return (uint16_t)pricingSanitizeHumanPrice(config.priceCents);
 }
 
+uint32_t pricingMdbAmountToHuman(const PricingConfig& config, uint16_t mdbAmount) {
+    switch (config.profile) {
+        case MDB_PRICING_PROFILE_RUBINO_HALF_CREDIT:
+            return (uint32_t)mdbAmount * 2U;
+        case MDB_PRICING_PROFILE_IDENTITY:
+        default:
+            return mdbAmount;
+    }
+}
+
 void pricingBuildSetupConfigResponse(const PricingConfig& config, uint8_t out[7]) {
     out[0] = config.featureLevel;
     out[1] = (uint8_t)((config.countryCode >> 8) & 0xFF);

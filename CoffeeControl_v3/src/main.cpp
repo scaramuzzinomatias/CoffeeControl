@@ -188,6 +188,8 @@ struct MdbRuntimeState {
     bool justReset;
     bool pendingSession;
     bool vendApproved;
+    bool vendDecisionSent;
+    bool endSessionPending;
     uint16_t vendAmount;
     String sessionUID;
     uint16_t sessionItemId;
@@ -201,6 +203,8 @@ struct MdbRuntimeState {
           justReset(true),
           pendingSession(false),
           vendApproved(false),
+          vendDecisionSent(false),
+          endSessionPending(false),
           vendAmount(1200),
           sessionUID(""),
           sessionItemId(0),
@@ -1448,13 +1452,17 @@ int postTap(const String& uid) {
 }
 
 void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool ok) {
-    Serial.printf("[TAP] Resultado venta %s — item #%d $%d centavos\n",
-                  ok ? "EXITOSA" : "FALLIDA", itemId, amount);
+    uint32_t humanAmount = amount > 0 ? pricingMdbAmountToHuman(pricingConfig, amount) : 0;
+    Serial.printf("[TAP] Resultado venta %s — item #%d $%lu centavos (MDB=%u)\n",
+                  ok ? "EXITOSA" : "FALLIDA",
+                  itemId,
+                  (unsigned long)humanAmount,
+                  (unsigned int)amount);
 
     // Si la sesión fue offline OR el WiFi cayó durante la sesión → encolar
     if (mdbRuntime.sessionIsOffline || WiFi.status() != WL_CONNECTED) {
         Serial.println("[TAP] Sin conexion online — encolando evento");
-        enqueueEvent(uid, itemId, amount, ok);
+        enqueueEvent(uid, itemId, humanAmount, ok);
         if (ok) incrementLocalUsed(uid);
         return;
     }
@@ -1475,7 +1483,7 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
     String body = "{\"nfc_uid\":\"" + uid
                 + "\",\"vend_success\":" + (ok ? "true" : "false")
                 + ",\"item_id\":" + itemId
-                + ",\"amount\":" + amount + "}";
+                + ",\"amount\":" + humanAmount + "}";
 
     int code = http.POST(body);
     http.end();
@@ -1484,7 +1492,7 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
     if (code <= 0) {
         // Sin respuesta → encolar para reintentar
         Serial.println("[TAP] Sin respuesta backend — encolando evento");
-        enqueueEvent(uid, itemId, amount, ok);
+        enqueueEvent(uid, itemId, humanAmount, ok);
     }
 }
 
@@ -1922,6 +1930,8 @@ void handleNFC() {
     mdbRuntime.phase            = SESSION_IDLE;
     mdbRuntime.sessionStartMs   = millis();   // Fix Bug 5: iniciar timeout
     mdbRuntime.vendUsed         = false;      // Fix Bug 2: resetear flag de dispensado
+    mdbRuntime.vendDecisionSent = false;
+    mdbRuntime.endSessionPending = false;
     ledBlink(2, 100);
 }
 
@@ -1957,8 +1967,12 @@ void cmdReset() {
     mdbRuntime.justReset = true;
     mdbRuntime.pendingSession = false;
     mdbRuntime.vendApproved = false;
+    mdbRuntime.vendDecisionSent = false;
+    mdbRuntime.endSessionPending = false;
     mdbRuntime.vendUsed = false;
     mdbRuntime.sessionUID = "";
+    mdbRuntime.sessionItemId = 0;
+    mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
     mdbRuntime.sessionIsOffline = false;
     resetMdbSetupSnapshot();
     mdbSendACK();
@@ -2004,6 +2018,20 @@ void cmdExpansion(uint8_t* d, uint8_t len) {
 }
 
 void cmdPoll() {
+    if (mdbRuntime.endSessionPending) {
+        mdbSendByte(MDB_END_SESSION);
+        mdbRuntime.endSessionPending = false;
+        mdbRuntime.phase = ENABLED;
+        mdbRuntime.sessionUID = "";
+        mdbRuntime.sessionItemId = 0;
+        mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+        mdbRuntime.vendApproved = false;
+        mdbRuntime.vendDecisionSent = false;
+        mdbRuntime.vendUsed = false;
+        mdbRuntime.sessionIsOffline = false;
+        return;
+    }
+
     switch (mdbRuntime.phase) {
         case INACTIVE:
             if (mdbRuntime.justReset) {
@@ -2028,23 +2056,33 @@ void cmdPoll() {
                                 (uint8_t)( sessionFunds        & 0xFF)};
                 mdbSendData(r, 3);
                 mdbRuntime.pendingSession = false;
+                mdbRuntime.vendDecisionSent = false;
+                mdbRuntime.endSessionPending = false;
             } else {
                 mdbSendACK();
             }
             break;
 
         case VEND_PENDING:
-            if (mdbRuntime.vendApproved) {
-                uint8_t r[3] = {MDB_VEND_APPROVED,
-                                (uint8_t)((mdbRuntime.vendAmount >> 8) & 0xFF),
-                                (uint8_t)( mdbRuntime.vendAmount        & 0xFF)};
-                mdbSendData(r, 3);
-                mdbRuntime.vendApproved = false;
+            if (!mdbRuntime.vendDecisionSent) {
+                if (mdbRuntime.vendApproved) {
+                    uint8_t r[3] = {MDB_VEND_APPROVED,
+                                    (uint8_t)((mdbRuntime.vendAmount >> 8) & 0xFF),
+                                    (uint8_t)( mdbRuntime.vendAmount        & 0xFF)};
+                    mdbSendData(r, 3);
+                    mdbRuntime.vendApproved = false;
+                    mdbRuntime.vendDecisionSent = true;
+                } else {
+                    mdbSendByte(MDB_VEND_DENIED);
+                    mdbRuntime.vendDecisionSent = true;
+                    mdbRuntime.phase = ENABLED;
+                    mdbRuntime.sessionUID = "";
+                    mdbRuntime.sessionItemId = 0;
+                    mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
+                    mdbRuntime.sessionIsOffline = false;
+                }
             } else {
-                mdbSendByte(MDB_VEND_DENIED);
-                mdbRuntime.phase = ENABLED;
-                mdbRuntime.sessionUID = "";
-                mdbRuntime.sessionIsOffline = false;
+                mdbSendACK();
             }
             break;
     }
@@ -2065,9 +2103,11 @@ void cmdVend(uint8_t* d, uint8_t len) {
                 if (mdbRuntime.vendUsed) {
                     MDB_LOG_EVENTLN("[MDB] Denegado — ya se dispenso en esta sesion");
                     mdbRuntime.vendApproved = false;
+                    mdbRuntime.vendDecisionSent = false;
                     mdbRuntime.phase = VEND_PENDING;
                 } else {
                     mdbRuntime.vendApproved = true;
+                    mdbRuntime.vendDecisionSent = false;
                     mdbRuntime.vendAmount = mdbRuntime.sessionAmount;
                     mdbRuntime.phase = VEND_PENDING;
                 }
@@ -2076,6 +2116,11 @@ void cmdVend(uint8_t* d, uint8_t len) {
             break;
 
         case VEND_SUCCESS:
+            if (mdbRuntime.vendUsed) {
+                MDB_LOG_EVENTLN("[MDB] VEND_SUCCESS duplicado — ignorado");
+                mdbSendACK();
+                break;
+            }
             MDB_LOG_EVENTLN("[MDB] VEND_SUCCESS — venta confirmada");
             logDiagEvent(EVT_MDB_VEND_SUCCESS, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
             notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, true);
@@ -2104,11 +2149,9 @@ void cmdVend(uint8_t* d, uint8_t len) {
                               mdbRuntime.sessionUID.c_str());
                 notifyVendResult(mdbRuntime.sessionUID, 0, 0, false);
             }
-            mdbSendByte(MDB_END_SESSION);
-            mdbRuntime.phase = ENABLED;
-            mdbRuntime.sessionUID = "";
-            mdbRuntime.vendUsed = false;
-            mdbRuntime.sessionIsOffline = false;
+            mdbSendACK();
+            mdbRuntime.endSessionPending = true;
+            mdbRuntime.phase = SESSION_IDLE;
             break;
 
         case VEND_CANCEL:
@@ -2138,7 +2181,11 @@ void cmdReader(uint8_t* d, uint8_t len) {
         }
         mdbRuntime.phase = MDB_DISABLED;
         mdbRuntime.sessionUID = "";
+        mdbRuntime.sessionItemId = 0;
+        mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
         mdbRuntime.vendUsed = false;
+        mdbRuntime.vendDecisionSent = false;
+        mdbRuntime.endSessionPending = false;
         mdbRuntime.pendingSession = false;
         mdbRuntime.sessionIsOffline = false;
     }
@@ -2336,6 +2383,8 @@ void loop() {
         mdbRuntime.phase            = MDB_DISABLED;
         mdbRuntime.vendApproved     = false;
         mdbRuntime.vendUsed         = false;
+        mdbRuntime.vendDecisionSent = false;
+        mdbRuntime.endSessionPending = false;
         mdbRuntime.sessionIsOffline = false;
 
         // wasOffline afecta cómo notifyVendResult enruta el evento
