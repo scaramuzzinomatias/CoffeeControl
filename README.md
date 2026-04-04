@@ -36,6 +36,7 @@ Una empresa con 4 expendedoras gasta $4 millones/mes en café sin saber qué emp
 | Tiempo real | WebSockets (`ws`) |
 | Auth panel | JWT (jsonwebtoken + bcryptjs) |
 | Frontend | HTML + CSS + JS vanilla + Chart.js |
+| Reloj operativo | NTP como fuente principal; fecha/hora MDB solo para diagnóstico o fallback si la máquina la entrega |
 
 ---
 
@@ -86,15 +87,13 @@ ARQUITECTURA_APP_GERENTE_MOVIL.md ← Alcance y arquitectura V1 para la app gere
 
 ## Hardware por máquina
 
-### ESP32-C3 Super Mini — target de producción (~$10-11 USD/unidad)
+### ESP32-C3 Super Mini — target de producción (~$8-9 USD/unidad)
 
 | Componente | Precio aprox. |
 |---|---|
 | ESP32-C3 Super Mini | ~$2-3 USD |
 | RC522 (lector NFC) | ~$4 USD |
 | MAX3232 (adaptador MDB 3.3V↔5V) | ~$2 USD |
-| DS3231 (RTC, respaldo offline) | ~$1-2 USD |
-
 ### Pinout definitivo ESP32-C3 Super Mini
 
 ```
@@ -102,9 +101,9 @@ RC522 (SPI):              MDB (bit-banging, IRAM_ATTR):
   SS    → GPIO4             TX → GPIO20 → MAX3232 T1IN → bus MDB
   SCK   → GPIO0             RX → GPIO21 ← MAX3232 R1OUT ← bus MDB
   MOSI  → GPIO1
-  MISO  → GPIO3            DS3231 RTC (I2C):
-  RST   → GPIO7              SDA → GPIO5
-  VCC   → 3.3V               SCL → GPIO6
+  MISO  → GPIO3
+  RST   → GPIO7
+  VCC   → 3.3V
 
 LED externo  → GPIO10     Botón BOOT/Reset → GPIO9 (integrado)
 
@@ -113,6 +112,7 @@ LED externo  → GPIO10     Botón BOOT/Reset → GPIO9 (integrado)
 
 Nota:
 - La realimentación visual del botón BOOT usa el LED onboard azul en `GPIO8` y funciona con el firmware ya corriendo, sin depender del arranque.
+- `GPIO5` y `GPIO6` quedan libres/reservados para expansión futura; el diseño operativo actual no usa RTC hardware.
 ```
 
 > **Por qué bit-banging para MDB:** El ESP32-C3 soporta hasta 8 bits por UART en hardware; MDB requiere 9 bits por trama. Se usa `MDB9bit.h` portado con `IRAM_ATTR`.

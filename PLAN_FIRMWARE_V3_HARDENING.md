@@ -9,6 +9,13 @@ Estado de referencia actual:
 - restore point: tag `firmware-baseline-2026-04-03`
 - commit base: `7af6afa` (`feat(mdb): comunicacion MDB bidireccional completa con Saeco Rubino`)
 
+Decision de reloj ya cerrada:
+
+- `NTP` queda como fuente principal del firmware
+- la fecha/hora MDB queda solo como diagnostico o fallback si la maquina realmente la entrega
+- el experimento de `gateway 0x18` ya se evaluo y la Rubino actual no lo usa
+- `DS3231` queda descartado del diseno operativo actual
+
 Objetivo:
 
 - mejorar robustez, mantenibilidad y capacidad de diagnostico
@@ -183,6 +190,7 @@ Estado actual:
 - la sincronizacion de precio ya no pisa `mdbRuntime` desde `readConfig()`, `saveConfig()` ni `applyPricingConfig()`
 - estado actual experimental: el firmware ya expone un `Communications Gateway` MDB mínimo en `0x18` para evaluar soporte real del VMC sin tocar el `cashless 0x10` validado; por ahora se limita a `RESET`, `SETUP`, `CONTROL`, `IDENTIFICATION`, `FEATURE ENABLE` y `TIME/DATE REQUEST`
 - resultado real en Rubino: el `gateway 0x18` no fue interrogado por la máquina (`Setup/Control/Identification/Feature Enable/Time-Date` quedaron en `No`), así que no sirve hoy como vía práctica para sincronizar reloj o ampliar telemetría en esta instalación
+- decision operativa posterior a esa prueba: el firmware deja `NTP` como reloj principal, usa fecha/hora MDB solo como apoyo diagnóstico y descarta `DS3231` del diseño activo
 
 Pendiente dentro de esta etapa:
 

@@ -35,7 +35,7 @@
  *   - LittleFS para cards.json y queue.json (modo offline)
  *   - Autenticación local: cache de hasta ~1500 tarjetas en RAM
  *   - Cola offline: hasta 1000 eventos, flush automático al reconectar
- *   - DS3231 RTC para reset de medianoche (I²C GPIO5/6), fallback NTP
+ *   - Reloj operativo por NTP, con fallback diagnóstico desde MDB si la máquina entrega fecha/hora
  *   - MDB 9-bit por software (IRAM_ATTR, GPIO20/21)
  *     Nota: el ESP32-C3 NO soporta 9-bit en UART hardware (registro
  *     bit_num tiene solo 2 bits → máx. 8 bits de dato). El bit-banging
@@ -47,8 +47,7 @@
  *   GPIO3  = SPI MISO (RC522)   ← NO usar GPIO2: strapping pin
  *   GPIO4  = RC522 SS  (CS)
  *   GPIO7  = RC522 RST
- *   GPIO5  = I²C SDA (DS3231)   ← pines recomendados por datasheet
- *   GPIO6  = I²C SCL (DS3231)   ← Wire.begin(5, 6)
+ *   GPIO5/6 reservados si a futuro se necesita I²C, pero el diseño activo no usa RTC hardware
  *   GPIO10 = LED externo (activo HIGH)
  *   GPIO9  = BOOT button (pull-up interno, LOW = presionado, abre portal en runtime)
  *   GPIO20 = MDB TX (bit-banging, salida al bus)
@@ -67,11 +66,9 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPI.h>
-#include <Wire.h>
 #include <MFRC522.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <RTClib.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <freertos/queue.h>
@@ -87,8 +84,6 @@
 #define PIN_SPI_MISO   3   // GPIO2 es strapping pin → usar GPIO3
 #define PIN_RC522_SS   4
 #define PIN_RC522_RST  7
-#define PIN_I2C_SDA    5   // pines recomendados por referencia oficial
-#define PIN_I2C_SCL    6
 #define PIN_LED       10
 #define PIN_LED_ONBOARD 8   // LED onboard azul del Super Mini (activo LOW, usar solo post-boot)
 #define PIN_BOOT_BTN   9   // BOOT button: pull-up interno, LOW = presionado
@@ -299,7 +294,6 @@ MFRC522     rfid(PIN_RC522_SS, PIN_RC522_RST);
 MDB9bit     mdb(PIN_MDB_TX, PIN_MDB_RX);
 WebServer   portalServer(80);
 DNSServer   dnsServer;
-RTC_DS3231  rtc;
 Preferences prefs;
 EventLog diagEventLog;
 volatile bool watchdogReady = false;
@@ -324,7 +318,6 @@ String backendLastError = "";
 bool   portalMode    = false;
 bool   wifiReady     = false;
 bool   backendReady  = false;   // true si /health respondio OK
-bool   rtcAvailable  = false;
 bool   mdbMachineTimeValid = false;
 uint32_t mdbMachineTimeEpoch = 0;
 uint32_t mdbMachineTimeCapturedAtMs = 0;
@@ -365,6 +358,30 @@ bool mdbSnapshotHasTimeDate() {
     return (mdbSetupSnapshot.seenMask & 0x08) != 0;
 }
 
+time_t buildTimeUtc(int year, int month, int day, int hour, int minute, int second) {
+    struct tm tmValue{};
+    tmValue.tm_year = year - 1900;
+    tmValue.tm_mon = month - 1;
+    tmValue.tm_mday = day;
+    tmValue.tm_hour = hour;
+    tmValue.tm_min = minute;
+    tmValue.tm_sec = second;
+    tmValue.tm_isdst = 0;
+    return mktime(&tmValue);
+}
+
+bool buildDateIsoFromEpoch(uint32_t ts, char* out, size_t outSize) {
+    if (!out || outSize == 0) return false;
+    time_t raw = (time_t)ts;
+    struct tm timeinfo{};
+    if (!gmtime_r(&raw, &timeinfo)) return false;
+    snprintf(out, outSize, "%04d-%02d-%02d",
+             1900 + timeinfo.tm_year,
+             timeinfo.tm_mon + 1,
+             timeinfo.tm_mday);
+    return true;
+}
+
 bool getMdbMachineTimeTs(uint32_t* outTs) {
     if (!mdbMachineTimeValid || mdbMachineTimeEpoch == 0) return false;
 
@@ -389,8 +406,9 @@ void applyMdbMachineClockIfAvailable() {
         return;
     }
 
-    DateTime machineDate(2000 + year, month, day, hour, minute, second);
-    mdbMachineTimeEpoch = machineDate.unixtime();
+    time_t machineTs = buildTimeUtc(2000 + year, month, day, hour, minute, second);
+    if (machineTs <= 0) return;
+    mdbMachineTimeEpoch = (uint32_t)machineTs;
     mdbMachineTimeCapturedAtMs = millis();
     mdbMachineTimeValid = true;
 
@@ -430,25 +448,22 @@ String buildMdbTimeDateIso() {
     return String(iso);
 }
 
-bool getGatewayCurrentTime(DateTime* out, const char** sourceLabel = nullptr) {
+bool getGatewayCurrentTime(struct tm* out, const char** sourceLabel = nullptr) {
     if (!out) return false;
+    memset(out, 0, sizeof(*out));
 
-    if (rtcAvailable) {
-        *out = rtc.now();
-        if (sourceLabel) *sourceLabel = "ds3231";
+    if (getLocalTime(out)) {
+        if (sourceLabel) *sourceLabel = "ntp";
         return true;
     }
 
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-        *out = DateTime(1900 + timeinfo.tm_year,
-                        timeinfo.tm_mon + 1,
-                        timeinfo.tm_mday,
-                        timeinfo.tm_hour,
-                        timeinfo.tm_min,
-                        timeinfo.tm_sec);
-        if (sourceLabel) *sourceLabel = "ntp";
-        return true;
+    uint32_t mdbTs = 0;
+    if (getMdbMachineTimeTs(&mdbTs)) {
+        time_t raw = (time_t)mdbTs;
+        if (gmtime_r(&raw, out)) {
+            if (sourceLabel) *sourceLabel = "mdb";
+            return true;
+        }
     }
 
     return false;
@@ -763,14 +778,10 @@ String buildDiagnosticsSnapshotJson(uint8_t eventLimit = 20) {
     json += ",\"mdb_time_date_probe_requested_at_ms\":";
     json += mdbTimeDateProbeRequestedAtMs;
     json += ",\"clock_source\":\"";
-    if (rtcAvailable) {
-        json += "ds3231";
-    } else {
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) json += "ntp";
-        else if (mdbMachineTimeValid) json += "mdb";
-        else json += "uptime";
-    }
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) json += "ntp";
+    else if (mdbMachineTimeValid) json += "mdb";
+    else json += "uptime";
     json += "\"";
     json += ",\"price_cents\":";
     json += pricingSanitizeHumanPrice(pricingConfig.priceCents);
@@ -1234,14 +1245,7 @@ void saveCards() {
     Serial.printf("[CARDS] Cache guardado: %d tarjetas\n", cardCount);
 }
 
-bool fillDateFromRtcOrNtp(char* out, size_t outSize) {
-    if (rtcAvailable) {
-        DateTime now = rtc.now();
-        snprintf(out, outSize, "%04d-%02d-%02d",
-                 now.year(), now.month(), now.day());
-        return true;
-    }
-
+bool fillDateFromClock(char* out, size_t outSize) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
         snprintf(out, outSize, "%04d-%02d-%02d",
@@ -1251,10 +1255,7 @@ bool fillDateFromRtcOrNtp(char* out, size_t outSize) {
 
     uint32_t mdbTs = 0;
     if (getMdbMachineTimeTs(&mdbTs)) {
-        DateTime now(mdbTs);
-        snprintf(out, outSize, "%04d-%02d-%02d",
-                 now.year(), now.month(), now.day());
-        return true;
+        return buildDateIsoFromEpoch(mdbTs, out, outSize);
     }
 
     return false;
@@ -1265,9 +1266,15 @@ bool advanceDateByOneDay(const char* currentDate, char* out, size_t outSize) {
     int month = 0;
     int day = 0;
     if (sscanf(currentDate, "%d-%d-%d", &year, &month, &day) != 3) return false;
-    DateTime current(year, month, day, 0, 0, 0);
-    DateTime next = current + TimeSpan(1, 0, 0, 0);
-    snprintf(out, outSize, "%04d-%02d-%02d", next.year(), next.month(), next.day());
+    time_t currentTs = buildTimeUtc(year, month, day, 0, 0, 0);
+    if (currentTs <= 0) return false;
+    time_t nextTs = currentTs + 86400;
+    struct tm next{};
+    if (!gmtime_r(&nextTs, &next)) return false;
+    snprintf(out, outSize, "%04d-%02d-%02d",
+             1900 + next.tm_year,
+             next.tm_mon + 1,
+             next.tm_mday);
     return true;
 }
 
@@ -1327,11 +1334,9 @@ void incrementLocalUsed(const String& uid) {
 }
 
 uint32_t getCurrentTs() {
-    if (rtcAvailable) {
-        return rtc.now().unixtime();
-    }
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
+        timeinfo.tm_isdst = 0;
         return (uint32_t)mktime(&timeinfo);
     }
     uint32_t mdbTs = 0;
@@ -1472,7 +1477,7 @@ void downloadCards() {
         nextResetTs = (uint32_t)(doc["next_reset_at"] | 0);
         arr = doc["cards"].as<JsonArray>();
     } else {
-        fillDateFromRtcOrNtp(savedDate, sizeof(savedDate));
+        fillDateFromClock(savedDate, sizeof(savedDate));
         nextResetTs = 0;
         arr = doc.as<JsonArray>();
     }
@@ -1513,17 +1518,17 @@ void checkMidnightReset() {
         }
         if (!advanced) return;
 
-        Serial.printf("[RTC] Nuevo dia operativo — reseteando contadores (fecha=%s)\n", savedDate);
+        Serial.printf("[CLOCK] Nuevo dia operativo — reseteando contadores (fecha=%s)\n", savedDate);
         for (int i = 0; i < cardCount; i++) cards[i].used = 0;
         cardsDirty = true;
         return;
     }
 
     char today[11] = "";
-    if (!fillDateFromRtcOrNtp(today, sizeof(today))) return;
+    if (!fillDateFromClock(today, sizeof(today))) return;
     if (strlen(savedDate) == 0 || strcmp(today, savedDate) == 0) return;
 
-    Serial.printf("[RTC] Nuevo dia local: %s → %s — reseteando contadores\n", savedDate, today);
+    Serial.printf("[CLOCK] Nuevo dia local: %s → %s — reseteando contadores\n", savedDate, today);
     strlcpy(savedDate, today, sizeof(savedDate));
     for (int i = 0; i < cardCount; i++) cards[i].used = 0;
     cardsDirty = true;
@@ -1967,7 +1972,7 @@ bool connectWiFi() {
         wifiReady = true;
         logDiagEvent(EVT_WIFI_CONNECT_OK, WiFi.RSSI(), WiFi.localIP());
 
-        // Sincronizar NTP (fallback para DS3231)
+        // Sincronizar NTP como reloj principal del firmware
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
         // Verificar conectividad con el backend
@@ -2694,17 +2699,17 @@ void cmdGatewayControl(uint8_t* d, uint8_t len) {
 bool buildGatewayTimeDateResponse(uint8_t* out, size_t outLen, const char** sourceLabel = nullptr) {
     if (!out || outLen < 11) return false;
 
-    DateTime now(2000, 1, 1, 0, 0, 0);
+    struct tm now{};
     if (!getGatewayCurrentTime(&now, sourceLabel)) return false;
 
-    const uint16_t fullYear = (uint16_t)now.year();
+    const uint16_t fullYear = (uint16_t)(1900 + now.tm_year);
     const uint8_t year = (uint8_t)(fullYear >= 2000 ? (fullYear - 2000) : fullYear % 100);
-    const uint8_t month = (uint8_t)now.month();
-    const uint8_t day = (uint8_t)now.day();
-    const uint8_t hour = (uint8_t)now.hour();
-    const uint8_t minute = (uint8_t)now.minute();
-    const uint8_t second = (uint8_t)now.second();
-    const uint8_t dayOfWeek = (uint8_t)now.dayOfTheWeek();
+    const uint8_t month = (uint8_t)(now.tm_mon + 1);
+    const uint8_t day = (uint8_t)now.tm_mday;
+    const uint8_t hour = (uint8_t)now.tm_hour;
+    const uint8_t minute = (uint8_t)now.tm_min;
+    const uint8_t second = (uint8_t)now.tm_sec;
+    const uint8_t dayOfWeek = (uint8_t)now.tm_wday;
     const uint8_t weekNumber = 0;
 
     out[0] = 0x01;
@@ -3125,17 +3130,7 @@ void setup() {
     // Config local (WiFi/backend/precio) antes de exponer MDB
     readConfig();
 
-    // I²C + DS3231 RTC
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    if (rtc.begin(&Wire)) {
-        rtcAvailable = true;
-        Serial.println("[RTC] DS3231 OK");
-        if (rtc.lostPower()) {
-            Serial.println("[RTC] Perdio alimentacion — se sincronizara con NTP");
-        }
-    } else {
-        Serial.println("[RTC] DS3231 no encontrado — usando NTP para reloj");
-    }
+    Serial.println("[CLOCK] Reloj principal: NTP");
 
     // LittleFS
     if (!LittleFS.begin(true)) {
@@ -3191,20 +3186,6 @@ void setup() {
             flushQueue();       // Enviar eventos offline pendientes
             downloadCards();    // Descargar cache de tarjetas para modo offline
 
-            // Sincronizar RTC con NTP si perdió alimentación
-            if (rtcAvailable && rtc.lostPower()) {
-                delay(2000);    // Esperar que NTP sincronice
-                struct tm timeinfo;
-                if (getLocalTime(&timeinfo)) {
-                    rtc.adjust(DateTime(1900 + timeinfo.tm_year,
-                                       timeinfo.tm_mon + 1,
-                                       timeinfo.tm_mday,
-                                       timeinfo.tm_hour,
-                                       timeinfo.tm_min,
-                                       timeinfo.tm_sec));
-                    Serial.println("[RTC] Ajustado con NTP");
-                }
-            }
         }
     }
 
@@ -3286,11 +3267,15 @@ void loop() {
         checkBackend();   // re-verificar backend en cada heartbeat
         registerMachine();  // actualiza last_seen y telemetría de red
         const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
-        Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | RTC:%s\n",
+        const char* clockSource = "UPTIME";
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) clockSource = "NTP";
+        else if (mdbMachineTimeValid) clockSource = "MDB";
+        Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | Clock:%s\n",
                      WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
                       backendReady ? "OK" : "OFFLINE",
                       stStr[mdbRuntime.phase], cardCount, queueLen,
-                      rtcAvailable ? "DS3231" : "NTP");
+                      clockSource);
     }
 
     feedWatchdog();

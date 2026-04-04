@@ -1,6 +1,6 @@
 # AGENTE.md — CoffeeControl
 > Archivo de continuidad del proyecto. Leer antes de cualquier sesión nueva.
-> Última actualización: 04/04/2026 — el firmware ya quedó validado en una Rubino real con venta completa y precio humano correcto (`1200` backend vs `600` interno MDB cuando aplica el perfil `rubino_half_credit`). Además ya quedó implementada la configuración técnica remota integral por máquina: backend, tests y panel admin con visibilidad restringida a `admin`, `tecnico` y `distribuidor`. La resolución de conflictos backend/portal ya quedó versionada con `config_version`, `config_source` y `config_updated_at`: el portal local puede seguir usándose para recovery, pero backend conserva el rol de fuente de verdad y devuelve una configuración autoritativa explícita cuando detecta desvíos. El portal sigue desacoplado en `LittleFS`, el `event log` compacto sigue disponible por `GET /diag/events`, el snapshot de `SETUP` MDB sigue en `GET /diag/mdb`, la cola offline ya usa journal append-only y el watchdog conservador de `20s` sigue activo sobre `loopTask` + tarea MDB. El timing MDB continúa fuera del bloque inicial. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
+> Última actualización: 04/04/2026 — el firmware ya quedó validado en una Rubino real con venta completa y precio humano correcto (`1200` backend vs `600` interno MDB cuando aplica el perfil `rubino_half_credit`). Además ya quedó implementada la configuración técnica remota integral por máquina: backend, tests y panel admin con visibilidad restringida a `admin`, `tecnico` y `distribuidor`. La resolución de conflictos backend/portal ya quedó versionada con `config_version`, `config_source` y `config_updated_at`: el portal local puede seguir usándose para recovery, pero backend conserva el rol de fuente de verdad y devuelve una configuración autoritativa explícita cuando detecta desvíos. El portal sigue desacoplado en `LittleFS`, el `event log` compacto sigue disponible por `GET /diag/events`, el snapshot de `SETUP` MDB sigue en `GET /diag/mdb`, la cola offline ya usa journal append-only y el watchdog conservador de `20s` sigue activo sobre `loopTask` + tarea MDB. El timing MDB continúa fuera del bloque inicial. La decisión de reloj quedó cerrada: `NTP` es la fuente principal, la fecha/hora MDB queda solo como diagnóstico/fallback si la máquina la entrega y el `DS3231` queda descartado del diseño operativo. La app gerente web queda como prototipo; la dirección de producto sigue siendo una futura app gerente nativa.
 >
 > **Punto de restauración general:** `git checkout a25148b -- .` restaura el estado previo a los fixes de edge cases.
 >
@@ -37,8 +37,8 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 - **Microcontrolador:** ESP32-C3 Super Mini — ~$2-3 USD
 - **Lector NFC:** RC522 (13.56 MHz, protocolo SPI) — ~$4 USD
 - **Adaptador de nivel:** MAX3232 (convierte 3.3V ESP ↔ 5V bus MDB) — ~$2 USD
-- **RTC:** DS3231 (I2C, batería de respaldo) — ~$1-2 USD ← **posible gracias a pines I2C libres**
-- **Total hardware por máquina:** ~$10-11 USD
+- **Reloj operativo:** NTP como fuente principal; la fecha/hora MDB queda solo como diagnóstico/fallback si la máquina la entrega
+- **Total hardware por máquina:** ~$8-9 USD
 
 ### Hardware por máquina (v1 — prototipo actual)
 - **Microcontrolador:** ESP8266 (NodeMCU o Wemos D1 Mini) — ~$3 USD
@@ -56,10 +56,10 @@ Sistema de control de consumo de café para empresas con expendedoras automátic
 | Factor | ESP8266 | ESP32-C3 Super Mini |
 |---|---|---|
 | Heap libre | ~30KB | ~380KB |
-| Pines I2C | Ocupados por MDB | GPIO8/GPIO10 libres |
+| Pines I2C | Ocupados por MDB | GPIO5/GPIO6 libres/reservados |
 | UART hardware | 1 (debug) | 2, pero MDB sigue por bit-banging |
 | MDB 9-bit | Bit-banging (SoftwareSerial) | Bit-banging `MDB9bit.h` con `IRAM_ATTR` |
-| RTC DS3231 | ❌ Sin pines | ✅ I2C libre |
+| RTC hardware | ❌ No disponible | ❌ Descartado; `NTP` queda como reloj principal |
 | Max tarjetas cache | 200 (seguro) | 2000+ |
 | Max cola offline | 100 (seguro) | 1000+ |
 | Precio | ~$3 | ~$2-3 |
@@ -304,9 +304,9 @@ RC522 (SPI hardware):           MDB (bit-banging, IRAM_ATTR):
   SS    → GPIO4                  TX → GPIO20 → MAX3232 T1IN → bus MDB
   SCK   → GPIO0                  RX → GPIO21 ← MAX3232 R1OUT ← bus MDB
   MOSI  → GPIO1
-  MISO  → GPIO3                DS3231 RTC (I2C):
-  RST   → GPIO7                  SDA → GPIO5
-  VCC   → 3.3V (¡no 5V!)        SCL → GPIO6
+  MISO  → GPIO3
+  RST   → GPIO7
+  VCC   → 3.3V (¡no 5V!)
   GND   → GND
 
 LED externo   → GPIO10
@@ -316,6 +316,9 @@ Portal/BOOT   → GPIO9 (pull-up interno, LOW = presionado)
 No usar para perifericos externos:
 - GPIO2 (strapping)
 - GPIO18/19 (USB D-/D+)
+
+Nota:
+- `GPIO5` y `GPIO6` quedan libres/reservados para expansión futura; el diseño operativo actual no usa RTC hardware.
 ```
 
 ---
@@ -442,8 +445,8 @@ No usar para perifericos externos:
 |---|---|---|
 | MDB 9-bit | `MDB9bit.h` bit-banging SoftwareSerial | `MDB9bit.h` bit-banging con `IRAM_ATTR` |
 | Filesystem | `#include <FS.h>` SPIFFS | `#include <LittleFS.h>` (mejor wear leveling) |
-| RTC | No disponible | DS3231 via I2C + librería RTClib (Adafruit) |
-| Hora offline | NTP único | DS3231 primario + NTP fallback |
+| RTC hardware | No disponible | Descartado en el diseño operativo |
+| Reloj operativo | NTP único | NTP principal + fecha/hora MDB solo como diagnóstico/fallback |
 | WiFi/HTTP | `ESP8266WiFi.h` + `ESP8266HTTPClient.h` | `WiFi.h` + `HTTPClient.h` (misma API) |
 | JSON | ArduinoJson 6 | ArduinoJson 6 (sin cambios) |
 | Pines | Aliases `D0`-`D8` | Numérico `GPIO0`-`GPIO10` |
@@ -462,7 +465,7 @@ No usar para perifericos externos:
 4. Cambiar includes WiFi/HTTP con `#ifdef ESP32` / `#elif defined(ESP8266)`
 5. Cambiar `SPIFFS` → `LittleFS`
 6. Redefinir pines con el nuevo mapa GPIO
-7. Agregar inicialización DS3231 (`#include <RTClib.h>`)
+7. Definir `NTP` como reloj principal y dejar `GPIO5/GPIO6` libres para expansión futura
 
 ---
 
@@ -522,7 +525,7 @@ Backend vuelve →
 Cada ESP conoce el `used_today` del backend al momento de la última sincronización. Si múltiples ESPs están offline simultáneamente y el mismo empleado tapa en varios, puede superar el límite global. Al reconectar, el backend marca los excesos con `over_limit=true` para auditoría visible en el panel.
 
 ### Reset de `used_today` a medianoche
-- **ESP32-C3 con DS3231:** comparar `cards.json.date` con fecha del RTC → si cambió → `used_today=0` en RAM + sobrescribir `cards.json`
+- **ESP32-C3 operativo:** comparar `cards.json.date` con la fecha del reloj del sistema sincronizado por `NTP`; si la máquina entrega fecha/hora MDB válida, puede usarse como apoyo diagnóstico/fallback
 - **ESP8266 con NTP:** igual pero usando `configTime()` + `localtime()` — funciona mientras WiFi esté activo (el backend puede estar caído sin afectar NTP)
 - **Si WiFi también cae:** suspender modo offline hasta reconectar (escenario tan extremo que no justifica complejidad adicional)
 
