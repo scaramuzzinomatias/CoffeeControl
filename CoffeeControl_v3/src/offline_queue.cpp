@@ -4,9 +4,29 @@
 
 namespace {
 
+bool fsHasPath(fs::FS& fs, const char* path) {
+    File root = fs.open("/");
+    if (!root) return false;
+
+    String expected = path;
+    File file = root.openNextFile();
+    while (file) {
+        String current = file.name();
+        file.close();
+        if (current == expected) {
+            root.close();
+            return true;
+        }
+        file = root.openNextFile();
+    }
+
+    root.close();
+    return false;
+}
+
 bool loadJournal(fs::FS& fs, const char* path, QueueEntry* entries, int capacity, int& outCount) {
     outCount = 0;
-    if (!fs.exists(path)) return false;
+    if (!fsHasPath(fs, path)) return false;
 
     File f = fs.open(path, "r");
     if (!f) return false;
@@ -23,7 +43,7 @@ bool loadJournal(fs::FS& fs, const char* path, QueueEntry* entries, int capacity
 
 bool loadLegacyJson(fs::FS& fs, const char* path, QueueEntry* entries, int capacity, int& outCount) {
     outCount = 0;
-    if (!fs.exists(path)) return false;
+    if (!fsHasPath(fs, path)) return false;
 
     File f = fs.open(path, "r");
     if (!f) return false;
@@ -57,6 +77,15 @@ String buildTempPath(const char* journalPath) {
 }
 
 }  // namespace
+
+bool offlineQueueEnsureJournal(fs::FS& fs, const char* journalPath) {
+    if (fsHasPath(fs, journalPath)) return true;
+
+    File f = fs.open(journalPath, "w");
+    if (!f) return false;
+    f.close();
+    return true;
+}
 
 bool offlineQueueLoad(fs::FS& fs,
                       const char* journalPath,

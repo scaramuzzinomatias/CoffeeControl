@@ -1790,6 +1790,7 @@ function applyMachineFilters(){
       <td>${formatReportMoney(m.cost_month_cents||0)}</td>
       <td style="font-size:11px;color:var(--tx3)">${since}</td>
       <td style="white-space:nowrap">
+        ${technicalConfig?`<button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openMachineOta(${m.id})">OTA</button>`:''}
         ${manager ? (m.blocked
           ?`<button class="btn btn-ghost btn-xs" onclick="unblockMachine(${m.id},'${m.name}')">Desbloquear</button>`
           :`<button class="btn btn-xs" style="background:var(--bgd);color:var(--txd)" onclick="blockMachine(${m.id},'${m.name}')">Bloquear</button>`) : ''}
@@ -2773,9 +2774,11 @@ async function machineDetail(id,name){
         <div><span style="color:var(--tx3)">Conectividad:</span> ${machineState.online?'Online':'Offline'}</div>
         <div><span style="color:var(--tx3)">Último contacto:</span> ${machineState.last_seen?timeSince(machineState.last_seen):'Nunca'}</div>
         <div><span style="color:var(--tx3)">Precio configurado:</span> ${formatMachinePriceValue(machineState.price_cents)}</div>
+        <div><span style="color:var(--tx3)">Firmware actual:</span> ${escHtml(machineState.current_firmware_version||'â€”')}</div>
         <div><span style="color:var(--tx3)">SSID:</span> ${escHtml(machineState.wifi_ssid||'—')}</div>
         <div><span style="color:var(--tx3)">RSSI:</span> ${formatMachineRssi(machineState.wifi_rssi)}</div>
         <div><span style="color:var(--tx3)">IP:</span> ${escHtml(machineState.wifi_ip||'—')}</div>
+        <div><span style="color:var(--tx3)">OTA:</span> <span class="badge ${machineOtaStatusMeta(machineState.firmware_update_status).cls}">${machineOtaStatusMeta(machineState.firmware_update_status).label}</span></div>
         <div><span style="color:var(--tx3)">Backend:</span> <span class="badge ${backend.cls}">${backend.label}</span></div>
         <div style="grid-column:1 / -1"><span style="color:var(--tx3)">URL backend:</span> ${escHtml(machineState.backend_url||'—')}</div>
         ${machineState.backend_error?`<div style="grid-column:1 / -1"><span style="color:var(--tx3)">Último error:</span> ${escHtml(machineState.backend_error)}</div>`:''}
@@ -2789,6 +2792,7 @@ async function machineDetail(id,name){
       openModal(`Máquina: ${name}`,`
         ${networkBlock}
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">
+          ${canManageMachineTechnicalConfig()?`<button type="button" class="btn btn-ghost btn-sm" onclick="openMachineOta(${id})">OTA</button>`:''}
           <button type="button" class="btn btn-ghost btn-sm" onclick='openMachineStock(${id},${JSON.stringify(name)})'>Actualizar stock</button>
           <button type="button" class="btn btn-primary btn-sm" onclick="openRemoteDiagnostics(${id},'${name.replace(/'/g,"&#39;")}',${machineState?.online?'true':'false'})" ${machineState?.online?'':'disabled title="Solo disponible si la máquina está online"'}>Diagnóstico remoto</button>
           ${canManageMachineTechnicalConfig()?`<button type="button" class="btn btn-ghost btn-sm" onclick="openMachineTechnicalConfig(${id})">Config técnica</button>`:''}
@@ -3455,6 +3459,141 @@ async function saveMachineTechnicalConfig(id){
 // ══════════════════════════════════════════════════════
 //  EMPLEADOS
 // ══════════════════════════════════════════════════════
+function machineOtaStatusMeta(status){
+  const key=(status||'idle').toLowerCase();
+  return {
+    idle:{label:'Sin objetivo OTA',cls:'bw'},
+    queued:{label:'En cola',cls:'bw'},
+    in_progress:{label:'En progreso',cls:'bs'},
+    pending_reconnect:{label:'Esperando re-registro',cls:'bw'},
+    failed:{label:'Falló',cls:'bd'},
+    success:{label:'Exitosa',cls:'bs'}
+  }[key]||{label:key||'—',cls:'bw'};
+}
+
+function formatMachineDateTime(value){
+  if(!value) return '—';
+  try{return new Date(value).toLocaleString('es-AR');}
+  catch(_){return '—';}
+}
+
+function renderMachineOtaReleaseRows(machineId,releases,desiredReleaseId){
+  if(!releases.length){
+    return '<tr><td colspan="6" class="empty">Todavía no hay releases OTA cargadas.</td></tr>';
+  }
+  return releases.map(rel=>{
+    const desired=Number(desiredReleaseId||0)===Number(rel.id);
+    return `<tr>
+      <td><strong>${escHtml(rel.version)}</strong>${desired?'<div style="font-size:11px;color:var(--tx3)">Objetivo actual</div>':''}</td>
+      <td>${escHtml(rel.filename)}</td>
+      <td>${Math.round((Number(rel.size_bytes||0)/1024)*10)/10} KB</td>
+      <td style="font-size:11px;color:var(--tx3)">${escHtml(rel.md5||'—')}</td>
+      <td style="font-size:11px;color:var(--tx3)">${rel.created_at?new Date(rel.created_at).toLocaleString('es-AR'):'—'}</td>
+      <td style="white-space:nowrap">
+        <button type="button" class="btn btn-ghost btn-xs" onclick="deployMachineFirmware(${machineId},${rel.id})">Desplegar</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function openMachineOta(id){
+  if(!canManageMachineTechnicalConfig()){alert('Este rol no puede gestionar OTA.');return;}
+  try{
+    const data=await api('GET',`/api/machines/${id}/ota`);
+    const machine=data.machine||{};
+    const ota=data.ota||{};
+    const releases=data.releases||[];
+    const meta=machineOtaStatusMeta(ota.firmware_update_status);
+    const online=(allMachines||[]).find(m=>Number(m.id)===Number(id))?.online;
+    openModal(`OTA: ${machine.name||'Máquina'}`,`
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">
+        <div style="padding:12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line)"><div style="font-size:11px;color:var(--tx3);margin-bottom:4px">Versión actual</div><div style="font-size:20px;font-weight:700">${escHtml(ota.current_firmware_version||'—')}</div></div>
+        <div style="padding:12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line)"><div style="font-size:11px;color:var(--tx3);margin-bottom:4px">Objetivo</div><div style="font-size:20px;font-weight:700">${escHtml(ota.desired_firmware_version||'—')}</div></div>
+        <div style="padding:12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line)"><div style="font-size:11px;color:var(--tx3);margin-bottom:4px">Estado OTA</div><div><span class="badge ${meta.cls}">${meta.label}</span></div></div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);line-height:1.45;margin-bottom:14px">
+        ${online?'La máquina está online y puede recibir una OTA ahora mismo.':'La máquina está offline; si desplegás una release quedará pendiente hasta que vuelva a registrarse.'}
+      </div>
+      <div style="padding:12px;border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-size:12px;line-height:1.55;margin-bottom:16px">
+        <div><strong>Mensaje:</strong> ${escHtml(ota.firmware_update_message||'—')}</div>
+        <div><strong>Inicio:</strong> ${escHtml(formatMachineDateTime(ota.firmware_update_started_at))}</div>
+        <div><strong>Fin:</strong> ${escHtml(formatMachineDateTime(ota.firmware_update_completed_at))}</div>
+      </div>
+      <div class="section-lbl" style="margin-bottom:8px">Subir nueva release</div>
+      <div class="field-row">
+        <div class="field"><label>Versión *</label><input id="otaVersion" placeholder="3.1.1"></div>
+        <div class="field"><label>Binario *.bin *</label><input id="otaFile" type="file" accept=".bin,application/octet-stream"></div>
+      </div>
+      <div class="field"><label>Notas</label><textarea id="otaNotes" rows="3" placeholder="Cambios relevantes de esta release"></textarea></div>
+      <div class="err-banner" id="otaErr"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">
+        <button type="button" class="btn btn-primary btn-sm" onclick="uploadFirmwareRelease(${id})">Subir release</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="openMachineOta(${id})">Refrescar</button>
+      </div>
+      <div class="section-lbl" style="margin-bottom:8px">Releases OTA disponibles</div>
+      <table>
+        <thead><tr><th>Versión</th><th>Archivo</th><th>Tamaño</th><th>MD5</th><th>Alta</th><th></th></tr></thead>
+        <tbody>${renderMachineOtaReleaseRows(id,releases,ota.desired_firmware_release_id)}</tbody>
+      </table>
+    `,'',true);
+  }catch(e){
+    alert('Error: '+e.message);
+  }
+}
+
+async function uploadFirmwareRelease(id){
+  const version=(document.getElementById('otaVersion')?.value||'').trim();
+  const file=document.getElementById('otaFile')?.files?.[0];
+  const notes=(document.getElementById('otaNotes')?.value||'').trim();
+  if(!version){showModalErr('otaErr','La versión OTA es requerida.');return;}
+  if(!file){showModalErr('otaErr','Seleccioná un binario .bin para subir.');return;}
+  const errEl=document.getElementById('otaErr');
+  if(errEl) errEl.style.display='none';
+  try{
+    const res=await fetch(BASE+'/api/firmware/releases',{
+      method:'POST',
+      headers:{
+        'Authorization':'Bearer '+TOKEN,
+        'Content-Type':'application/octet-stream',
+        'X-Firmware-Version':version,
+        'X-Firmware-Filename':file.name,
+        'X-Firmware-Notes':notes
+      },
+      body:file
+    });
+    if(res.status===401){doLogout();throw new Error('Sesión expirada');}
+    const text=await res.text();
+    let data={};
+    if(text){
+      try{data=JSON.parse(text);}catch(_){data={error:text};}
+    }
+    if(!res.ok) throw new Error(data.error||('Error HTTP '+res.status));
+    await openMachineOta(id);
+    alert(`Release ${data.release?.version||version} subida correctamente.`);
+  }catch(e){
+    showModalErr('otaErr',e.message);
+  }
+}
+
+async function deployMachineFirmware(id,releaseId){
+  if(!confirm('¿Desplegar esta release OTA sobre la máquina?')) return;
+  try{
+    const data=await api('POST',`/api/machines/${id}/ota/deploy`,{release_id:Number(releaseId)});
+    await loadMachines();
+    await openMachineOta(id);
+    const status=data.ota?.firmware_update_status||'queued';
+    if(status==='queued'){
+      alert('OTA encolada para la máquina.');
+    }else if(status==='pending_reconnect'){
+      alert('OTA registrada. La máquina la aplicará al reconectarse o cuando quede libre.');
+    }else{
+      alert('OTA programada.');
+    }
+  }catch(e){
+    alert('Error: '+e.message);
+  }
+}
+
 let allEmployees=[];
 
 async function loadEmployees(){

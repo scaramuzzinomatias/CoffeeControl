@@ -45,10 +45,20 @@ const MACHINE_TECH_REPORTED_FIELDS = Object.freeze([
     'last_reported_technical_config',
     'last_reported_technical_config_at'
 ]);
+const MACHINE_OTA_FIELDS = Object.freeze([
+    'current_firmware_version',
+    'desired_firmware_release_id',
+    'desired_firmware_version',
+    'firmware_update_status',
+    'firmware_update_message',
+    'firmware_update_started_at',
+    'firmware_update_completed_at'
+]);
 const MACHINE_TECH_CONFIG_SQL = MACHINE_TECH_CONFIG_FIELDS.join(', ');
 const MACHINE_TECH_META_SQL = MACHINE_TECH_META_FIELDS.join(', ');
 const MACHINE_TECH_REPORTED_SQL = MACHINE_TECH_REPORTED_FIELDS.join(', ');
-const MACHINE_TECH_CONFIG_SELECT = `id, name, location, last_seen, ${MACHINE_TECH_CONFIG_SQL}, ${MACHINE_TECH_META_SQL}, ${MACHINE_TECH_REPORTED_SQL}`;
+const MACHINE_OTA_SQL = MACHINE_OTA_FIELDS.join(', ');
+const MACHINE_TECH_CONFIG_SELECT = `id, name, location, last_seen, ${MACHINE_TECH_CONFIG_SQL}, ${MACHINE_TECH_META_SQL}, ${MACHINE_TECH_REPORTED_SQL}, ${MACHINE_OTA_SQL}`;
 const MACHINE_TECH_FIELD_LABELS = Object.freeze({
     price_cents: 'Precio',
     pricing_profile: 'Perfil MDB',
@@ -78,6 +88,12 @@ function normalizeOptionalInteger(value) {
     if (value === null || value === undefined || value === '') return null;
     const parsed = parseInt(value, 10);
     return Number.isInteger(parsed) ? parsed : null;
+}
+
+function normalizeFirmwareVersion(value) {
+    if (typeof value !== 'string') return null;
+    const version = value.trim();
+    return version ? version.slice(0, 80) : null;
 }
 
 function normalizePositiveInteger(value) {
@@ -142,6 +158,28 @@ function buildMachineTechnicalConfig(machine) {
         config_version: Number(machine?.technical_config_version ?? machine?.config_version ?? DEFAULT_MACHINE_TECH_CONFIG.config_version),
         config_source: normalizeConfigSource(machine?.technical_config_source ?? machine?.config_source, DEFAULT_MACHINE_TECH_CONFIG.config_source),
         config_updated_at: machine?.technical_config_updated_at ?? machine?.config_updated_at ?? DEFAULT_MACHINE_TECH_CONFIG.config_updated_at
+    };
+}
+
+function buildMachineOtaState(machine, release = null) {
+    return {
+        current_firmware_version: normalizeFirmwareVersion(machine?.current_firmware_version),
+        desired_firmware_release_id: machine?.desired_firmware_release_id ? Number(machine.desired_firmware_release_id) : null,
+        desired_firmware_version: normalizeFirmwareVersion(machine?.desired_firmware_version),
+        firmware_update_status: machine?.firmware_update_status || 'idle',
+        firmware_update_message: machine?.firmware_update_message || '',
+        firmware_update_started_at: machine?.firmware_update_started_at || null,
+        firmware_update_completed_at: machine?.firmware_update_completed_at || null,
+        desired_release: release ? {
+            id: Number(release.id),
+            version: release.version,
+            filename: release.filename,
+            size_bytes: Number(release.size_bytes),
+            md5: release.md5,
+            notes: release.notes || '',
+            created_at: release.created_at,
+            created_by_username: release.created_by_username || null
+        } : null
     };
 }
 
@@ -368,6 +406,43 @@ function parseTechnicalConfigBody(body = {}) {
     return patch;
 }
 
+function serializeFirmwareRelease(row) {
+    return {
+        id: Number(row.id),
+        version: row.version,
+        filename: row.filename,
+        size_bytes: Number(row.size_bytes),
+        md5: row.md5,
+        notes: row.notes || '',
+        created_at: row.created_at,
+        created_by_username: row.created_by_username || null
+    };
+}
+
+function buildFirmwareCommandPayload(release) {
+    return {
+        release_id: Number(release.id),
+        version: release.version,
+        size_bytes: Number(release.size_bytes),
+        md5: release.md5,
+        download_path: `/api/machine-firmware/releases/${Number(release.id)}/download`
+    };
+}
+
+async function getFirmwareReleaseById(releaseId) {
+    const result = await pool.query(
+        `SELECT id, version, filename, size_bytes, md5, notes, created_at, created_by_username
+         FROM firmware_releases
+         WHERE id = $1`,
+        [releaseId]
+    );
+    return result.rows[0] || null;
+}
+
+function otaCanQueueAfterRegister(status) {
+    return ['queued', 'in_progress', 'pending_reconnect'].includes(status || 'idle');
+}
+
 async function queueMachineCommand({ machineId, machineName, commandType, payload, req }) {
     const insertResult = await pool.query(
         `INSERT INTO machine_commands(machine_id, command_type, payload)
@@ -411,6 +486,127 @@ async function getActiveMachineById(machineId) {
         [machineId]
     );
     return result.rows[0] || null;
+}
+
+async function getQueuedMachineCommand(machineId) {
+    const result = await pool.query(
+        `SELECT id, command_type
+         FROM machine_commands
+         WHERE machine_id = $1
+           AND status = 'queued'
+         ORDER BY queued_at DESC
+         LIMIT 1`,
+        [machineId]
+    );
+    return result.rows[0] || null;
+}
+
+async function queueFirmwareUpdateForMachine({ machine, release, req, statusWhenQueued = 'queued', messageWhenQueued = null }) {
+    const payload = buildFirmwareCommandPayload(release);
+    const queuedCommand = await queueMachineCommand({
+        machineId: machine.id,
+        machineName: machine.name,
+        commandType: 'firmware_update',
+        payload,
+        req
+    });
+
+    await pool.query(
+        `UPDATE machines
+         SET desired_firmware_release_id = $2,
+             desired_firmware_version = $3,
+             firmware_update_status = $4,
+             firmware_update_message = $5,
+             firmware_update_started_at = NULL,
+             firmware_update_completed_at = NULL
+         WHERE id = $1`,
+        [
+            machine.id,
+            release.id,
+            release.version,
+            statusWhenQueued,
+            messageWhenQueued || `Release ${release.version} encolada para OTA`
+        ]
+    );
+
+    return queuedCommand;
+}
+
+async function maybeQueuePendingFirmwareUpdate(machine) {
+    if (!machine?.desired_firmware_release_id || !machine?.desired_firmware_version) {
+        return machine;
+    }
+
+    const currentVersion = normalizeFirmwareVersion(machine.current_firmware_version);
+    if (currentVersion && currentVersion === machine.desired_firmware_version) {
+        await pool.query(
+            `UPDATE machine_commands
+             SET status = 'completed',
+                 completed_at = COALESCE(completed_at, NOW()),
+                 result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('message', $2::text, 'version', $3::text)
+             WHERE machine_id = $1
+               AND command_type = 'firmware_update'
+               AND status = 'queued'`,
+            [machine.id, `Firmware ${currentVersion} activo`, currentVersion]
+        );
+        const synced = await pool.query(
+            `UPDATE machines
+             SET firmware_update_status = 'success',
+                 firmware_update_message = $2,
+                 firmware_update_completed_at = NOW()
+             WHERE id = $1
+             RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
+            [machine.id, `Firmware ${currentVersion} activo`]
+        );
+        return synced.rows[0] || machine;
+    }
+
+    if (!otaCanQueueAfterRegister(machine.firmware_update_status)) {
+        return machine;
+    }
+
+    const existing = await getQueuedMachineCommand(machine.id);
+    if (existing) {
+        const pending = await pool.query(
+            `UPDATE machines
+             SET firmware_update_status = 'pending_reconnect',
+                 firmware_update_message = $2
+             WHERE id = $1
+             RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
+            [machine.id, `OTA pendiente; hay otro comando remoto en cola (${existing.command_type})`]
+        );
+        return pending.rows[0] || machine;
+    }
+
+    const release = await getFirmwareReleaseById(machine.desired_firmware_release_id);
+    if (!release) {
+        const failed = await pool.query(
+            `UPDATE machines
+             SET firmware_update_status = 'failed',
+                 firmware_update_message = $2,
+                 firmware_update_completed_at = NOW()
+             WHERE id = $1
+             RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
+            [machine.id, 'La release OTA deseada ya no existe en backend']
+        );
+        return failed.rows[0] || machine;
+    }
+
+    await queueFirmwareUpdateForMachine({
+        machine,
+        release,
+        req: null,
+        statusWhenQueued: 'queued',
+        messageWhenQueued: `Release ${release.version} encolada al reconectarse`
+    });
+
+    const refreshed = await pool.query(
+        `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+         FROM machines
+         WHERE id = $1`,
+        [machine.id]
+    );
+    return refreshed.rows[0] || machine;
 }
 
 function syncStockAlert(machine, stockItem) {
@@ -467,6 +663,7 @@ router.post('/register', async (req, res) => {
         backend_url,
         price_cents,
         pricing_profile,
+        firmware_version,
         wifi_rssi,
         wifi_ip,
         backend_ok,
@@ -479,6 +676,7 @@ router.post('/register', async (req, res) => {
     const backendUrl = normalizeOptionalString(backend_url, 255);
     const reportedPriceCents = normalizePositiveInteger(price_cents);
     const pricingProfile = normalizePricingProfile(pricing_profile);
+    const firmwareVersion = normalizeFirmwareVersion(firmware_version);
     const reportedConfigVersion = normalizePositiveInteger(req.body?.config_version);
     const reportedConfigSource = normalizeConfigSource(req.body?.config_source, 'unknown');
     const wifiRssi = normalizeOptionalInteger(wifi_rssi);
@@ -513,15 +711,16 @@ router.post('/register', async (req, res) => {
                  SET last_seen = NOW(),
                     wifi_ssid = COALESCE($2, wifi_ssid),
                     backend_url = COALESCE($3, backend_url),
-                     wifi_rssi = COALESCE($4, wifi_rssi),
-                     wifi_ip = COALESCE($5, wifi_ip),
-                     backend_ok = COALESCE($6, backend_ok),
-                     backend_error = $7,
-                     last_reported_technical_config = $8::jsonb,
+                     current_firmware_version = COALESCE($4, current_firmware_version),
+                     wifi_rssi = COALESCE($5, wifi_rssi),
+                     wifi_ip = COALESCE($6, wifi_ip),
+                     backend_ok = COALESCE($7, backend_ok),
+                     backend_error = $8,
+                     last_reported_technical_config = $9::jsonb,
                      last_reported_technical_config_at = NOW()
                  WHERE mac = $1
                  RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
-                [macClean, wifiSsid, backendUrl, wifiRssi, wifiIp, backendOk, backendError, JSON.stringify(reportedConfig)]
+                [macClean, wifiSsid, backendUrl, firmwareVersion, wifiRssi, wifiIp, backendOk, backendError, JSON.stringify(reportedConfig)]
             );
             let machineState = updateResult.rows[0];
             const desiredConfig = buildMachineTechnicalConfig(machineState);
@@ -535,11 +734,13 @@ router.post('/register', async (req, res) => {
                     'backend'
                 ) || machineState;
             }
+            machineState = await maybeQueuePendingFirmwareUpdate(machineState);
             alerts.resolveMachineOffline(machineState.id).catch(err => console.error('[ALERT] Error resolviendo offline:', err.message));
             return res.status(200).json({
                 status: 'approved',
                 machine: approved.rows[0].name,
-                config: buildMachineTechnicalConfig(machineState)
+                config: buildMachineTechnicalConfig(machineState),
+                ota: buildMachineOtaState(machineState)
             });
         }
 
@@ -797,6 +998,146 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
             technical_config: buildMachineTechnicalConfig(updatedMachine),
             config_sync: configSync,
             support: await buildMachineTechnicalSupport(updatedMachine)
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.get('/:id/ota', requireMachineTechnicalConfig, async (req, res) => {
+    try {
+        const machineResult = await pool.query(
+            `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+             FROM machines
+             WHERE id = $1`,
+            [req.params.id]
+        );
+        if (machineResult.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
+
+        const machine = machineResult.rows[0];
+        let desiredRelease = null;
+        if (machine.desired_firmware_release_id) {
+            desiredRelease = await getFirmwareReleaseById(machine.desired_firmware_release_id);
+        }
+
+        const releasesResult = await pool.query(
+            `SELECT id, version, filename, size_bytes, md5, notes, created_at, created_by_username
+             FROM firmware_releases
+             ORDER BY created_at DESC, id DESC`
+        );
+
+        res.json({
+            machine: {
+                id: machine.id,
+                name: machine.name,
+                location: machine.location,
+                last_seen: machine.last_seen
+            },
+            ota: buildMachineOtaState(machine, desiredRelease),
+            releases: releasesResult.rows.map(serializeFirmwareRelease)
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) => {
+    const machineId = parseMachineId(req.params.id);
+    const releaseId = normalizePositiveInteger(req.body?.release_id);
+
+    if (!machineId || !releaseId) {
+        return res.status(400).json({ error: 'machine_id/release_id inválidos' });
+    }
+
+    try {
+        const machineResult = await pool.query(
+            `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+             FROM machines
+             WHERE id = $1
+               AND active = true`,
+            [machineId]
+        );
+        if (machineResult.rowCount === 0) {
+            return res.status(404).json({ error: 'No encontrada' });
+        }
+
+        const machine = machineResult.rows[0];
+        const release = await getFirmwareReleaseById(releaseId);
+        if (!release) {
+            return res.status(404).json({ error: 'Release OTA no encontrada' });
+        }
+
+        if (normalizeFirmwareVersion(machine.current_firmware_version) === release.version) {
+            return res.status(409).json({ error: 'La máquina ya reporta esa versión de firmware.' });
+        }
+
+        const existing = await getQueuedMachineCommand(machine.id);
+        let otaStatus = isMachineOnline(machine.last_seen) ? 'queued' : 'pending_reconnect';
+        let otaMessage = isMachineOnline(machine.last_seen)
+            ? `Release ${release.version} encolada para OTA`
+            : `Release ${release.version} lista para aplicar al reconectarse`;
+
+        if (existing) {
+            otaStatus = 'pending_reconnect';
+            otaMessage = `Release ${release.version} pendiente; ya existe un comando remoto en cola (${existing.command_type})`;
+        }
+
+        await pool.query(
+            `UPDATE machines
+             SET desired_firmware_release_id = $2,
+                 desired_firmware_version = $3,
+                 firmware_update_status = $4,
+                 firmware_update_message = $5,
+                 firmware_update_started_at = NULL,
+                 firmware_update_completed_at = NULL
+             WHERE id = $1`,
+            [machine.id, release.id, release.version, otaStatus, otaMessage]
+        );
+
+        let queuedCommand = null;
+        if (!existing && isMachineOnline(machine.last_seen)) {
+            queuedCommand = await queueFirmwareUpdateForMachine({
+                machine,
+                release,
+                req,
+                statusWhenQueued: 'queued',
+                messageWhenQueued: otaMessage
+            });
+        }
+
+        await audit.logAuditEvent({
+            req,
+            action: 'machine.deploy_firmware',
+            entityType: 'machine',
+            entityId: machine.id,
+            entityLabel: machine.name,
+            summary: `Programó OTA ${release.version} para ${machine.name}`,
+            details: {
+                release: serializeFirmwareRelease(release),
+                status: otaStatus,
+                queued_command_id: queuedCommand ? Number(queuedCommand.id) : null
+            }
+        });
+
+        const refreshedResult = await pool.query(
+            `SELECT ${MACHINE_TECH_CONFIG_SELECT}
+             FROM machines
+             WHERE id = $1`,
+            [machine.id]
+        );
+        const refreshed = refreshedResult.rows[0];
+
+        res.status(201).json({
+            machine: {
+                id: refreshed.id,
+                name: refreshed.name,
+                location: refreshed.location
+            },
+            ota: buildMachineOtaState(refreshed, release),
+            command: queuedCommand ? {
+                id: Number(queuedCommand.id),
+                type: queuedCommand.command_type
+            } : null
         });
     } catch (err) {
         res.status(500).json({ error: err.message });

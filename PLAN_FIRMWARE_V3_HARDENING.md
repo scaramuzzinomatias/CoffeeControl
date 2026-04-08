@@ -16,6 +16,18 @@ Decision de reloj ya cerrada:
 - el experimento de `gateway 0x18` ya se evaluo y la Rubino actual no lo usa
 - `DS3231` queda descartado del diseno operativo actual
 
+Estado experimental de hardware MDB al 2026-04-07:
+
+- se probo una interfaz aislada con `6N137` en RX y `4N32` en TX
+- con el cableado actual del `4N32`, la Rubino no aceptaba al lector si el firmware mantenia la inversion TX original
+- sintoma observado: `MDB_RESET` repetidos, sin `SETUP`, sin credito y sin habilitar seleccion
+- prueba confirmatoria realizada: desactivar la inversion TX por software (`MDB_UART_TX_INVERT = 0`) hizo que la maquina volviera a mostrar credito y aceptar seleccion
+- conclusion operativa: el prototipo aislado actual introduce una inversion extra en TX
+- regla para retomar:
+  - hardware original/BC548 en TX -> `MDB_UART_TX_INVERT = 1`
+  - prototipo actual con `4N32` en TX cableado como hoy -> `MDB_UART_TX_INVERT = 0`
+- esta decision queda marcada como temporal hasta reformar la placa y reevaluar la etapa TX
+
 Objetivo:
 
 - mejorar robustez, mantenibilidad y capacidad de diagnostico
@@ -191,6 +203,7 @@ Estado actual:
 - estado actual experimental: el firmware ya expone un `Communications Gateway` MDB mínimo en `0x18` para evaluar soporte real del VMC sin tocar el `cashless 0x10` validado; por ahora se limita a `RESET`, `SETUP`, `CONTROL`, `IDENTIFICATION`, `FEATURE ENABLE` y `TIME/DATE REQUEST`
 - resultado real en Rubino: el `gateway 0x18` no fue interrogado por la máquina (`Setup/Control/Identification/Feature Enable/Time-Date` quedaron en `No`), así que no sirve hoy como vía práctica para sincronizar reloj o ampliar telemetría en esta instalación
 - decision operativa posterior a esa prueba: el firmware deja `NTP` como reloj principal, usa fecha/hora MDB solo como apoyo diagnóstico y descarta `DS3231` del diseño activo
+- estado actual de firmware para prueba del prototipo aislado: el switch `MDB_UART_TX_INVERT` quedó expuesto en `MDB9bit.h` y seteado desde `main.cpp` para permitir probar polaridad de TX sin reformar placa en el momento
 
 Pendiente dentro de esta etapa:
 

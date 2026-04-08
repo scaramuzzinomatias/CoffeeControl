@@ -4,6 +4,57 @@ const { broadcast } = require('../ws');
 
 const router = express.Router();
 
+function otaCommandMessage(result, fallback) {
+    if (typeof result?.message === 'string' && result.message.trim()) {
+        return result.message.trim().slice(0, 255);
+    }
+    return fallback;
+}
+
+async function markFirmwareCommandDelivered(machineId, command) {
+    if (command.command_type !== 'firmware_update') return;
+
+    const version = String(command.payload?.version || '').trim();
+    const message = version
+        ? `Descarga OTA ${version} en progreso`
+        : 'Descarga OTA en progreso';
+
+    await pool.query(
+        `UPDATE machines
+         SET firmware_update_status = 'in_progress',
+             firmware_update_message = $2,
+             firmware_update_started_at = COALESCE(firmware_update_started_at, NOW()),
+             firmware_update_completed_at = NULL
+         WHERE id = $1`,
+        [machineId, message]
+    );
+}
+
+async function markFirmwareCommandAck(machineId, commandType, status, result) {
+    if (commandType !== 'firmware_update') return;
+
+    if (status === 'failed') {
+        await pool.query(
+            `UPDATE machines
+             SET firmware_update_status = 'failed',
+                 firmware_update_message = $2,
+                 firmware_update_completed_at = NOW()
+             WHERE id = $1`,
+            [machineId, otaCommandMessage(result, 'La actualización OTA falló.')]
+        );
+        return;
+    }
+
+    await pool.query(
+        `UPDATE machines
+         SET firmware_update_status = 'pending_reconnect',
+             firmware_update_message = $2,
+             firmware_update_completed_at = NOW()
+         WHERE id = $1`,
+        [machineId, otaCommandMessage(result, 'Firmware grabado; esperando re-registro con la nueva versión.')]
+    );
+}
+
 router.get('/commands/next', async (req, res) => {
     try {
         const result = await pool.query(
@@ -27,6 +78,7 @@ router.get('/commands/next', async (req, res) => {
              WHERE id = $1`,
             [command.id]
         );
+        await markFirmwareCommandDelivered(req.machine.id, command);
 
         return res.json({
             command: {
@@ -70,6 +122,7 @@ router.post('/commands/:id/ack', async (req, res) => {
         }
 
         const command = updateResult.rows[0];
+        await markFirmwareCommandAck(req.machine.id, command.command_type, status, result || {});
         broadcast({
             event: status === 'completed' ? 'machine_command_completed' : 'machine_command_failed',
             machine_id: req.machine.id,

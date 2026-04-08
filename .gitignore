@@ -11,6 +11,8 @@ node_modules/
 # Env files con credenciales reales
 backend/.env
 backend/*.log
+backend/storage/
+CoffeeControl_v3/ota-artifacts/
 
 # OS
 .DS_Store

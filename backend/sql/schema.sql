@@ -71,6 +71,13 @@ CREATE TABLE machines (
     technical_config_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_reported_technical_config JSONB,
     last_reported_technical_config_at TIMESTAMPTZ,
+    current_firmware_version VARCHAR(80),
+    desired_firmware_release_id INT,
+    desired_firmware_version VARCHAR(80),
+    firmware_update_status VARCHAR(24) NOT NULL DEFAULT 'idle',
+    firmware_update_message VARCHAR(255),
+    firmware_update_started_at TIMESTAMPTZ,
+    firmware_update_completed_at TIMESTAMPTZ,
     wifi_ssid   VARCHAR(64),
     backend_url VARCHAR(255),
     wifi_rssi   INT,
@@ -88,8 +95,31 @@ CREATE TABLE machines (
     CHECK (mdb_max_response_time BETWEEN 0 AND 255),
     CHECK (mdb_misc_options BETWEEN 0 AND 255),
     CHECK (technical_config_version >= 1),
-    CHECK (technical_config_source IN ('backend', 'portal', 'factory', 'unknown'))
+    CHECK (technical_config_source IN ('backend', 'portal', 'factory', 'unknown')),
+    CHECK (firmware_update_status IN ('idle', 'queued', 'in_progress', 'pending_reconnect', 'failed', 'success'))
 );
+
+CREATE TABLE firmware_releases (
+    id                  SERIAL PRIMARY KEY,
+    version             VARCHAR(80) NOT NULL UNIQUE,
+    filename            VARCHAR(180) NOT NULL,
+    storage_path        VARCHAR(255) NOT NULL UNIQUE,
+    content_type        VARCHAR(80) NOT NULL DEFAULT 'application/octet-stream',
+    size_bytes          INT NOT NULL,
+    md5                 CHAR(32) NOT NULL,
+    notes               TEXT,
+    created_by_user_id  INT,
+    created_by_username VARCHAR(60),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (size_bytes > 0),
+    CHECK (md5 ~ '^[0-9a-f]{32}$')
+);
+
+ALTER TABLE machines
+    ADD CONSTRAINT machines_desired_firmware_release_fk
+    FOREIGN KEY (desired_firmware_release_id)
+    REFERENCES firmware_releases(id)
+    ON DELETE SET NULL;
 
 CREATE TABLE alert_events (
     alert_key        VARCHAR(160) PRIMARY KEY,
@@ -149,6 +179,12 @@ CREATE TABLE admin_user_departments (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (admin_user_id, department)
 );
+
+ALTER TABLE firmware_releases
+    ADD CONSTRAINT firmware_releases_created_by_fk
+    FOREIGN KEY (created_by_user_id)
+    REFERENCES admin_users(id)
+    ON DELETE SET NULL;
 
 CREATE TABLE mobile_sessions (
     id                 BIGSERIAL PRIMARY KEY,

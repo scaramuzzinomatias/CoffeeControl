@@ -32,6 +32,7 @@ Lineas ya acordadas:
 - estado actual: configuración técnica remota integral ya disponible solo para `admin`, `tecnico` y `distribuidor`
 - estado actual: el panel ya ofrece `Compatibilidad asistida` en `Máquinas > Diag` y botón `Sugerir según último SETUP MDB` en `Config técnica`, sin autoaplicar cambios
 - estado actual: se agregó y probó un experimento controlado de `Communications Gateway` MDB (`0x18`); la Rubino evaluada no lo interroga, así que por ahora el reloj operativo queda con `NTP` como fuente principal y el cashless `0x10` sigue siendo el camino real de integración
+- estado actual: se probó una interfaz MDB aislada prototipo (`6N137` en RX, `4N32` en TX); la Rubino solo vuelve a aceptar credito y seleccion cuando el firmware desactiva la inversion TX (`MDB_UART_TX_INVERT = 0`), lo que confirma una inversion extra en la etapa TX actual. Queda documentado como decision temporal hasta reformar esa placa.
 
 ## Criterio de priorización
 

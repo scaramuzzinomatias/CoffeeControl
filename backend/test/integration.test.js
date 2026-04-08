@@ -1,5 +1,6 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const bcrypt = require('bcryptjs');
@@ -110,9 +111,22 @@ async function cleanupFixtures() {
             );
             const machineIds = machineIdsResult.rows.map(row => row.id);
             const employeeIds = employeeIdsResult.rows.map(row => row.id);
+            const firmwareReleasesResult = await client.query(
+                `SELECT id, storage_path
+                 FROM firmware_releases
+                 WHERE version LIKE $1`,
+                [`${TEST_PREFIX}%`]
+            );
+            const firmwareReleaseIds = firmwareReleasesResult.rows.map(row => row.id);
 
             if (machineIds.length) {
                 await client.query('DELETE FROM machine_commands WHERE machine_id = ANY($1::int[])', [machineIds]);
+            }
+            if (firmwareReleaseIds.length) {
+                await client.query(
+                    'UPDATE machines SET desired_firmware_release_id = NULL WHERE desired_firmware_release_id = ANY($1::int[])',
+                    [firmwareReleaseIds]
+                );
             }
             if (employeeIds.length || machineIds.length) {
                 const clauses = [];
@@ -157,7 +171,19 @@ async function cleanupFixtures() {
                  WHERE name LIKE $1`,
                 [`${TEST_PREFIX}%`]
             );
+            if (firmwareReleaseIds.length) {
+                await client.query(
+                    'DELETE FROM firmware_releases WHERE id = ANY($1::int[])',
+                    [firmwareReleaseIds]
+                );
+            }
             await client.query('COMMIT');
+            for (const release of firmwareReleasesResult.rows) {
+                const filePath = path.join(backendRoot, 'storage', 'firmware', release.storage_path);
+                try {
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                } catch (_) {}
+            }
         } catch (err) {
             try { await client.query('ROLLBACK'); } catch (_) {}
             throw err;
@@ -807,6 +833,117 @@ test('técnico puede actualizar configuración técnica completa y encola config
     });
     assert.equal(ack.status, 200);
     assert.equal(ack.json.ok, true);
+});
+
+test('técnico puede subir una release OTA, desplegarla y cerrar el ciclo al re-registrar la máquina', async () => {
+    await withDb(async (client) => {
+        await client.query('DELETE FROM machine_commands WHERE machine_id = $1', [fixture.machine.id]);
+        await client.query(
+            `UPDATE machines
+             SET last_seen = NOW(),
+                 current_firmware_version = '3.1.0',
+                 desired_firmware_release_id = NULL,
+                 desired_firmware_version = NULL,
+                 firmware_update_status = 'idle',
+                 firmware_update_message = NULL,
+                 firmware_update_started_at = NULL,
+                 firmware_update_completed_at = NULL
+             WHERE id = $1`,
+            [fixture.machine.id]
+        );
+    });
+
+    const binary = Buffer.from(`OTA_${TEST_PREFIX}`);
+    const uploadResponse = await fetch(`${BASE_URL}/api/firmware/releases`, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${technicianToken}`,
+            'Content-Type': 'application/octet-stream',
+            'X-Firmware-Version': `${TEST_PREFIX}-v2`,
+            'X-Firmware-Filename': 'coffeecontrol-test.bin',
+            'X-Firmware-Notes': 'release de integración'
+        },
+        body: binary
+    });
+    const uploadJson = await uploadResponse.json();
+    assert.equal(uploadResponse.status, 201);
+    assert.equal(uploadJson.release.version, `${TEST_PREFIX}-v2`);
+    assert.equal(uploadJson.release.size_bytes, binary.length);
+
+    const otaBeforeDeploy = await requestJson('GET', `/api/machines/${fixture.machine.id}/ota`, {
+        token: technicianToken
+    });
+    assert.equal(otaBeforeDeploy.status, 200);
+    assert.equal(otaBeforeDeploy.json.releases.some(release => release.version === `${TEST_PREFIX}-v2`), true);
+
+    const deploy = await requestJson('POST', `/api/machines/${fixture.machine.id}/ota/deploy`, {
+        token: technicianToken,
+        body: {
+            release_id: uploadJson.release.id
+        }
+    });
+    assert.equal(deploy.status, 201);
+    assert.equal(deploy.json.ota.desired_firmware_version, `${TEST_PREFIX}-v2`);
+    assert.equal(deploy.json.ota.firmware_update_status, 'queued');
+
+    const next = await requestJson('GET', '/api/machine-control/commands/next', {
+        headers: {
+            'X-Machine-Mac': fixture.machine.mac
+        }
+    });
+    assert.equal(next.status, 200);
+    assert.equal(next.json.command.type, 'firmware_update');
+    assert.equal(next.json.command.payload.version, `${TEST_PREFIX}-v2`);
+    assert.equal(next.json.command.payload.release_id, uploadJson.release.id);
+    assert.match(next.json.command.payload.download_path, /\/api\/machine-firmware\/releases\/\d+\/download$/);
+
+    const downloadResponse = await fetch(`${BASE_URL}${next.json.command.payload.download_path}`, {
+        headers: {
+            'X-Machine-Mac': fixture.machine.mac
+        }
+    });
+    const downloadBuffer = Buffer.from(await downloadResponse.arrayBuffer());
+    assert.equal(downloadResponse.status, 200);
+    assert.equal(downloadBuffer.equals(binary), true);
+    assert.equal(downloadResponse.headers.get('x-firmware-version'), `${TEST_PREFIX}-v2`);
+
+    const ack = await requestJson('POST', `/api/machine-control/commands/${next.json.command.id}/ack`, {
+        headers: machineHeaders(fixture.machine.mac),
+        body: {
+            status: 'completed',
+            result: { message: 'Firmware escrito; reiniciando', version: `${TEST_PREFIX}-v2` }
+        }
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(ack.json.ok, true);
+
+    const register = await requestJson('POST', '/api/machines/register', {
+        headers: {
+            'X-Registration-Secret': process.env.REGISTRATION_SECRET
+        },
+        body: {
+            mac: fixture.machine.mac,
+            backend_url: BASE_URL,
+            wifi_ssid: 'QA_WIFI',
+            firmware_version: `${TEST_PREFIX}-v2`,
+            price_cents: 1200,
+            pricing_profile: 'rubino_half_credit',
+            config_version: 3,
+            config_source: 'backend',
+            backend_ok: true
+        }
+    });
+    assert.equal(register.status, 200);
+    assert.equal(register.json.ota.current_firmware_version, `${TEST_PREFIX}-v2`);
+    assert.equal(register.json.ota.firmware_update_status, 'success');
+
+    const otaAfterRegister = await requestJson('GET', `/api/machines/${fixture.machine.id}/ota`, {
+        token: technicianToken
+    });
+    assert.equal(otaAfterRegister.status, 200);
+    assert.equal(otaAfterRegister.json.ota.current_firmware_version, `${TEST_PREFIX}-v2`);
+    assert.equal(otaAfterRegister.json.ota.desired_firmware_version, `${TEST_PREFIX}-v2`);
+    assert.equal(otaAfterRegister.json.ota.firmware_update_status, 'success');
 });
 
 test('supervisor no puede acceder a notificaciones ni auditoría', async () => {

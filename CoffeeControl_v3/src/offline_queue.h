@@ -19,5 +19,6 @@ bool offlineQueueLoad(fs::FS& fs,
                       int& outCount,
                       bool& migratedLegacy);
 
+bool offlineQueueEnsureJournal(fs::FS& fs, const char* journalPath);
 bool offlineQueueAppend(fs::FS& fs, const char* journalPath, const QueueEntry& entry);
 bool offlineQueueRewrite(fs::FS& fs, const char* journalPath, const QueueEntry* entries, int count);

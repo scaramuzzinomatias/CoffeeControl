@@ -15,6 +15,8 @@ const dashboardRoutes  = require('./routes/dashboard');
 const employeeRoutes   = require('./routes/employees');
 const machineRoutes    = require('./routes/machines');
 const machineCommandRoutes = require('./routes/machineCommands');
+const firmwareRoutes   = require('./routes/firmware');
+const machineFirmwareRoutes = require('./routes/machineFirmware');
 const reportRoutes     = require('./routes/reports');
 const adminUserRoutes  = require('./routes/adminUsers');
 const nfcCardsRoutes   = require('./routes/nfcCards');
@@ -43,6 +45,7 @@ app.use('/api/mobile-auth', mobileAuthRoutes);
 // Rutas ESP8266 (secret de máquina)
 app.use('/api/tap', machineAuth, tapRoutes);
 app.use('/api/machine-control', machineAuth, machineCommandRoutes);
+app.use('/api/machine-firmware', machineAuth, machineFirmwareRoutes);
 
 // Rutas del panel (JWT)
 app.use('/api/dashboard',   authJwt, dashboardRoutes);
@@ -67,6 +70,7 @@ app.use('/api/system-settings', authJwt, systemSettingsRoutes);
 app.use('/api/audit-logs', authJwt, auditLogsRoutes);
 app.use('/api/mobile-tech', authJwt, mobileTechRoutes);
 app.use('/api/alerts', authJwt, alertsRoutes);
+app.use('/api/firmware', authJwt, firmwareRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 

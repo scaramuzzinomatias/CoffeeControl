@@ -27,6 +27,10 @@
 #define MDB_TX_BUF     256
 #define MDB_RX_RING    64
 
+#ifndef MDB_UART_TX_INVERT
+#define MDB_UART_TX_INVERT 1
+#endif
+
 class MDB9bit {
 public:
     MDB9bit(uint8_t txPin, uint8_t rxPin)
@@ -48,9 +52,11 @@ public:
         uart_set_pin(MDB_UART_NUM, _tx, _rx,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-        // BC548 common-emitter invierte señal en TX solamente
-        // RX funciona sin inversión (ya probado)
-        uart_set_line_inverse(MDB_UART_NUM, UART_SIGNAL_TXD_INV);
+        // La inversión final de TX depende de la etapa física al bus MDB.
+        uart_set_line_inverse(
+            MDB_UART_NUM,
+            MDB_UART_TX_INVERT ? UART_SIGNAL_TXD_INV : (uart_signal_inv_t)0
+        );
 
         // FIFO threshold alto → no dispara evento por bytes individuales
         uart_set_rx_full_threshold(MDB_UART_NUM, 120);

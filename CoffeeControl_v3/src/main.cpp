@@ -62,6 +62,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -72,6 +73,9 @@
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <freertos/queue.h>
+// Prueba temporal con TX aislado por 4N32 cableado invertido.
+// Mañana, al volver al hardware original, esto debería volver a 1.
+#define MDB_UART_TX_INVERT 0
 #include "MDB9bit.h"
 #include "pricing.h"
 #include "device_config.h"
@@ -95,6 +99,9 @@
 #define DEPLOYMENT_MODE       "local"
 #define BACKEND_URL           "http://192.168.1.50:3000"   // fallback si campo vacío
 #define REGISTRATION_SECRET   "coffeecontrol-registro-2024"
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION      "3.1.0"
+#endif
 
 // ── Portal WiFi cautivo ───────────────────────────────
 #define AP_SSID        "CoffeeControl-Setup"
@@ -144,6 +151,7 @@
 // ── Timing ────────────────────────────────────────────
 #define NFC_COOLDOWN_MS    2500
 #define HTTP_TIMEOUT_MS    4000
+#define OTA_HTTP_TIMEOUT_MS 20000
 #define SESSION_TIMEOUT_MS 12000
 #define MDB_ASYNC_QUEUE_LEN 4
 #define MDB_ASYNC_UID_MAX 17
@@ -783,6 +791,9 @@ String buildDiagnosticsSnapshotJson(uint8_t eventLimit = 20) {
     else if (mdbMachineTimeValid) json += "mdb";
     else json += "uptime";
     json += "\"";
+    json += ",\"firmware_version\":\"";
+    json += jsonEscape(FIRMWARE_VERSION);
+    json += "\"";
     json += ",\"price_cents\":";
     json += pricingSanitizeHumanPrice(pricingConfig.priceCents);
     json += ",\"pricing_profile\":\"";
@@ -1285,6 +1296,7 @@ bool advanceDateByOneDay(const char* currentDate, char* out, size_t outSize) {
 void loadQueue() {
     bool migratedLegacy = false;
     int loaded = 0;
+    offlineQueueEnsureJournal(LittleFS, QUEUE_PATH);
     if (!offlineQueueLoad(LittleFS, QUEUE_PATH, QUEUE_LEGACY_PATH, queueBuf, MAX_QUEUE, loaded, migratedLegacy)) {
         queueLen = 0;
         return;
@@ -2119,10 +2131,11 @@ void registerMachine() {
     http.addHeader("X-Registration-Secret", REGISTRATION_SECRET);
     http.setTimeout(HTTP_TIMEOUT_MS);
 
-    DynamicJsonDocument doc(768);
+    DynamicJsonDocument doc(1024);
     doc["mac"] = macAddress;
     doc["wifi_ssid"] = wifiSSID;
     doc["backend_url"] = backendBase;
+    doc["firmware_version"] = FIRMWARE_VERSION;
     doc["price_cents"] = pricingSanitizeHumanPrice(pricingConfig.priceCents);
     doc["pricing_profile"] = pricingProfileCode(pricingConfig.profile);
     doc["config_version"] = technicalConfigVersion;
@@ -2147,7 +2160,7 @@ void registerMachine() {
     feedWatchdog();
 
     if (code == 200 && responseBody.length() > 0) {
-        DynamicJsonDocument responseDoc(768);
+        DynamicJsonDocument responseDoc(2048);
         DeserializationError err = deserializeJson(responseDoc, responseBody);
         if (!err) {
             JsonObject config = responseDoc["config"].as<JsonObject>();
@@ -2391,6 +2404,94 @@ bool handleRemoteConfigUpdate(uint32_t commandId, JsonObject payload) {
     return true;
 }
 
+bool handleRemoteFirmwareUpdate(uint32_t commandId, JsonObject payload) {
+    const uint32_t releaseId = (uint32_t)(payload["release_id"] | 0);
+    const uint32_t sizeBytes = (uint32_t)(payload["size_bytes"] | 0);
+    String version = String((const char*)(payload["version"] | ""));
+    String md5 = String((const char*)(payload["md5"] | ""));
+    String downloadPath = String((const char*)(payload["download_path"] | ""));
+
+    version.trim();
+    md5.trim();
+    downloadPath.trim();
+
+    if (releaseId == 0 || version.length() == 0 || sizeBytes == 0 || md5.length() != 32 || !downloadPath.startsWith("/")) {
+        ackRemoteCommand(commandId, "failed", "Payload OTA invalido");
+        return true;
+    }
+
+    String downloadUrl = backendBase + downloadPath;
+    Serial.printf("[OTA] Descargando release %lu (%s) desde %s\n",
+                  (unsigned long)releaseId,
+                  version.c_str(),
+                  downloadUrl.c_str());
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, downloadUrl)) {
+        ackRemoteCommand(commandId, "failed", "No se pudo abrir la descarga OTA");
+        return true;
+    }
+
+    http.addHeader("X-Machine-Mac", macAddress);
+    http.setTimeout(OTA_HTTP_TIMEOUT_MS);
+    int code = http.GET();
+    if (code != 200) {
+        http.end();
+        ackRemoteCommand(commandId, "failed", "Descarga OTA rechazo HTTP " + String(code));
+        return true;
+    }
+
+    const int responseLength = http.getSize();
+    if (responseLength > 0 && (uint32_t)responseLength != sizeBytes) {
+        http.end();
+        ackRemoteCommand(commandId, "failed", "Tamano OTA inesperado");
+        return true;
+    }
+
+    if (!Update.begin(sizeBytes)) {
+        http.end();
+        ackRemoteCommand(commandId, "failed", String("Update.begin fallo: ") + Update.errorString());
+        return true;
+    }
+    if (!Update.setMD5(md5.c_str())) {
+        Update.abort();
+        http.end();
+        ackRemoteCommand(commandId, "failed", "MD5 OTA invalido");
+        return true;
+    }
+
+    size_t written = Update.writeStream(*http.getStreamPtr());
+    bool updateOk = (written == sizeBytes) && Update.end();
+    String updateError = Update.errorString();
+    http.end();
+
+    if (!updateOk) {
+        Update.abort();
+        ackRemoteCommand(commandId, "failed", String("OTA fallo: ") + updateError);
+        return true;
+    }
+
+    DynamicJsonDocument resultDoc(256);
+    resultDoc["message"] = String("Firmware ") + version + " aplicado; reiniciando";
+    resultDoc["version"] = version;
+    resultDoc["release_id"] = releaseId;
+    String resultJson;
+    serializeJson(resultDoc, resultJson);
+
+    if (!ackRemoteCommandJson(commandId, "completed", resultJson)) {
+        Serial.println("[OTA] ACK no confirmado; el re-registro debera cerrar el estado.");
+    }
+
+    Serial.printf("[OTA] Release %s grabada (%lu bytes). Reiniciando...\n",
+                  version.c_str(),
+                  (unsigned long)written);
+    ledBlink(5, 80);
+    delay(400);
+    ESP.restart();
+    return true;
+}
+
 bool handleRemoteDiagnosticsSnapshot(uint32_t commandId, JsonObject payload) {
     uint8_t limit = (uint8_t)(payload["limit"] | 20);
     if (limit == 0) limit = 20;
@@ -2478,6 +2579,16 @@ void pollRemoteCommands() {
             return;
         }
         handleRemoteConfigUpdate(commandId, payload);
+        return;
+    }
+
+    if (commandType == "firmware_update") {
+        JsonObject payload = command["payload"].as<JsonObject>();
+        if (payload.isNull()) {
+            ackRemoteCommand(commandId, "failed", "Payload remoto invalido");
+            return;
+        }
+        handleRemoteFirmwareUpdate(commandId, payload);
         return;
     }
 
@@ -3155,7 +3266,8 @@ void setup() {
 
     // MDB 9-bit software serial
     mdb.begin();
-    Serial.println("[MDB] UART HW listo (TX=GPIO20, RX=GPIO21)");
+    Serial.printf("[MDB] UART HW listo (TX=GPIO20, RX=GPIO21, tx_inv=%s)\n",
+                  MDB_UART_TX_INVERT ? "on" : "off");
 
     // Arrancar tarea MDB independiente para responder al VMC durante boot
     mdbAsyncQueue = xQueueCreate(MDB_ASYNC_QUEUE_LEN, sizeof(MdbAsyncEvent));
