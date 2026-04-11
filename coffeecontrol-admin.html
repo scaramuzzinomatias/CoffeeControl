@@ -1154,6 +1154,14 @@ function isManagerRole(){
   return CURRENT_ROLE==='admin' || CURRENT_ROLE==='gerente';
 }
 
+function isAdminRole(){
+  return CURRENT_ROLE==='admin';
+}
+
+function isGerenteRole(){
+  return CURRENT_ROLE==='gerente';
+}
+
 function isTechnicalRole(){
   return CURRENT_ROLE==='tecnico' || CURRENT_ROLE==='distribuidor';
 }
@@ -1175,7 +1183,8 @@ function defaultPageForRole(){
 }
 
 function canAccessPage(page){
-  if(isManagerRole()) return true;
+  if(isAdminRole()) return true;
+  if(isGerenteRole()) return ['dashboard','machines','employees','reports','notifications','users'].includes(page);
   if(isTechnicalRole()) return ['machines'].includes(page);
   return ['dashboard','reports','live'].includes(page);
 }
@@ -1248,20 +1257,39 @@ function showApp(){
     const ui = document.getElementById('userInfo');
     if(ui) ui.innerHTML = '<strong>'+payload.username+'</strong><br>'+roleLabel;
     const manager = isManagerRole();
+    const admin = isAdminRole();
+    const gerente = isGerenteRole();
     const technical = isTechnicalRole();
+    const sidebarSub=document.querySelector('.sidebar-sub');
+    if(sidebarSub){
+      sidebarSub.textContent = gerente ? 'Vista de gestión' : technical ? 'Operación técnica' : 'Panel de administración';
+    }
     const machineNav=document.getElementById('n-machines');
     if(machineNav) machineNav.style.display=canOperateMachines()?'flex':'none';
-    ['n-employees','n-unknown','n-nfc','n-levels','n-notifications','n-system','n-audit'].forEach(id=>{
+    const showNav = (id, visible) => {
       const el=document.getElementById(id);
-      if(el) el.style.display=manager?'flex':'none';
-    });
-    ['n-dashboard','n-reports','n-live'].forEach(id=>{
-      const el=document.getElementById(id);
-      if(!el) return;
-      el.style.display=technical?'none':'flex';
-    });
+      if(el) el.style.display=visible?'flex':'none';
+    };
+    showNav('n-dashboard', !technical);
+    showNav('n-reports', !technical);
+    showNav('n-live', !technical && !gerente);
+    showNav('n-employees', manager);
+    showNav('n-unknown', admin);
+    showNav('n-nfc', admin);
+    showNav('n-levels', admin);
+    showNav('n-notifications', manager);
+    showNav('n-system', admin);
+    showNav('n-audit', admin);
     const nu = document.getElementById('n-users');
     if(nu) nu.style.display=manager?'flex':'none';
+    const dashboardNav=document.getElementById('n-dashboard');
+    if(dashboardNav && gerente) dashboardNav.innerHTML='<span class="nav-icon">◈</span>Resumen';
+    else if(dashboardNav) dashboardNav.innerHTML='<span class="nav-icon">◈</span>Dashboard';
+    const machinesNav=document.getElementById('n-machines');
+    if(machinesNav && gerente) machinesNav.innerHTML='<span class="nav-icon">⬡</span>Máquinas <span id="pendingBadge" style="display:none;background:#E24B4A;color:#fff;border-radius:100px;font-size:10px;padding:1px 6px;margin-left:4px">0</span>';
+    const reportsNav=document.getElementById('n-reports');
+    if(reportsNav && gerente) reportsNav.innerHTML='<span class="nav-icon">◎</span>Análisis';
+    else if(reportsNav) reportsNav.innerHTML='<span class="nav-icon">◎</span>Reportes';
   }catch(_){}
   document.getElementById('loginScreen').style.display='none';
   document.getElementById('appScreen').style.display='block';
@@ -1625,6 +1653,11 @@ async function loadDashboard(){
 }
 
 function renderDashboard(today,monthly,machinesData){
+  if(isGerenteRole()){
+    renderGerenteDashboard(today,monthly,machinesData);
+    return;
+  }
+
   const emps=today.employees||[];
   const s=today.summary||{};
   const mc=monthly.total_spent_cents||0;
@@ -1695,6 +1728,86 @@ function renderDashboard(today,monthly,machinesData){
   }
 }
 
+function renderGerenteDashboard(today,monthly,machinesData){
+  const emps=today.employees||[];
+  const s=today.summary||{};
+  const machines=(machinesData.machines||[]);
+  const monthlySpent=monthly.total_spent_cents||0;
+  const monthlyTaps=machines.reduce((acc,m)=>acc+parseInt(m.taps_month||0,10),0);
+  const todaySpent=emps.reduce((acc,e)=>acc+parseInt(e.spent_today_cents||0,10),0);
+  const todayTaps=emps.reduce((acc,e)=>acc+parseInt(e.taps_today||0,10),0);
+  const blockedEmployees=s.blocked_employees||0;
+  const warningEmployees=emps.filter(e=>empStatus(e)==='warning').length;
+  const blockedMachines=machines.filter(m=>m.blocked).length;
+  const onlineMachines=machines.filter(m=>m.online).length;
+  const offlineMachines=Math.max(0,machines.length-onlineMachines);
+
+  const metricsHtml=[
+    ['Gasto hoy', formatReportMoney(todaySpent), ''],
+    ['Gasto mensual', formatReportMoney(monthlySpent), ''],
+    ['Cafés hoy', formatReportInt(todayTaps), ''],
+    ['Cafés este mes', formatReportInt(monthlyTaps), ''],
+    ['Máquinas online', `${formatReportInt(onlineMachines)}/${formatReportInt(machines.length)}`, offlineMachines>0?'warn':''],
+    ['Empleados bloqueados hoy', formatReportInt(blockedEmployees), blockedEmployees>0?'danger':''],
+    ['Advertencias hoy', formatReportInt(warningEmployees), warningEmployees>0?'warn':''],
+    ['Máquinas bloqueadas', formatReportInt(blockedMachines), blockedMachines>0?'warn':'']
+  ].map(([label,value,cls])=>`<div class="metric"><div class="mlbl">${label}</div><div class="mval ${cls}">${value}</div></div>`).join('');
+
+  const topMachines=[...machines]
+    .sort((a,b)=>Number(b.cost_month_cents||0)-Number(a.cost_month_cents||0))
+    .slice(0,5);
+  const topMachinesRows=topMachines.map(m=>`<tr>
+    <td>
+      <div style="font-weight:600">${escHtml(m.name||'—')}</div>
+      <div style="font-size:11px;color:var(--tx3)">${escHtml(m.location||'—')}</div>
+    </td>
+    <td>${formatReportInt(m.taps_month||0)}</td>
+    <td>${formatReportMoney(m.cost_month_cents||0)}</td>
+    <td>${m.online?'<span class="badge bs">Online</span>':'<span class="badge bw">Offline</span>'}</td>
+  </tr>`).join('');
+
+  const focusItems=[
+    ...machines
+      .filter(m=>m.blocked || !m.online)
+      .slice(0,5)
+      .map(m=>`<div style="background:${m.blocked?'var(--bgd)':'var(--bgw)'};color:${m.blocked?'var(--txd)':'var(--txw)'};border-radius:var(--r);padding:10px 12px;margin-bottom:8px;font-size:13px">
+        <strong>${escHtml(m.name||'Máquina')}</strong> — ${m.blocked?'Bloqueada':'Offline'}
+        <div style="font-size:11px;opacity:.85;margin-top:4px">${escHtml(m.location||'Sin ubicación')} · Último contacto ${escHtml(m.last_seen?timeSince(m.last_seen):'Nunca')}</div>
+      </div>`),
+    ...emps
+      .filter(e=>empStatus(e)!=='ok')
+      .slice(0,5)
+      .map(e=>{
+        const blocked=empStatus(e)==='blocked';
+        return `<div style="background:${blocked?'var(--bgd)':'var(--bgw)'};color:${blocked?'var(--txd)':'var(--txw)'};border-radius:var(--r);padding:10px 12px;margin-bottom:8px;font-size:13px">
+          <strong>${escHtml(e.employee_name||'Empleado')}</strong> — ${blocked?'Bloqueado':'Advertencia'}
+          <div style="font-size:11px;opacity:.85;margin-top:4px">${formatReportInt(e.taps_today||0)}/${formatReportInt(e.daily_limit||0)} hoy · ${escHtml(e.department||'Sin área')}</div>
+        </div>`;
+      })
+  ].join('');
+
+  render(`
+    <div class="topbar">
+      <div class="page-title">Dashboard</div>
+      <div style="font-size:12px;color:var(--tx3)">Vista resumida de gestión · Día operativo ${escHtml(today.business_date||'—')}</div>
+    </div>
+    <div class="metrics">${metricsHtml}</div>
+    <div style="display:grid;grid-template-columns:1.1fr .9fr;gap:16px;margin-bottom:16px">
+      <div class="card">
+        <div class="card-title">Máquinas con mayor gasto del mes</div>
+        <table>
+          <thead><tr><th>Máquina</th><th>Cafés</th><th>$ Mes</th><th>Estado</th></tr></thead>
+          <tbody>${topMachinesRows||'<tr><td colspan="4" class="empty">Sin datos del período</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title">Focos de atención</div>
+        ${focusItems||'<div class="empty">Sin alertas ni máquinas a revisar.</div>'}
+      </div>
+    </div>
+  `);
+}
+
 // ══════════════════════════════════════════════════════
 //  MÁQUINAS
 // ══════════════════════════════════════════════════════
@@ -1712,6 +1825,7 @@ async function loadMachines(){
 
 function renderMachines(){
   const manager=isManagerRole();
+  const gerente=isGerenteRole();
   const installer=canManageMachineSetup();
   const technicalConfig=canManageMachineTechnicalConfig();
   render(`
@@ -1720,6 +1834,7 @@ function renderMachines(){
     <div class="page-title">Máquinas</div>
     ${manager?'<button class="btn btn-primary btn-sm" onclick="openAddMachine()">+ Nueva máquina</button>':''}
   </div>
+  ${gerente?'<div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent"><div style="font-size:13px;color:var(--txi)">Vista resumida para gestión. Se ocultan detalles de red, diagnóstico y compatibilidad técnica para mantener foco operativo.</div></div>':''}
   <div class="card">
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--br)">
       <div style="display:flex;flex-direction:column;gap:3px">
@@ -1749,7 +1864,7 @@ function renderMachines(){
       <button class="btn btn-ghost btn-sm" onclick="resetMachineFilters()" style="align-self:flex-end">Limpiar filtros</button>
     </div>
     <table>
-      <thead><tr><th>Nombre / Ubicación</th><th>Estado</th><th>Hoy</th><th>Mes</th><th>$ Mes</th><th>Último tap</th><th></th></tr></thead>
+      <thead><tr><th>Nombre / Ubicación</th><th>Estado</th><th>Hoy</th><th>Mes</th><th>$ Mes</th>${gerente?'<th>Stock / Precio</th>':''}<th>Último tap</th><th></th></tr></thead>
       <tbody id="machinesTbody"></tbody>
     </table>
   </div>`);
@@ -1773,6 +1888,7 @@ function applyMachineFilters(){
   });
   const rows=filtered.map(m=>{
     const manager=isManagerRole();
+    const gerente=isGerenteRole();
     const since=m.last_tap_at?timeSince(m.last_tap_at):'Nunca';
     const stBg=m.blocked?'bd':m.active?'bs':'bw';
     const stLbl=m.blocked?'Bloqueada':m.active?'Activa':'Inactiva';
@@ -1782,6 +1898,27 @@ function applyMachineFilters(){
     const networkLine=`${machineNetworkSummary(m)}</div><div style="font-size:11px;color:var(--tx3);margin-top:4px">Precio ${formatMachinePriceValue(m.price_cents)} · ${stockLine}`;
     const lastSeen=m.last_seen?timeSince(m.last_seen):'Nunca';
     const backendError=m.backend_error?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.backend_error)}</div>`:'';
+    const gerenteNameCell=`<div style="display:flex;align-items:flex-start;gap:6px">${onlineDot}<div><strong>${escHtml(m.name)}</strong><div style="font-size:11px;color:var(--tx3)">${escHtml(m.location||'—')}</div></div></div>`;
+    const gerenteStateCell=`<span class="badge ${stBg}">${stLbl}</span><span class="badge ${m.online?'bs':'bw'}" style="margin-left:6px">${m.online?'Online':'Offline'}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.blocked_reason||'')}</div>`:''}<div style="font-size:11px;color:var(--tx3);margin-top:4px">Último contacto ${lastSeen}</div>`;
+    const gerenteActions=`
+        ${manager ? (m.blocked
+          ?`<button class="btn btn-ghost btn-xs" onclick="unblockMachine(${m.id},'${m.name}')">Desbloquear</button>`
+          :`<button class="btn btn-xs" style="background:var(--bgd);color:var(--txd)" onclick="blockMachine(${m.id},'${m.name}')">Bloquear</button>`) : ''}
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick='openMachineStock(${m.id},${JSON.stringify(m.name)})'>Stock</button>
+        ${manager?`<button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="openEditMachine(${m.id})">Editar</button>`:''}
+        <button class="btn btn-ghost btn-xs" style="margin-left:4px" onclick="machineDetail(${m.id},'${m.name}')">Ver</button>`;
+    if(gerente){
+      return `<tr>
+        <td>${gerenteNameCell}</td>
+        <td>${gerenteStateCell}</td>
+        <td>${m.taps_today||0}</td>
+        <td>${m.taps_month||0}</td>
+        <td>${formatReportMoney(m.cost_month_cents||0)}</td>
+        <td style="font-size:11px;color:var(--tx3)">Precio ${formatMachinePriceValue(m.price_cents)}<div style="margin-top:4px">${stockLine}</div></td>
+        <td style="font-size:11px;color:var(--tx3)">${since}</td>
+        <td style="white-space:nowrap">${gerenteActions}</td>
+      </tr>`;
+    }
     return `<tr>
       <td><div style="display:flex;align-items:flex-start;gap:6px">${onlineDot}<div><strong>${escHtml(m.name)}</strong><div style="font-size:11px;color:var(--tx3)">${escHtml(m.location||'—')}</div><div style="font-size:11px;color:var(--tx3);margin-top:3px">${networkLine}</div></div></div></td>
       <td><span class="badge ${stBg}">${stLbl}</span><span class="badge ${backend.cls}" style="margin-left:6px">${backend.label}</span>${m.blocked?`<div style="font-size:11px;color:var(--txd);margin-top:4px">${escHtml(m.blocked_reason||'')}</div>`:''}<div style="font-size:11px;color:var(--tx3);margin-top:4px">Último contacto ${lastSeen}</div>${backendError}</td>
@@ -1806,7 +1943,7 @@ function applyMachineFilters(){
     </tr>`;
   }).join('');
   const tbody=document.getElementById('machinesTbody');
-  if(tbody) tbody.innerHTML=rows||'<tr><td colspan="7" class="empty">Sin resultados</td></tr>';
+  if(tbody) tbody.innerHTML=rows||`<tr><td colspan="${isGerenteRole()?8:7}" class="empty">Sin resultados</td></tr>`;
 }
 
 function resetMachineFilters(){
@@ -5473,6 +5610,11 @@ async function loadReports(customFilters){
 }
 
 function renderReports(){
+  if(isGerenteRole()){
+    renderGerenteReports();
+    return;
+  }
+
   const overview=reportState.overview||{};
   const filters=reportState.filters||{};
   const summaryHtml=reportSummaryCards(overview);
@@ -5676,6 +5818,131 @@ function renderReports(){
         <tbody>${stockMovementRows||'<tr><td colspan="7" class="empty">Sin movimientos de stock en el rango</td></tr>'}</tbody></table>
       </div>
     </div>`:''}
+  `);
+  renderReportCharts();
+}
+
+function renderGerenteReports(){
+  const overview=reportState.overview||{};
+  const filters=reportState.filters||{};
+  const summaryHtml=reportSummaryCards(overview);
+  const departmentOptions=(reportState.departmentOptions||[]).map(dep=>`<option value="${escHtml(dep)}"${dep===filters.department?' selected':''}>${escHtml(dep)}</option>`).join('');
+  const activeFilters=[];
+  if(filters.department) activeFilters.push(`Área: <strong>${escHtml(filters.department)}</strong>`);
+  const filterStatus=activeFilters.length ? activeFilters.join(' &nbsp;·&nbsp; ') : 'Sin filtros adicionales';
+  const machineRows=reportState.machines.slice(0,10).map((m,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${escHtml(m.name)}</td>
+    <td>${formatReportInt(m.taps_count)}</td>
+    <td><strong>${formatReportMoney(m.spent_cents)}</strong></td>
+    <td>${m.online?'<span class="badge bs">Online</span>':'<span class="badge bw">Offline</span>'}</td>
+  </tr>`).join('');
+  const employeeRows=reportState.employees.slice(0,10).map((e,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${escHtml(e.name)}</td>
+    <td>${escHtml(e.department||'Sin área')}</td>
+    <td>${formatReportInt(e.taps_count)}</td>
+    <td><strong>${formatReportMoney(e.spent_cents)}</strong></td>
+  </tr>`).join('');
+  const departmentRows=reportState.departments.slice(0,10).map((d,i)=>`<tr>
+    <td><strong>${i+1}.</strong> ${escHtml(d.department||'Sin área')}</td>
+    <td>${formatReportInt(d.employees_count)}</td>
+    <td>${formatReportInt(d.taps_count)}</td>
+    <td><strong>${formatReportMoney(d.spent_cents)}</strong></td>
+  </tr>`).join('');
+  const stockSummary=reportState.stock?.summary||{};
+  const stockRows=(reportState.stock?.items||[])
+    .filter(item=>item.status==='empty' || item.status==='low')
+    .slice(0,8)
+    .map((item,i)=>`<tr>
+      <td><strong>${i+1}.</strong> ${escHtml(item.machine_name||'—')}</td>
+      <td>#${formatReportInt(item.item_id)} · ${escHtml(item.product_name||'—')}</td>
+      <td><span class="badge ${item.status_badge||'bw'}">${escHtml(item.status_label||'—')}</span></td>
+      <td>${item.fill_pct===null||item.fill_pct===undefined?'—':`${formatReportInt(item.fill_pct)}%`}</td>
+    </tr>`).join('');
+
+  render(`
+    <div class="topbar">
+      <div class="page-title">Reportes</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-left:auto">
+        <button class="btn btn-ghost btn-sm" onclick="exportReportsExcel()">Descargar Excel</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportReportsPdf()">Descargar PDF</button>
+        <button class="btn btn-ghost btn-sm" onclick="setReportPreset('today')">Hoy</button>
+        <button class="btn btn-ghost btn-sm" onclick="setReportPreset('7d')">7 días</button>
+        <button class="btn btn-ghost btn-sm" onclick="setReportPreset('30d')">30 días</button>
+        <button class="btn btn-primary btn-sm" onclick="applyReportFilters()">Aplicar</button>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:16px;background:var(--bgi);border-color:transparent">
+      <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+        <div class="field" style="margin:0;min-width:180px">
+          <label>Desde</label>
+          <input id="repFrom" type="date" value="${escHtml(reportState.from)}">
+        </div>
+        <div class="field" style="margin:0;min-width:180px">
+          <label>Hasta</label>
+          <input id="repTo" type="date" value="${escHtml(reportState.to)}">
+        </div>
+        <div class="field" style="margin:0;min-width:220px">
+          <label>Área</label>
+          <select id="repDepartment">
+            <option value="">Todas</option>
+            ${departmentOptions}
+          </select>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="clearReportFilters()">Limpiar filtros</button>
+        <div style="font-size:13px;color:var(--tx2);margin-left:auto">
+          Rango operativo: <strong>${escHtml(formatReportRangeLabel(reportState.from,reportState.to))}</strong>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--tx3);margin-top:10px">Filtros activos: ${filterStatus}</div>
+      <div style="font-size:12px;color:var(--tx3);margin-top:4px">Vista resumida para gestión: foco en gasto, consumo, áreas, máquinas y stock crítico.</div>
+    </div>
+    <div class="metrics">${summaryHtml}</div>
+    <div class="card">
+      <div class="card-title">Evolución diaria del rango</div>
+      <div style="height:280px"><canvas id="repTrendChart"></canvas></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+          <div class="card-title" style="margin:0">Máquinas con mayor gasto</div>
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('machines','excel')">Excel</button>
+        </div>
+        <div style="height:220px;margin-bottom:14px"><canvas id="repMachinesChart"></canvas></div>
+        <table><thead><tr><th>Máquina</th><th>Cafés</th><th>$</th><th>Estado</th></tr></thead>
+        <tbody>${machineRows||'<tr><td colspan="4" class="empty">Sin datos</td></tr>'}</tbody></table>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+          <div class="card-title" style="margin:0">Áreas con mayor consumo</div>
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('departments','excel')">Excel</button>
+        </div>
+        <div style="height:220px;margin-bottom:14px"><canvas id="repDepartmentsChart"></canvas></div>
+        <table><thead><tr><th>Área</th><th>Empleados</th><th>Cafés</th><th>$</th></tr></thead>
+        <tbody>${departmentRows||'<tr><td colspan="4" class="empty">Sin datos</td></tr>'}</tbody></table>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+          <div class="card-title" style="margin:0">Empleados con mayor consumo</div>
+          <button class="btn btn-ghost btn-sm" onclick="exportReportSection('employees','excel')">Excel</button>
+        </div>
+        <div style="height:220px;margin-bottom:14px"><canvas id="repEmployeesChart"></canvas></div>
+        <table><thead><tr><th>Empleado</th><th>Área</th><th>Cafés</th><th>$</th></tr></thead>
+        <tbody>${employeeRows||'<tr><td colspan="4" class="empty">Sin datos</td></tr>'}</tbody></table>
+      </div>
+      <div class="card">
+        <div class="card-title" style="margin-bottom:12px">Stock crítico</div>
+        <div class="metrics" style="margin-bottom:16px">
+          <div class="metric"><div class="mlbl">Bajo stock</div><div class="mval">${formatReportInt(stockSummary.low_items||0)}</div></div>
+          <div class="metric"><div class="mlbl">Sin stock</div><div class="mval ${Number(stockSummary.empty_items||0)>0?'danger':''}">${formatReportInt(stockSummary.empty_items||0)}</div></div>
+          <div class="metric"><div class="mlbl">Ventas del rango</div><div class="mval">${formatReportInt(stockSummary.sales_units||0)}</div></div>
+          <div class="metric"><div class="mlbl">Máquinas con stock</div><div class="mval">${formatReportInt(stockSummary.machines_with_stock||0)}</div></div>
+        </div>
+        <table><thead><tr><th>Máquina</th><th>Selección</th><th>Estado</th><th>Ocupación</th></tr></thead>
+        <tbody>${stockRows||'<tr><td colspan="4" class="empty">Sin alertas de stock en el rango.</td></tr>'}</tbody></table>
+      </div>
+    </div>
   `);
   renderReportCharts();
 }
