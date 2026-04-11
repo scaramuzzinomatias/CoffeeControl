@@ -10,6 +10,47 @@ const {
     findPostgresExecutable
 } = require('./_lib');
 
+function resolveManifestPath(outputPath) {
+    return `${outputPath}.meta.json`;
+}
+
+function gitHead(projectDir) {
+    const result = spawnSync('git', ['rev-parse', '--short', 'HEAD'], {
+        cwd: projectDir,
+        encoding: 'utf8'
+    });
+    if (result.status !== 0) return null;
+    const value = String(result.stdout || '').trim();
+    return value || null;
+}
+
+function writeManifest({ outputPath, db, format, args, sizeBytes }) {
+    const manifestPath = resolveManifestPath(outputPath);
+    const manifest = {
+        generated_at: new Date().toISOString(),
+        project: 'CoffeeControl',
+        database: {
+            name: db.database,
+            host: db.host,
+            port: db.port,
+            username: db.username || null
+        },
+        backup: {
+            file: outputPath,
+            format,
+            schema_only: Boolean(args['schema-only']),
+            data_only: Boolean(args['data-only']),
+            size_bytes: sizeBytes
+        },
+        source: {
+            git_head: gitHead(projectRoot),
+            hostname: process.env.COMPUTERNAME || process.env.HOSTNAME || null
+        }
+    };
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    return manifestPath;
+}
+
 function usage() {
     console.log(`Uso:
   node scripts/db-backup.js [--output archivo] [--dir carpeta] [--format sql|custom] [--schema-only] [--data-only]
@@ -90,7 +131,15 @@ function main() {
     }
 
     const stats = fs.statSync(outputPath);
+    const manifestPath = writeManifest({
+        outputPath,
+        db,
+        format,
+        args,
+        sizeBytes: stats.size
+    });
     console.log(`[db:backup] OK — ${(stats.size / 1024).toFixed(1)} KB`);
+    console.log(`[db:backup] Metadata: ${manifestPath}`);
 }
 
 try {

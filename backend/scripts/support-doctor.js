@@ -1,4 +1,6 @@
-const { withPool, findPostgresExecutable } = require('./_lib');
+const fs = require('fs');
+const path = require('path');
+const { withPool, findPostgresExecutable, projectRoot } = require('./_lib');
 
 function ok(label, detail) {
     console.log(`OK   ${label}${detail ? ` — ${detail}` : ''}`);
@@ -14,6 +16,47 @@ function fail(label, detail) {
 
 function envValue(name) {
     return String(process.env[name] || '').trim();
+}
+
+function inspectLatestBackup() {
+    const backupDir = path.join(projectRoot, 'backups', 'db');
+    if (!fs.existsSync(backupDir)) {
+        warn('Backups', `no existe ${backupDir}`);
+        return;
+    }
+
+    const files = fs.readdirSync(backupDir)
+        .filter(name => /\.(sql|dump)$/i.test(name))
+        .map(name => ({
+            name,
+            fullPath: path.join(backupDir, name),
+            stat: fs.statSync(path.join(backupDir, name))
+        }))
+        .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+
+    if (!files.length) {
+        warn('Backups', `sin backups en ${backupDir}`);
+        return;
+    }
+
+    const latest = files[0];
+    const ageHours = ((Date.now() - latest.stat.mtimeMs) / 3600000).toFixed(1);
+    ok('Backups', `${latest.name} (${(latest.stat.size / 1024).toFixed(1)} KB, hace ${ageHours} h)`);
+
+    const manifestPath = `${latest.fullPath}.meta.json`;
+    if (!fs.existsSync(manifestPath)) {
+        warn('Backup metadata', `falta ${path.basename(manifestPath)}`);
+        return;
+    }
+
+    try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const sourceDb = manifest?.database?.name || 'desconocida';
+        const sourceHost = manifest?.database?.host || 'desconocido';
+        ok('Backup metadata', `${sourceDb} @ ${sourceHost}`);
+    } catch (err) {
+        warn('Backup metadata', `inválida (${err.message})`);
+    }
 }
 
 async function httpHealth() {
@@ -61,6 +104,7 @@ async function main() {
     else warn('psql', 'no encontrado — restore de backups .sql no va a funcionar');
     if (pgRestorePath) ok('pg_restore', pgRestorePath);
     else warn('pg_restore', 'no encontrado — restore de backups .dump no va a funcionar');
+    inspectLatestBackup();
 
     await withPool(async (pool) => {
         const dbNow = await pool.query('SELECT NOW() AS now');

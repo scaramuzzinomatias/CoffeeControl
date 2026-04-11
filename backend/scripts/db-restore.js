@@ -9,6 +9,36 @@ const {
     findPostgresExecutable
 } = require('./_lib');
 
+function resolveManifestPath(inputPath) {
+    return `${inputPath}.meta.json`;
+}
+
+function loadManifest(inputPath) {
+    const manifestPath = resolveManifestPath(inputPath);
+    if (!fs.existsSync(manifestPath)) return null;
+    try {
+        const raw = fs.readFileSync(manifestPath, 'utf8');
+        const json = JSON.parse(raw);
+        return { path: manifestPath, data: json };
+    } catch (err) {
+        throw new Error(`No se pudo leer metadata del backup (${manifestPath}): ${err.message}`);
+    }
+}
+
+function validateManifest(manifest, db, args) {
+    if (!manifest) return;
+    const sourceDb = String(manifest.data?.database?.name || '').trim();
+    if (!sourceDb) return;
+    console.log(`[db:restore] Metadata: ${manifest.path}`);
+    console.log(`[db:restore] Backup origen: ${sourceDb}`);
+    if (sourceDb !== db.database && !args['allow-other-db']) {
+        throw new Error(
+            `El backup parece venir de la base "${sourceDb}" y el destino actual es "${db.database}". ` +
+            'Si querés restaurarlo igual, agregá --allow-other-db'
+        );
+    }
+}
+
 function usage() {
     console.log(`Uso:
   node scripts/db-restore.js --input archivo [--format sql|custom] [--recreate --confirm nombre_bd] [--yes] [--dry-run]
@@ -114,6 +144,8 @@ async function main() {
 
     const db = parseDatabaseUrl();
     const format = detectFormat(inputPath, args.format);
+    const manifest = loadManifest(inputPath);
+    validateManifest(manifest, db, args);
     const command = buildRestoreCommand({ format, db, inputPath });
 
     console.log(`[db:restore] Archivo: ${inputPath}`);

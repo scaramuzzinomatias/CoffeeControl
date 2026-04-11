@@ -259,6 +259,16 @@ Pero ese es otro bloque de arquitectura.
 
 Hoy, la forma profesional y segura de operar CoffeeControl es:
 
+- una empresa por backend
+- una base por empresa
+- un subdominio por empresa
+- backups identificados por cliente/base
+- restore probado con procedimiento explícito
+
+Runbook operativo asociado:
+
+- [RUNBOOK_BACKUP_RESTORE_CLIENTES.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/RUNBOOK_BACKUP_RESTORE_CLIENTES.md)
+
 - una empresa por instalación
 - un backend por empresa
 - una base por empresa

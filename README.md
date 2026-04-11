@@ -852,6 +852,7 @@ Acceso:
 - [PROTOCOLO_PRUEBAS.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_PRUEBAS.md)
 - [GUIA_SOPORTE.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/GUIA_SOPORTE.md)
 - [MODELO_OPERATIVO_CLIENTES.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/MODELO_OPERATIVO_CLIENTES.md)
+- [RUNBOOK_BACKUP_RESTORE_CLIENTES.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/RUNBOOK_BACKUP_RESTORE_CLIENTES.md)
 - [ARQUITECTURA_APP_TECNICO_ANDROID.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/ARQUITECTURA_APP_TECNICO_ANDROID.md)
 
 ---
