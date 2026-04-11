@@ -268,6 +268,7 @@ Hoy, la forma profesional y segura de operar CoffeeControl es:
 Runbook operativo asociado:
 
 - [RUNBOOK_BACKUP_RESTORE_CLIENTES.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/RUNBOOK_BACKUP_RESTORE_CLIENTES.md)
+- [PLANTILLA_DESPLIEGUE_CLIENTE.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PLANTILLA_DESPLIEGUE_CLIENTE.md)
 
 - una empresa por instalación
 - un backend por empresa
