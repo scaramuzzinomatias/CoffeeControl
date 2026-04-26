@@ -275,6 +275,7 @@ El precio del café ahora se maneja como un valor **humano** por máquina:
   - `Máquinas > Config técnica` ofrece `Sugerir según último SETUP MDB` para precargar valores conservadores sin guardarlos automáticamente
 - protocolo específico de validación en campo:
   - [PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_VALIDACION_CONFIG_TECNICA_RUBINO.md)
+  - [FLUJO_MDB_SAECO_RUBINO_200.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/FLUJO_MDB_SAECO_RUBINO_200.md)
 
 Si el precio cambia desde `Máquinas`:
 
