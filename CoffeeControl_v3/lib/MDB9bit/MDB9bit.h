@@ -13,9 +13,9 @@
  *   Detección address/data RX: por rx_tout del hardware UART.
  *
  * Conexión en ESP32-C3 Super Mini:
- *   MDB_TX = GPIO20  (salida al bus MDB via BC548, UART1 TX)
- *   MDB_RX = GPIO21  (entrada del bus MDB via BC548, UART1 RX)
- *   Ambos BC548 common-emitter → señal invertida en TX y RX
+ *   MDB_TX = GPIO21  (salida al bus MDB via interfaz física, UART1 TX)
+ *   MDB_RX = GPIO20  (entrada del bus MDB via interfaz física, UART1 RX)
+ *   La inversión final de TX depende de la etapa física seleccionada.
  */
 
 #pragma once
@@ -48,7 +48,7 @@ public:
 
         uart_driver_install(MDB_UART_NUM, MDB_UART_BUF, MDB_TX_BUF, 16, &_evtQueue, 0);
         uart_param_config(MDB_UART_NUM, &cfg);
-        // TX en _tx (GPIO20), RX en _rx (GPIO21)
+        // TX en _tx, RX en _rx (ruteables por matrix del ESP32-C3)
         uart_set_pin(MDB_UART_NUM, _tx, _rx,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 

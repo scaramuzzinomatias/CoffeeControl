@@ -36,22 +36,20 @@
  *   - Autenticación local: cache de hasta ~1500 tarjetas en RAM
  *   - Cola offline: hasta 1000 eventos, flush automático al reconectar
  *   - Reloj operativo por NTP, con fallback diagnóstico desde MDB si la máquina entrega fecha/hora
- *   - MDB 9-bit por software (IRAM_ATTR, GPIO20/21)
- *     Nota: el ESP32-C3 NO soporta 9-bit en UART hardware (registro
- *     bit_num tiene solo 2 bits → máx. 8 bits de dato). El bit-banging
- *     con IRAM_ATTR es la única opción y funciona perfectamente.
+ *   - MDB usando UART hardware 8E1 + paridad como bit MODE
+ *   - RC522 en esta revisión con MOSI/MISO físicamente cruzados
  * ─────────────────────────────────────────────────────
- * Pines ESP32-C3 Super Mini — pinout definitivo:
+ * Pines ESP32-C3 Super Mini — pinout de esta revision:
  *   GPIO0  = SPI SCK  (RC522)
- *   GPIO1  = SPI MOSI (RC522)
- *   GPIO3  = SPI MISO (RC522)   ← NO usar GPIO2: strapping pin
+ *   GPIO1  = SPI MISO (RC522)
+ *   GPIO3  = SPI MOSI (RC522)   ← NO usar GPIO2: strapping pin
  *   GPIO4  = RC522 SS  (CS)
  *   GPIO7  = RC522 RST
  *   GPIO5/6 reservados si a futuro se necesita I²C, pero el diseño activo no usa RTC hardware
  *   GPIO10 = LED externo (activo HIGH)
  *   GPIO9  = BOOT button (pull-up interno, LOW = presionado, abre portal en runtime)
- *   GPIO20 = MDB TX (bit-banging, salida al bus)
- *   GPIO21 = MDB RX (bit-banging, entrada del bus)
+ *   GPIO20 = MDB RX (entrada del bus)
+ *   GPIO21 = MDB TX (salida al bus)
  *
  * Pines que NO conectar nada:
  *   GPIO2  = strapping (debe estar HIGH al boot)
@@ -67,15 +65,16 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPI.h>
+// Baja el clock del RC522 para tolerar mejor cableado/pistas menos ideales.
+#define MFRC522_SPICLOCK (1000000u)
 #include <MFRC522.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <freertos/queue.h>
-// Prueba temporal con TX aislado por 4N32 cableado invertido.
-// Mañana, al volver al hardware original, esto debería volver a 1.
-#define MDB_UART_TX_INVERT 0
+// En esta revisión, la etapa TX aislada hacia MDB requiere inversión final.
+#define MDB_UART_TX_INVERT 1
 #include "MDB9bit.h"
 #include "pricing.h"
 #include "device_config.h"
@@ -84,15 +83,16 @@
 
 // ── Pines ─────────────────────────────────────────────
 #define PIN_SPI_SCK    0
-#define PIN_SPI_MOSI   1
-#define PIN_SPI_MISO   3   // GPIO2 es strapping pin → usar GPIO3
+// Esta revision de placa quedo con MOSI/MISO fisicamente invertidos en el RC522.
+#define PIN_SPI_MOSI   3
+#define PIN_SPI_MISO   1
 #define PIN_RC522_SS   4
 #define PIN_RC522_RST  7
 #define PIN_LED       10
 #define PIN_LED_ONBOARD 8   // LED onboard azul del Super Mini (activo LOW, usar solo post-boot)
 #define PIN_BOOT_BTN   9   // BOOT button: pull-up interno, LOW = presionado
-#define PIN_MDB_TX    20   // TX = GPIO20 (salida al bus MDB)
-#define PIN_MDB_RX    21   // RX = GPIO21 (entrada del bus, invertido por transistor)
+#define PIN_MDB_TX    21   // TX = GPIO21 (salida al bus MDB)
+#define PIN_MDB_RX    20   // RX = GPIO20 (entrada del bus MDB)
 
 // ── Modo de deployment ────────────────────────────────
 // Opción B — servidor local (URL configurable en el portal)
@@ -3253,20 +3253,46 @@ void setup() {
     }
 
     // SPI + RC522
-    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_RC522_SS);
-    rfid.PCD_Init();
+    pinMode(PIN_RC522_SS, OUTPUT);
+    digitalWrite(PIN_RC522_SS, HIGH);
+    pinMode(PIN_RC522_RST, OUTPUT);
+    digitalWrite(PIN_RC522_RST, LOW);
+    delay(20);
+    digitalWrite(PIN_RC522_RST, HIGH);
     delay(50);
-    byte ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_RC522_SS);
+    byte ver = 0x00;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        rfid.PCD_Init();
+        delay(50);
+        ver = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+        if (ver != 0x00 && ver != 0xFF) {
+            break;
+        }
+        Serial.printf("[NFC] Intento %d fallido — VersionReg=0x%02X (RST=%d SS=%d, SPI=1MHz)\n",
+                      attempt,
+                      ver,
+                      digitalRead(PIN_RC522_RST),
+                      digitalRead(PIN_RC522_SS));
+        delay(50);
+    }
     if (ver == 0x00 || ver == 0xFF) {
         Serial.println("[NFC] ERROR — RC522 no responde");
-        Serial.println("[NFC]   SCK=GPIO0  MOSI=GPIO1  MISO=GPIO3  SS=GPIO4  RST=GPIO7");
+        Serial.printf("[NFC]   SCK=GPIO%d  MOSI=GPIO%d  MISO=GPIO%d  SS=GPIO%d  RST=GPIO%d\n",
+                      PIN_SPI_SCK,
+                      PIN_SPI_MOSI,
+                      PIN_SPI_MISO,
+                      PIN_RC522_SS,
+                      PIN_RC522_RST);
     } else {
         Serial.printf("[NFC] RC522 OK — chip: 0x%02X\n", ver);
     }
 
     // MDB 9-bit software serial
     mdb.begin();
-    Serial.printf("[MDB] UART HW listo (TX=GPIO20, RX=GPIO21, tx_inv=%s)\n",
+    Serial.printf("[MDB] UART HW listo (TX=GPIO%d, RX=GPIO%d, tx_inv=%s)\n",
+                  PIN_MDB_TX,
+                  PIN_MDB_RX,
                   MDB_UART_TX_INVERT ? "on" : "off");
 
     // Arrancar tarea MDB independiente para responder al VMC durante boot
