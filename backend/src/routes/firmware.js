@@ -27,6 +27,11 @@ function normalizeFirmwareNotes(value) {
     return notes ? notes.slice(0, 2000) : null;
 }
 
+function firmwareBinaryDeclaresVersion(binary, version) {
+    if (!Buffer.isBuffer(binary) || !binary.length || !version) return false;
+    return binary.includes(Buffer.from(String(version), 'utf8'));
+}
+
 function serializeRelease(row) {
     return {
         id: Number(row.id),
@@ -72,6 +77,11 @@ router.post(
         }
         if (binary.length > MAX_FIRMWARE_UPLOAD_BYTES) {
             return res.status(400).json({ error: 'El binario OTA supera el tamaño máximo permitido.' });
+        }
+        if (!firmwareBinaryDeclaresVersion(binary, version)) {
+            return res.status(400).json({
+                error: `El binario OTA no declara la versión ${version}. Recompilá la release antes de subirla.`
+            });
         }
 
         ensureFirmwareStorageDir();

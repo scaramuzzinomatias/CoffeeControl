@@ -155,7 +155,7 @@
 #define SESSION_TIMEOUT_MS 12000
 #define MDB_ASYNC_QUEUE_LEN 4
 #define MDB_ASYNC_UID_MAX 17
-#define COMMAND_POLL_MS    15000
+#define COMMAND_POLL_MS    5000
 #define WATCHDOG_TIMEOUT_SEC 20
 
 // ── Offline ───────────────────────────────────────────
@@ -326,6 +326,9 @@ String backendLastError = "";
 bool   portalMode    = false;
 bool   wifiReady     = false;
 bool   backendReady  = false;   // true si /health respondio OK
+unsigned long lastCommandPollMs = 0;
+bool remoteCommandPollRequested = false;
+unsigned long statusLedSuppressUntilMs = 0;
 bool   mdbMachineTimeValid = false;
 uint32_t mdbMachineTimeEpoch = 0;
 uint32_t mdbMachineTimeCapturedAtMs = 0;
@@ -865,13 +868,66 @@ void initWatchdog() {
 // ══════════════════════════════════════════════════════
 //  HELPERS LED (activo HIGH)
 // ══════════════════════════════════════════════════════
-void ledBlink(int n, int ms) {
-    for (int i = 0; i < n; i++) {
-        digitalWrite(PIN_LED, HIGH); delay(ms);
-        digitalWrite(PIN_LED, LOW);  delay(ms);
+bool statusLedState = false;
+
+void ledWrite(bool on) {
+    statusLedState = on;
+    digitalWrite(PIN_LED, on ? HIGH : LOW);
+}
+
+void ledDelayWithWatchdog(unsigned long ms) {
+    unsigned long startedAt = millis();
+    while ((millis() - startedAt) < ms) {
+        feedWatchdog();
+        delay(10);
     }
 }
-void ledToggle() { digitalWrite(PIN_LED, !digitalRead(PIN_LED)); }
+
+void ledPulse(unsigned long onMs, unsigned long offMs = 0) {
+    ledWrite(true);
+    ledDelayWithWatchdog(onMs);
+    ledWrite(false);
+    if (offMs > 0) {
+        ledDelayWithWatchdog(offMs);
+    }
+}
+
+void suppressStatusLed(unsigned long ms) {
+    unsigned long until = millis() + ms;
+    if ((long)(until - statusLedSuppressUntilMs) > 0) {
+        statusLedSuppressUntilMs = until;
+    }
+}
+
+void ledBlink(int n, int ms) {
+    for (int i = 0; i < n; i++) {
+        ledPulse(ms, ms);
+    }
+}
+void ledToggle() { ledWrite(!statusLedState); }
+
+void ledTagApprovedPattern() {
+    ledPulse(850, 0);
+    suppressStatusLed(1500);
+}
+
+void ledTagRejectedPattern() {
+    for (int i = 0; i < 4; ++i) {
+        ledPulse(120, (i < 3) ? 120 : 0);
+    }
+    suppressStatusLed(1500);
+}
+
+void updateStatusLed() {
+    bool ready = !portalMode && wifiReady && backendReady && (WiFi.status() == WL_CONNECTED);
+    if (!ready || (long)(statusLedSuppressUntilMs - millis()) > 0) {
+        ledWrite(false);
+        return;
+    }
+
+    // "Late" corto cada 1 segundo para indicar que el equipo sigue vivo.
+    ledWrite((millis() % 1000UL) < 60UL);
+}
 
 void bootFeedbackPinsInit() {
     pinMode(PIN_LED_ONBOARD, OUTPUT);
@@ -1962,6 +2018,12 @@ void startPortal() {
 //  WIFI
 // ══════════════════════════════════════════════════════
 bool checkBackend();   // forward declaration
+void pollRemoteCommands(); // forward declaration
+bool canProcessRemoteCommand(); // forward declaration
+
+void requestImmediateRemoteCommandPoll() {
+    remoteCommandPollRequested = true;
+}
 
 bool connectWiFi() {
     if (wifiSSID.length() == 0) return false;
@@ -1980,8 +2042,8 @@ bool connectWiFi() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] OK — IP: %s\n", WiFi.localIP().toString().c_str());
-        digitalWrite(PIN_LED, HIGH);
         wifiReady = true;
+        requestImmediateRemoteCommandPoll();
         logDiagEvent(EVT_WIFI_CONNECT_OK, WiFi.RSSI(), WiFi.localIP());
 
         // Sincronizar NTP como reloj principal del firmware
@@ -2158,6 +2220,8 @@ void registerMachine() {
     String responseBody = (code > 0) ? http.getString() : "";
     http.end();
     feedWatchdog();
+    bool otaPendingAfterRegister = false;
+    String otaPendingVersion = "";
 
     if (code == 200 && responseBody.length() > 0) {
         DynamicJsonDocument responseDoc(2048);
@@ -2182,6 +2246,21 @@ void registerMachine() {
                 nextConfig.miscOptions = (uint8_t)(config["mdb_misc_options"] | nextConfig.miscOptions);
                 applyPricingConfig(nextConfig, true, "backend/register", remoteVersion, remoteSource);
             }
+
+            JsonObject ota = responseDoc["ota"].as<JsonObject>();
+            if (!ota.isNull()) {
+                String desiredVersion = String((const char*)(ota["desired_firmware_version"] | ""));
+                String otaStatus = String((const char*)(ota["firmware_update_status"] | ""));
+                desiredVersion.trim();
+                otaStatus.trim();
+
+                if (desiredVersion.length() > 0
+                    && desiredVersion != String(FIRMWARE_VERSION)
+                    && (otaStatus == "queued" || otaStatus == "in_progress" || otaStatus == "pending_reconnect")) {
+                    otaPendingAfterRegister = true;
+                    otaPendingVersion = desiredVersion;
+                }
+            }
         } else {
             Serial.printf("[REG] JSON invalido en respuesta: %s\n", err.c_str());
         }
@@ -2189,6 +2268,14 @@ void registerMachine() {
 
     if (code == 200) {
         Serial.println("[REG] OK — maquina APROBADA");
+        requestImmediateRemoteCommandPoll();
+        if (otaPendingAfterRegister && canProcessRemoteCommand()) {
+            Serial.printf("[REG] OTA pendiente detectada (%s) — consultando comandos remotos ahora\n",
+                          otaPendingVersion.c_str());
+            remoteCommandPollRequested = false;
+            lastCommandPollMs = millis();
+            pollRemoteCommands();
+        }
         logDiagEvent(EVT_BACKEND_REGISTER_OK, code, pricingSanitizeHumanPrice(pricingConfig.priceCents));
     } else if (code == 202) {
         Serial.println("[REG] PENDIENTE — esperando aprobacion");
@@ -2618,7 +2705,6 @@ void handleNFC() {
     // Fix Bug 6: no aceptar nuevos taps si hay sesión MDB activa
     if (mdbRuntime.phase == VEND_PENDING || mdbRuntime.phase == SESSION_IDLE) {
         Serial.println("[NFC] TAP IGNORADO — sesion MDB activa");
-        ledBlink(6, 60);
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
         lastNFCRead = millis();
@@ -2639,8 +2725,6 @@ void handleNFC() {
 
     Serial.printf("[NFC] Tarjeta: %s\n", uid.c_str());
     logDiagEvent(EVT_NFC_READ, 0, uid.length() >= 4 ? strtoul(uid.substring(0, 4).c_str(), nullptr, 16) : 0);
-    ledBlink(1, 50);
-
     bool approved    = false;
     bool isOffline   = false;
 
@@ -2658,18 +2742,18 @@ void handleNFC() {
             // (postTap devuelve solo el código; la razón viene en el body — se loguea genérico)
             Serial.println("[TAP] DENEGADO (online) — verificar razon en backend");
             logDiagEvent(EVT_NFC_DENIED, 403, 0);
-            ledBlink(5, 80);
+            ledTagRejectedPattern();
             return;
         } else if (code == 401) {
             Serial.println("[TAP] ERROR 401 — re-registrando maquina...");
             logDiagEvent(EVT_NFC_DENIED, 401, 0);
             registerMachine();
-            ledBlink(3, 300);
+            ledTagRejectedPattern();
             return;
         } else if (code > 0) {
             Serial.printf("[TAP] ERROR HTTP %d\n", code);
             logDiagEvent(EVT_NFC_DENIED, code, 0);
-            ledBlink(3, 200);
+            ledTagRejectedPattern();
             return;
         }
         // code <= 0: sin respuesta → caer a modo offline
@@ -2688,23 +2772,23 @@ void handleNFC() {
         } else if (result == LOCAL_AUTH_OVERLIMIT) {
             Serial.println("[TAP] DENEGADO — limite diario alcanzado (offline)");
             logDiagEvent(EVT_NFC_DENIED, 1, 0);
-            ledBlink(5, 80);
+            ledTagRejectedPattern();
             return;
         } else {
             Serial.println("[TAP] DENEGADO — tarjeta desconocida (offline)");
             logDiagEvent(EVT_NFC_DENIED, 2, 0);
-            ledBlink(3, 200);
+            ledTagRejectedPattern();
             return;
         }
     }
 
     if (!enqueueMdbStartSession(uid, isOffline)) {
         Serial.println("[MDB] ERROR — no se pudo encolar inicio de sesion");
-        ledBlink(5, 80);
+        ledTagRejectedPattern();
         return;
     }
 
-    ledBlink(2, 100);
+    ledTagApprovedPattern();
 }
 
 
@@ -3085,6 +3169,7 @@ void cmdVend(uint8_t* d, uint8_t len) {
             MDB_LOG_EVENTLN("[MDB] VEND_FAILURE — venta fallida");
             logDiagEvent(EVT_MDB_VEND_FAILURE, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
             notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, false);
+            ledTagRejectedPattern();
             mdbSendACK();
             mdbRuntime.phase = SESSION_IDLE;
             mdbRuntime.sessionUID = "";
@@ -3220,6 +3305,7 @@ void setup() {
     logDiagEvent(EVT_BOOT, (int16_t)resetReason, 0);
 
     pinMode(PIN_LED, OUTPUT);
+    ledWrite(false);
     pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
     bootFeedbackPinsInit();
     bootFeedbackOff();
@@ -3342,6 +3428,7 @@ void loop() {
         feedWatchdog();
         dnsServer.processNextRequest();
         portalServer.handleClient();
+        updateStatusLed();
         return;
     }
 
@@ -3377,10 +3464,12 @@ void loop() {
         downloadCards();
     }
 
-    // ── Poll de comandos remotos cada 15s ─────────────
-    static unsigned long lastCommandPoll = 0;
-    if (millis() - lastCommandPoll > COMMAND_POLL_MS) {
-        lastCommandPoll = millis();
+    // ── Poll de comandos remotos cada 5s o inmediatamente tras reconectar/registrar ──
+    if ((remoteCommandPollRequested || (millis() - lastCommandPollMs > COMMAND_POLL_MS))
+        && WiFi.status() == WL_CONNECTED
+        && canProcessRemoteCommand()) {
+        remoteCommandPollRequested = false;
+        lastCommandPollMs = millis();
         pollRemoteCommands();
     }
 
@@ -3416,6 +3505,7 @@ void loop() {
                       clockSource);
     }
 
+    updateStatusLed();
     feedWatchdog();
     yield();
 }

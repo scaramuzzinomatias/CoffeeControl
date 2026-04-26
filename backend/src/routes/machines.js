@@ -490,11 +490,14 @@ async function getActiveMachineById(machineId) {
 
 async function getQueuedMachineCommand(machineId) {
     const result = await pool.query(
-        `SELECT id, command_type
+        `SELECT id, command_type, status
          FROM machine_commands
          WHERE machine_id = $1
-           AND status = 'queued'
-         ORDER BY queued_at DESC
+           AND status IN ('queued', 'delivered')
+         ORDER BY
+           CASE WHEN status = 'delivered' THEN 0 ELSE 1 END,
+           delivered_at DESC NULLS LAST,
+           queued_at DESC
          LIMIT 1`,
         [machineId]
     );
@@ -546,7 +549,7 @@ async function maybeQueuePendingFirmwareUpdate(machine) {
                  result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('message', $2::text, 'version', $3::text)
              WHERE machine_id = $1
                AND command_type = 'firmware_update'
-               AND status = 'queued'`,
+               AND status IN ('queued', 'delivered')`,
             [machine.id, `Firmware ${currentVersion} activo`, currentVersion]
         );
         const synced = await pool.query(

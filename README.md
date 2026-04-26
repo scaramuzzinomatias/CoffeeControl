@@ -670,6 +670,9 @@ Notas:
 - `POST /api/machines/register` devuelve la configuración efectiva aprobada por backend, incluyendo precio humano, perfil MDB y parámetros técnicos
 - cuando cambia el precio o la configuración técnica de una máquina desde el backend, se puede encolar un `config_update` completo para que el ESP lo aplique sin recompilar
 - la máquina reporta también `config_version` y `config_source`, para que backend y portal no queden en conflicto silencioso
+- si backend devuelve una OTA pendiente en `register`, el firmware fuerza una consulta remota inmediata en ese mismo arranque
+- los comandos OTA entregados quedan reentregables (`delivered`) hasta que la máquina confirme o re-registre la nueva versión
+- el backend rechaza releases cuyo binario no declare la misma versión publicada
 
 ### Panel admin (auth JWT — header Authorization: Bearer token)
 ```
@@ -685,8 +688,12 @@ POST /api/machines                      { name, location, mac, price_cents }
 PATCH /api/machines/:id                { name?, location?, price_cents? } → { machine, config_sync }
 GET  /api/machines/:id/technical-config
 PATCH /api/machines/:id/technical-config { price_cents?, pricing_profile?, mdb_feature_level?, mdb_country_code?, mdb_scale_factor?, mdb_decimal_places?, mdb_max_response_time?, mdb_misc_options? }
+GET  /api/machines/:id/ota
+POST /api/machines/:id/ota/deploy      { release_id }
 POST /api/machines/:id/block    { reason }
 POST /api/machines/:id/unblock
+
+POST /api/firmware/releases     (binario OTA con headers X-Firmware-Version / X-Firmware-Filename)
 
 GET  /api/employees
 POST /api/employees             { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled }
@@ -871,9 +878,9 @@ Acceso:
 - [x] Precio configurable por máquina en backend, panel admin y portal del ESP32-C3, con conversión MDB interna en firmware
 - [x] Scripts DB y soporte (`db:migrate:all`, `support:doctor`, reseteo/alta de usuarios del panel)
 - [x] Tests de integración mínimos (`npm run test:integration`)
+- [x] OTA (Over The Air) — actualización de firmware desde el panel, con reentrega confiable y validada en máquina real
 - [~] App técnico Android nativa (operativa en teléfono real; falta pulido UX y validación en vivo de WiFi/pending)
 - [~] App gerente móvil: PWA V1 implementada como prototipo; siguiente dirección recomendada, app nativa
-- [ ] OTA (Over The Air) — actualización de firmware desde el panel
 - [ ] Multi-tenant para modo SaaS (campo `tenant_id`, schema por empresa)
 - [ ] Mapa de máquinas con estado en tiempo real
 - [ ] Seguridad payload MDB: XOR + timestamp contra replay attacks
