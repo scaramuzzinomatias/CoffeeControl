@@ -61,7 +61,7 @@ Configuración:
 
 - [ ] ESP32-C3 flasheado con firmware vigente
 - [ ] Lector NFC operativo
-- [ ] RTC operativo
+- [ ] NTP operativo y hora válida
 - [ ] Comunicación MDB estable
 - [ ] Fuente estable
 - [ ] Cableado firme y etiquetado

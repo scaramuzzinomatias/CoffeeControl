@@ -242,6 +242,7 @@ Siempre:
 ## 12. Referencias relacionadas
 
 - [CHECKLIST_PILOTO.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/CHECKLIST_PILOTO.md)
+- [RUNBOOK_PRODUCCION_MAQUINAS.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/RUNBOOK_PRODUCCION_MAQUINAS.md)
 - [PROTOCOLO_PRUEBAS.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/PROTOCOLO_PRUEBAS.md)
 - [README.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/README.md)
 - [AGENTE.md](/C:/PROYECTOS/CoffeControl/CoffeeControl_proyecto/AGENTE.md)
