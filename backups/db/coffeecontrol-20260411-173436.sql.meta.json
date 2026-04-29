@@ -1,0 +1,21 @@
+{
+  "generated_at": "2026-04-11T20:34:37.954Z",
+  "project": "CoffeeControl",
+  "database": {
+    "name": "coffeecontrol",
+    "host": "127.0.0.1",
+    "port": "5432",
+    "username": "postgres"
+  },
+  "backup": {
+    "file": "C:\\PROYECTOS\\CoffeControl\\CoffeeControl_proyecto\\backups\\db\\coffeecontrol-20260411-173436.sql",
+    "format": "sql",
+    "schema_only": false,
+    "data_only": false,
+    "size_bytes": 174774
+  },
+  "source": {
+    "git_head": "725c84e",
+    "hostname": "IEAORD03"
+  }
+}

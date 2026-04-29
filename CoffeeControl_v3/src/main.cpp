@@ -60,6 +60,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Update.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -156,7 +157,7 @@
 #define MDB_ASYNC_QUEUE_LEN 4
 #define MDB_ASYNC_UID_MAX 17
 #define COMMAND_POLL_MS    5000
-#define WATCHDOG_TIMEOUT_SEC 20
+#define WATCHDOG_TIMEOUT_SEC 90
 
 // ── Offline ───────────────────────────────────────────
 #define MAX_CARDS          1500   // límite práctico (~100KB ArduinoJson doc)
@@ -1473,7 +1474,8 @@ void flushQueue() {
         }
         body += "]";
 
-        WiFiClient client;
+        WiFiClientSecure client;
+    client.setInsecure();
         HTTPClient http;
         if (!http.begin(client, backendBase + "/api/tap/queue")) break;
 
@@ -1511,13 +1513,15 @@ void flushQueue() {
 void downloadCards() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, backendBase + "/api/tap/cards")) return;
 
     http.addHeader("X-Machine-Mac", macAddress);
     http.setTimeout(HTTP_TIMEOUT_MS * 3);
 
+    feedWatchdog();
     int code = http.GET();
     feedWatchdog();
     if (code != 200) {
@@ -1529,9 +1533,10 @@ void downloadCards() {
 
     // Parsear directo desde el stream (no se almacena el payload completo en String)
     DynamicJsonDocument doc(100000);
-    DeserializationError err = deserializeJson(doc, client);
+    feedWatchdog();          // antes del parse
+    DeserializationError err = deserializeJson(doc, http.getStream());
     http.end();
-    feedWatchdog();
+    feedWatchdog();          // después del parse
 
     if (err) {
         Serial.printf("[CARDS] Error JSON descarga: %s\n", err.c_str());
@@ -1693,7 +1698,8 @@ String testPortalConnection(const String& rawSsid, const String& rawPass, const 
 
     String ip = WiFi.localIP().toString();
     String healthUrl = url + "/health";
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     bool backendOk = false;
     int code = -1;
@@ -2072,7 +2078,8 @@ bool checkBackend() {
     }
     String url = backendBase + "/health";
     Serial.printf("[BACKEND] Intentando: %s\n", url.c_str());
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, url)) {
         Serial.println("[BACKEND] http.begin() fallo — URL invalida?");
@@ -2104,7 +2111,8 @@ bool checkBackend() {
 int postTap(const String& uid) {
     if (WiFi.status() != WL_CONNECTED) return -1;
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, backendBase + "/api/tap")) return -1;
 
@@ -2135,7 +2143,8 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
     }
 
     // Online: notificar al backend directamente
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, backendBase + "/api/tap/result")) {
         // Si falla begin, encolar como fallback
@@ -2166,7 +2175,8 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
 void reconcileTaps() {
     if (!wifiReady) return;
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, backendBase + "/api/tap/reconcile")) return;
 
@@ -2185,7 +2195,8 @@ void reconcileTaps() {
 void registerMachine() {
     if (!wifiReady) return;
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, backendBase + "/api/machines/register")) return;
 
@@ -2303,7 +2314,8 @@ bool canProcessRemoteCommand() {
 bool ackRemoteCommandJson(uint32_t commandId, const char* status, const String& resultJson) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     String url = backendBase + "/api/machine-control/commands/" + String(commandId) + "/ack";
     if (!http.begin(client, url)) return false;
@@ -2513,7 +2525,8 @@ bool handleRemoteFirmwareUpdate(uint32_t commandId, JsonObject payload) {
                   version.c_str(),
                   downloadUrl.c_str());
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (!http.begin(client, downloadUrl)) {
         ackRemoteCommand(commandId, "failed", "No se pudo abrir la descarga OTA");
@@ -2592,7 +2605,8 @@ void pollRemoteCommands() {
     if (WiFi.status() != WL_CONNECTED) return;
     if (!canProcessRemoteCommand()) return;
 
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     String url = backendBase + "/api/machine-control/commands/next";
     if (!http.begin(client, url)) return;
@@ -3389,7 +3403,7 @@ void setup() {
 
     xTaskCreatePinnedToCore(
         mdbCommandTask,
-        "mdb_cmd", 4096, NULL, 4, NULL, 1
+        "mdb_cmd", 12288, NULL, 4, NULL, 1
     );
     Serial.println("[MDB] Tarea MDB command handler iniciada");
 
