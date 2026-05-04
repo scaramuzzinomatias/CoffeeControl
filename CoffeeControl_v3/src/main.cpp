@@ -350,6 +350,21 @@ int        queueLen = 0;
 String jsonEscape(const String& value);
 String buildMdbGatewayJson();
 
+bool urlUsesTls(const String& url) {
+    return url.startsWith("https://");
+}
+
+bool beginHttpRequest(HTTPClient& http,
+                      WiFiClient& plainClient,
+                      WiFiClientSecure& secureClient,
+                      const String& url) {
+    if (urlUsesTls(url)) {
+        secureClient.setInsecure();
+        return http.begin(secureClient, url);
+    }
+    return http.begin(plainClient, url);
+}
+
 void logDiagEvent(uint16_t code, int16_t arg1 = 0, uint32_t arg2 = 0) {
     diagEventLog.push(code, arg1, arg2, millis());
 }
@@ -1474,10 +1489,11 @@ void flushQueue() {
         }
         body += "]";
 
-        WiFiClientSecure client;
-    client.setInsecure();
+        String url = backendBase + "/api/tap/queue";
+        WiFiClient client;
+        WiFiClientSecure secureClient;
         HTTPClient http;
-        if (!http.begin(client, backendBase + "/api/tap/queue")) break;
+        if (!beginHttpRequest(http, client, secureClient, url)) break;
 
         http.addHeader("Content-Type", "application/json");
         http.addHeader("X-Machine-Mac", macAddress);
@@ -1513,10 +1529,11 @@ void flushQueue() {
 void downloadCards() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    String url = backendBase + "/api/tap/cards";
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, backendBase + "/api/tap/cards")) return;
+    if (!beginHttpRequest(http, client, secureClient, url)) return;
 
     http.addHeader("X-Machine-Mac", macAddress);
     http.setTimeout(HTTP_TIMEOUT_MS * 3);
@@ -1698,13 +1715,13 @@ String testPortalConnection(const String& rawSsid, const String& rawPass, const 
 
     String ip = WiFi.localIP().toString();
     String healthUrl = url + "/health";
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
     bool backendOk = false;
     int code = -1;
 
-    if (http.begin(client, healthUrl)) {
+    if (beginHttpRequest(http, client, secureClient, healthUrl)) {
         http.setTimeout(5000);
         code = http.GET();
         backendOk = (code == 200);
@@ -2078,10 +2095,10 @@ bool checkBackend() {
     }
     String url = backendBase + "/health";
     Serial.printf("[BACKEND] Intentando: %s\n", url.c_str());
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, url)) {
+    if (!beginHttpRequest(http, client, secureClient, url)) {
         Serial.println("[BACKEND] http.begin() fallo — URL invalida?");
         backendReady = false;
         backendLastError = "URL backend invalida o inaccesible";
@@ -2111,10 +2128,11 @@ bool checkBackend() {
 int postTap(const String& uid) {
     if (WiFi.status() != WL_CONNECTED) return -1;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    String url = backendBase + "/api/tap";
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, backendBase + "/api/tap")) return -1;
+    if (!beginHttpRequest(http, client, secureClient, url)) return -1;
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
@@ -2143,10 +2161,11 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
     }
 
     // Online: notificar al backend directamente
-    WiFiClientSecure client;
-    client.setInsecure();
+    String url = backendBase + "/api/tap/result";
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, backendBase + "/api/tap/result")) {
+    if (!beginHttpRequest(http, client, secureClient, url)) {
         // Si falla begin, encolar como fallback
         enqueueEvent(uid, itemId, amount, ok);
         return;
@@ -2175,10 +2194,11 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
 void reconcileTaps() {
     if (!wifiReady) return;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    String url = backendBase + "/api/tap/reconcile";
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, backendBase + "/api/tap/reconcile")) return;
+    if (!beginHttpRequest(http, client, secureClient, url)) return;
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
@@ -2195,10 +2215,11 @@ void reconcileTaps() {
 void registerMachine() {
     if (!wifiReady) return;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    String url = backendBase + "/api/machines/register";
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, backendBase + "/api/machines/register")) return;
+    if (!beginHttpRequest(http, client, secureClient, url)) return;
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Registration-Secret", REGISTRATION_SECRET);
@@ -2314,11 +2335,11 @@ bool canProcessRemoteCommand() {
 bool ackRemoteCommandJson(uint32_t commandId, const char* status, const String& resultJson) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
     String url = backendBase + "/api/machine-control/commands/" + String(commandId) + "/ack";
-    if (!http.begin(client, url)) return false;
+    if (!beginHttpRequest(http, client, secureClient, url)) return false;
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
@@ -2525,10 +2546,10 @@ bool handleRemoteFirmwareUpdate(uint32_t commandId, JsonObject payload) {
                   version.c_str(),
                   downloadUrl.c_str());
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
-    if (!http.begin(client, downloadUrl)) {
+    if (!beginHttpRequest(http, client, secureClient, downloadUrl)) {
         ackRemoteCommand(commandId, "failed", "No se pudo abrir la descarga OTA");
         return true;
     }
@@ -2605,11 +2626,11 @@ void pollRemoteCommands() {
     if (WiFi.status() != WL_CONNECTED) return;
     if (!canProcessRemoteCommand()) return;
 
-    WiFiClientSecure client;
-    client.setInsecure();
+    WiFiClient client;
+    WiFiClientSecure secureClient;
     HTTPClient http;
     String url = backendBase + "/api/machine-control/commands/next";
-    if (!http.begin(client, url)) return;
+    if (!beginHttpRequest(http, client, secureClient, url)) return;
 
     http.addHeader("X-Machine-Mac", macAddress);
     http.setTimeout(HTTP_TIMEOUT_MS);
