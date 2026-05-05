@@ -154,6 +154,8 @@
 #define HTTP_TIMEOUT_MS    4000
 #define OTA_HTTP_TIMEOUT_MS 20000
 #define SESSION_TIMEOUT_MS 12000
+#define BACKEND_SYNC_BOOT_DELAY_MS 5000
+#define BACKEND_SYNC_RECONNECT_DELAY_MS 1500
 #define MDB_ASYNC_QUEUE_LEN 4
 #define MDB_ASYNC_UID_MAX 17
 #define COMMAND_POLL_MS    5000
@@ -327,9 +329,31 @@ String backendLastError = "";
 bool   portalMode    = false;
 bool   wifiReady     = false;
 bool   backendReady  = false;   // true si /health respondio OK
+uint8_t backendFailureStreak = 0;
 unsigned long lastCommandPollMs = 0;
 bool remoteCommandPollRequested = false;
 unsigned long statusLedSuppressUntilMs = 0;
+bool heartbeatLedOn = false;
+unsigned long heartbeatNextChangeMs = 0;
+enum BackendSyncPhase : uint8_t {
+    BACKEND_SYNC_IDLE = 0,
+    BACKEND_SYNC_INITIAL_DELAY,
+    BACKEND_SYNC_ATTEMPT,
+    BACKEND_SYNC_RETRY_DELAY
+};
+BackendSyncPhase backendSyncPhase = BACKEND_SYNC_IDLE;
+unsigned long backendSyncNextStepMs = 0;
+uint8_t backendSyncAttempt = 0;
+bool backendSyncLastHealthOk = false;
+String backendSyncReason = "";
+enum StatusLedEventType : uint8_t {
+    LED_EVENT_NONE = 0,
+    LED_EVENT_TAG_PENDING,
+    LED_EVENT_APPROVED,
+    LED_EVENT_REJECTED
+};
+StatusLedEventType statusLedEvent = LED_EVENT_NONE;
+unsigned long statusLedEventStartedMs = 0;
 bool   mdbMachineTimeValid = false;
 uint32_t mdbMachineTimeEpoch = 0;
 uint32_t mdbMachineTimeCapturedAtMs = 0;
@@ -367,15 +391,26 @@ bool beginHttpRequest(HTTPClient& http,
 
 void markBackendOk() {
     backendReady = true;
+    backendFailureStreak = 0;
     backendLastError = "";
 }
 
 void markBackendResponseError(const String& error) {
     backendReady = true;
+    backendFailureStreak = 0;
     backendLastError = error;
 }
 
 void markBackendOffline(const String& error) {
+    if (backendFailureStreak < 255) backendFailureStreak++;
+    if (backendFailureStreak >= 3) {
+        backendReady = false;
+    }
+    backendLastError = error;
+}
+
+void markBackendHardOffline(const String& error) {
+    backendFailureStreak = 3;
     backendReady = false;
     backendLastError = error;
 }
@@ -396,7 +431,13 @@ void registerMachine();
 void reconcileTaps();
 void flushQueue();
 void downloadCards();
+void processBackendSync();
+bool isBackendSyncActive();
 void syncBackendAfterWiFi(const char* reason);
+
+bool isBackendSyncActive() {
+    return backendSyncPhase != BACKEND_SYNC_IDLE;
+}
 
 void logDiagEvent(uint16_t code, int16_t arg1 = 0, uint32_t arg2 = 0) {
     diagEventLog.push(code, arg1, arg2, millis());
@@ -955,27 +996,117 @@ void ledBlink(int n, int ms) {
 }
 void ledToggle() { ledWrite(!statusLedState); }
 
+void resetStatusLedEvent() {
+    statusLedEvent = LED_EVENT_NONE;
+    statusLedEventStartedMs = 0;
+}
+
+void ledTagReadPending() {
+    statusLedSuppressUntilMs = 0;
+    heartbeatLedOn = false;
+    heartbeatNextChangeMs = 0;
+    statusLedEvent = LED_EVENT_TAG_PENDING;
+    statusLedEventStartedMs = millis();
+    ledWrite(true);
+}
+
 void ledTagApprovedPattern() {
-    ledPulse(850, 0);
-    suppressStatusLed(1500);
+    statusLedSuppressUntilMs = millis() + 250UL;
+    heartbeatLedOn = false;
+    heartbeatNextChangeMs = 0;
+    statusLedEvent = LED_EVENT_APPROVED;
+    statusLedEventStartedMs = millis();
+    ledWrite(true);
 }
 
 void ledTagRejectedPattern() {
-    for (int i = 0; i < 4; ++i) {
-        ledPulse(120, (i < 3) ? 120 : 0);
+    statusLedSuppressUntilMs = millis() + 300UL;
+    heartbeatLedOn = false;
+    heartbeatNextChangeMs = 0;
+    statusLedEvent = LED_EVENT_REJECTED;
+    statusLedEventStartedMs = millis();
+    ledWrite(true);
+}
+
+bool updateStatusLedEvent(unsigned long now) {
+    if (statusLedEvent == LED_EVENT_NONE) return false;
+
+    unsigned long elapsed = now - statusLedEventStartedMs;
+
+    switch (statusLedEvent) {
+        case LED_EVENT_TAG_PENDING:
+            ledWrite(true);
+            if (elapsed >= 2000UL) {
+                resetStatusLedEvent();
+                ledWrite(false);
+            }
+            return true;
+
+        case LED_EVENT_APPROVED:
+            if (elapsed < 650UL) {
+                ledWrite(true);
+            } else {
+                ledWrite(false);
+                resetStatusLedEvent();
+            }
+            return true;
+
+        case LED_EVENT_REJECTED:
+            if (elapsed < 220UL) {
+                ledWrite(true);
+            } else if (elapsed < 400UL) {
+                ledWrite(false);
+            } else if (elapsed < 620UL) {
+                ledWrite(true);
+            } else {
+                ledWrite(false);
+                resetStatusLedEvent();
+            }
+            return true;
+
+        default:
+            resetStatusLedEvent();
+            ledWrite(false);
+            return false;
     }
-    suppressStatusLed(1500);
 }
 
 void updateStatusLed() {
-    bool ready = !portalMode && wifiReady && backendReady && (WiFi.status() == WL_CONNECTED);
-    if (!ready || (long)(statusLedSuppressUntilMs - millis()) > 0) {
-        ledWrite(false);
+    unsigned long now = millis();
+    if (updateStatusLedEvent(now)) {
         return;
     }
 
-    // "Late" corto cada 1 segundo para indicar que el equipo sigue vivo.
-    ledWrite((millis() % 1000UL) < 60UL);
+    bool ready = !portalMode && wifiReady && backendReady && (WiFi.status() == WL_CONNECTED);
+
+    if (!ready || (long)(statusLedSuppressUntilMs - now) > 0) {
+        ledWrite(false);
+        heartbeatLedOn = false;
+        heartbeatNextChangeMs = 0;
+        return;
+    }
+
+    // Heartbeat no bloqueante: 120 ms encendido, 880 ms apagado.
+    if (heartbeatNextChangeMs == 0) {
+        heartbeatLedOn = true;
+        ledWrite(true);
+        heartbeatNextChangeMs = now + 120UL;
+        return;
+    }
+
+    if ((long)(now - heartbeatNextChangeMs) < 0) {
+        return;
+    }
+
+    if (heartbeatLedOn) {
+        heartbeatLedOn = false;
+        ledWrite(false);
+        heartbeatNextChangeMs = now + 880UL;
+    } else {
+        heartbeatLedOn = true;
+        ledWrite(true);
+        heartbeatNextChangeMs = now + 120UL;
+    }
 }
 
 void bootFeedbackPinsInit() {
@@ -2103,6 +2234,8 @@ bool connectWiFi() {
     if (wifiSSID.length() == 0) return false;
 
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
     Serial.printf("[WiFi] Conectando a %s", wifiSSID.c_str());
 
@@ -2116,6 +2249,8 @@ bool connectWiFi() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] OK — IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.println("[WiFi] Power save desactivado");
+        ledWrite(false);
         wifiReady = true;
         requestImmediateRemoteCommandPoll();
         logDiagEvent(EVT_WIFI_CONNECT_OK, WiFi.RSSI(), WiFi.localIP());
@@ -2136,7 +2271,7 @@ bool connectWiFi() {
 // ══════════════════════════════════════════════════════
 bool checkBackend() {
     if (WiFi.status() != WL_CONNECTED) {
-        markBackendOffline("WiFi desconectado");
+        markBackendHardOffline("WiFi desconectado");
         logDiagEvent(EVT_BACKEND_HEALTH_FAIL, -1, 0);
         return false;
     }
@@ -2147,7 +2282,7 @@ bool checkBackend() {
     HTTPClient http;
     if (!beginHttpRequest(http, client, secureClient, url)) {
         Serial.println("[BACKEND] http.begin() fallo — URL invalida?");
-        markBackendOffline("URL backend invalida o inaccesible");
+        markBackendHardOffline("URL backend invalida o inaccesible");
         return false;
     }
     prepareHttpClient(http, HTTP_TIMEOUT_MS);
@@ -2403,43 +2538,98 @@ void syncBackendAfterWiFi(const char* reason) {
     if (!wifiReady) return;
 
     const char* label = (reason != nullptr && reason[0] != '\0') ? reason : "conexion";
+    backendSyncReason = label;
+    backendSyncAttempt = 0;
+    backendSyncLastHealthOk = false;
+    backendSyncPhase = BACKEND_SYNC_INITIAL_DELAY;
+    const unsigned long delayMs = (strcmp(label, "arranque") == 0)
+        ? BACKEND_SYNC_BOOT_DELAY_MS
+        : BACKEND_SYNC_RECONNECT_DELAY_MS;
+    backendSyncNextStepMs = millis() + delayMs;
     Serial.printf("[BACKEND] Sincronizando tras %s...\n", label);
-    delay(700);
-    feedWatchdog();
+}
 
-    const uint8_t maxAttempts = 4;
-    for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt) {
-        Serial.printf("[BACKEND] Intento de sincronizacion %u/%u\n", attempt, maxAttempts);
-
-        bool healthOk = checkBackend();
-        registerMachine();
-
-        if (backendReady) {
-            reconcileTaps();
-            flushQueue();
-            downloadCards();
-
-            if (backendReady && !healthOk) {
-                delay(250);
-                feedWatchdog();
-                healthOk = checkBackend();
-            }
-
-            if (backendReady && healthOk) {
-                return;
-            }
-        }
-
-        if (attempt < maxAttempts) {
-            delay(1200);
-            feedWatchdog();
+void finishBackendSync(bool success) {
+    if (!success) {
+        if (backendLastError.length() > 0) {
+            Serial.printf("[BACKEND] Sincronizacion incompleta: %s\n", backendLastError.c_str());
+        } else {
+            Serial.println("[BACKEND] Sincronizacion incompleta");
         }
     }
 
-    if (backendLastError.length() > 0) {
-        Serial.printf("[BACKEND] Sincronizacion incompleta: %s\n", backendLastError.c_str());
-    } else {
-        Serial.println("[BACKEND] Sincronizacion incompleta");
+    backendSyncPhase = BACKEND_SYNC_IDLE;
+    backendSyncNextStepMs = 0;
+    backendSyncAttempt = 0;
+    backendSyncLastHealthOk = false;
+    backendSyncReason = "";
+}
+
+void processBackendSync() {
+    if (backendSyncPhase == BACKEND_SYNC_IDLE) return;
+
+    if (!wifiReady || WiFi.status() != WL_CONNECTED) {
+        Serial.println("[BACKEND] Sincronizacion cancelada — WiFi desconectado");
+        finishBackendSync(false);
+        return;
+    }
+
+    unsigned long now = millis();
+    if ((long)(now - backendSyncNextStepMs) < 0) return;
+
+    const uint8_t maxAttempts = 4;
+
+    switch (backendSyncPhase) {
+        case BACKEND_SYNC_INITIAL_DELAY:
+            backendSyncPhase = BACKEND_SYNC_ATTEMPT;
+            backendSyncNextStepMs = now;
+            return;
+
+        case BACKEND_SYNC_ATTEMPT: {
+            if (backendSyncAttempt >= maxAttempts) {
+                finishBackendSync(false);
+                return;
+            }
+
+            backendSyncAttempt++;
+            Serial.printf("[BACKEND] Intento de sincronizacion %u/%u\n",
+                          backendSyncAttempt,
+                          maxAttempts);
+
+            registerMachine();
+            bool registerResponsive = (backendFailureStreak == 0) && (backendLastError.length() == 0);
+
+            if (registerResponsive) {
+                reconcileTaps();
+                flushQueue();
+                downloadCards();
+
+                if (backendLastError.length() > 0) {
+                    Serial.printf("[BACKEND] Sincronizacion base OK; tareas auxiliares pendientes/error: %s\n",
+                                  backendLastError.c_str());
+                }
+                finishBackendSync(true);
+                return;
+            }
+
+            if (backendSyncAttempt < maxAttempts) {
+                backendSyncPhase = BACKEND_SYNC_RETRY_DELAY;
+                backendSyncNextStepMs = millis() + 1200UL;
+                return;
+            }
+
+            finishBackendSync(false);
+            return;
+        }
+
+        case BACKEND_SYNC_RETRY_DELAY:
+            backendSyncPhase = BACKEND_SYNC_ATTEMPT;
+            backendSyncNextStepMs = now;
+            return;
+
+        case BACKEND_SYNC_IDLE:
+        default:
+            return;
     }
 }
 
@@ -2903,6 +3093,7 @@ void handleNFC() {
 
     Serial.printf("[NFC] Tarjeta: %s\n", uid.c_str());
     logDiagEvent(EVT_NFC_READ, 0, uid.length() >= 4 ? strtoul(uid.substring(0, 4).c_str(), nullptr, 16) : 0);
+    ledTagReadPending();
     bool approved    = false;
     bool isOffline   = false;
 
@@ -3607,6 +3798,8 @@ void loop() {
     // Modo normal: NFC (MDB ahora corre en tarea independiente)
     handleNFC();
 
+    processBackendSync();
+
     // ── Reconexión WiFi cada 30s ──────────────────────
     static unsigned long lastWifiCheck = 0;
     if (millis() - lastWifiCheck > 30000) {
@@ -3634,7 +3827,8 @@ void loop() {
     }
 
     // ── Poll de comandos remotos cada 5s o inmediatamente tras reconectar/registrar ──
-    if ((remoteCommandPollRequested || (millis() - lastCommandPollMs > COMMAND_POLL_MS))
+    if (!isBackendSyncActive()
+        && (remoteCommandPollRequested || (millis() - lastCommandPollMs > COMMAND_POLL_MS))
         && WiFi.status() == WL_CONNECTED) {
         remoteCommandPollRequested = false;
         lastCommandPollMs = millis();
@@ -3657,9 +3851,8 @@ void loop() {
 
     // ── Heartbeat cada 60s ────────────────────────────
     static unsigned long lastHeartbeat = 0;
-    if (millis() - lastHeartbeat > 60000) {
+    if (!isBackendSyncActive() && millis() - lastHeartbeat > 60000) {
         lastHeartbeat = millis();
-        checkBackend();   // re-verificar backend en cada heartbeat
         registerMachine();  // actualiza last_seen y telemetría de red
         const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
         const char* clockSource = "UPTIME";
