@@ -156,6 +156,9 @@
 #define SESSION_TIMEOUT_MS 12000
 #define BACKEND_SYNC_BOOT_DELAY_MS 5000
 #define BACKEND_SYNC_RECONNECT_DELAY_MS 1500
+#define TAP_DECISION_FLUSH_INITIAL_DELAY_MS 500
+#define TAP_DECISION_FLUSH_BASE_RETRY_MS    3000
+#define TAP_DECISION_FLUSH_MAX_RETRY_MS    30000
 #define MDB_ASYNC_QUEUE_LEN 4
 #define MDB_ASYNC_UID_MAX 17
 #define COMMAND_POLL_MS    5000
@@ -164,14 +167,19 @@
 // ── Offline ───────────────────────────────────────────
 #define MAX_CARDS          1500   // límite práctico (~100KB ArduinoJson doc)
 #define MAX_QUEUE          1000
+#define MAX_TAP_DECISIONS   256
 #define CARDS_PATH         "/cards.json"
 #define QUEUE_PATH         "/queue.log"
 #define QUEUE_LEGACY_PATH  "/queue.json"
+#define TAP_DECISIONS_PATH "/tap_decisions.json"
 
 // Resultados de localAuth()
 #define LOCAL_AUTH_OK        0
 #define LOCAL_AUTH_OVERLIMIT 1
 #define LOCAL_AUTH_UNKNOWN   2
+#define LOCAL_TAP_REASON_NONE          0
+#define LOCAL_TAP_REASON_CARD_UNKNOWN  1
+#define LOCAL_TAP_REASON_LIMIT_REACHED 2
 
 // Modos de límite diario cacheados offline
 #define LIMIT_MODE_ENFORCE   0
@@ -187,6 +195,14 @@ struct __attribute__((packed)) CardEntry {
     uint8_t limit;     // daily_limit
     uint8_t mode;      // enforce / warn_only / off
     uint8_t used;      // used_today (en memoria)
+};
+
+struct __attribute__((packed)) TapDecisionEntry {
+    char     uid[9];
+    uint8_t  approved;
+    uint8_t  reason;
+    uint16_t reserved;
+    uint32_t ts;
 };
 
 struct __attribute__((packed)) MdbSetupSnapshot {
@@ -266,6 +282,7 @@ struct __attribute__((packed)) MdbAsyncEvent {
     uint8_t sessionIsOffline;
     uint16_t reserved;
     uint32_t requestedAtMs;
+    uint32_t tapTs;
     char uid[MDB_ASYNC_UID_MAX];
 };
 
@@ -282,6 +299,7 @@ struct MdbRuntimeState {
     uint16_t sessionAmount;
     bool vendUsed;
     bool sessionIsOffline;
+    uint32_t sessionTapTs;
     unsigned long sessionStartMs;
 
     MdbRuntimeState()
@@ -297,6 +315,7 @@ struct MdbRuntimeState {
           sessionAmount(1200),
           vendUsed(false),
           sessionIsOffline(false),
+          sessionTapTs(0),
           sessionStartMs(0) {}
 };
 
@@ -370,6 +389,11 @@ uint32_t  nextResetTs = 0;      // Unix timestamp UTC del próximo reset de cont
 // ── Offline: cola de eventos ──────────────────────────
 QueueEntry queueBuf[MAX_QUEUE];
 int        queueLen = 0;
+TapDecisionEntry tapDecisionBuf[MAX_TAP_DECISIONS];
+int              tapDecisionLen = 0;
+bool             tapDecisionFlushRequested = false;
+unsigned long    tapDecisionNextFlushMs = 0;
+uint8_t          tapDecisionFlushFailureStreak = 0;
 
 String jsonEscape(const String& value);
 String buildMdbGatewayJson();
@@ -434,6 +458,7 @@ void downloadCards();
 void processBackendSync();
 bool isBackendSyncActive();
 void syncBackendAfterWiFi(const char* reason);
+void backendServiceTask(void*);
 
 bool isBackendSyncActive() {
     return backendSyncPhase != BACKEND_SYNC_IDLE;
@@ -1145,8 +1170,16 @@ void handleMDB();
 
 void startPortal();
 void saveConfig(const String& ssid, const String& pass, const String& url, const PricingConfig& pricing, uint32_t configVersion, const String& configSource);
-void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool ok);
+void notifyVendResult(const String& uid, uint32_t tapTs, uint16_t itemId, uint16_t amount, bool ok);
 uint16_t currentConfiguredHumanPrice();
+void loadTapDecisions();
+void saveTapDecisions();
+void flushTapDecisions();
+void requestTapDecisionFlush();
+void scheduleTapDecisionFlush(unsigned long delayMs);
+unsigned long nextTapDecisionRetryDelayMs();
+void flushPendingBackendArtifactsNow();
+uint32_t getCurrentTs();
 
 bool parseUnsignedLongStrict(const String& raw, uint32_t& out) {
     String value = raw;
@@ -1175,13 +1208,14 @@ uint16_t currentConfiguredSessionFunds() {
     return pricingBeginSessionFunds(pricingConfig);
 }
 
-bool enqueueMdbStartSession(const String& uid, bool isOffline) {
+bool enqueueMdbStartSession(const String& uid, bool isOffline, uint32_t tapTs) {
     if (mdbAsyncQueue == nullptr) return false;
 
     MdbAsyncEvent event{};
     event.type = MDB_EVENT_START_SESSION;
     event.sessionIsOffline = isOffline ? 1 : 0;
     event.requestedAtMs = millis();
+    event.tapTs = tapTs;
     snprintf(event.uid, sizeof(event.uid), "%s", uid.c_str());
 
     return xQueueSend(mdbAsyncQueue, &event, 0) == pdPASS;
@@ -1195,6 +1229,7 @@ void startMdbSessionFromEvent(const MdbAsyncEvent& event) {
 
     mdbRuntime.sessionUID = event.uid;
     mdbRuntime.sessionIsOffline = event.sessionIsOffline != 0;
+    mdbRuntime.sessionTapTs = event.tapTs;
     mdbRuntime.pendingSession = true;
     mdbRuntime.phase = SESSION_IDLE;
     mdbRuntime.sessionStartMs = event.requestedAtMs > 0 ? event.requestedAtMs : millis();
@@ -1235,6 +1270,7 @@ void processMdbSessionTimeout() {
 
     String cancelUid = mdbRuntime.sessionUID;
     bool wasOffline = mdbRuntime.sessionIsOffline;
+    uint32_t cancelTapTs = mdbRuntime.sessionTapTs;
 
     mdbRuntime.sessionUID = "";
     mdbRuntime.pendingSession = false;
@@ -1248,9 +1284,10 @@ void processMdbSessionTimeout() {
     mdbRuntime.vendAmount = currentConfiguredHumanPrice();
     mdbRuntime.sessionStartMs = 0;
     mdbRuntime.sessionIsOffline = false;
+    mdbRuntime.sessionTapTs = 0;
 
     mdbRuntime.sessionIsOffline = wasOffline;
-    notifyVendResult(cancelUid, 0, 0, false);
+    notifyVendResult(cancelUid, cancelTapTs, 0, 0, false);
     mdbRuntime.sessionIsOffline = false;
 
     ledBlink(4, 150);
@@ -1553,6 +1590,239 @@ void saveQueue() {
     }
 }
 
+const char* localTapReasonLabel(uint8_t reason) {
+    switch (reason) {
+        case LOCAL_TAP_REASON_CARD_UNKNOWN: return "card_unknown";
+        case LOCAL_TAP_REASON_LIMIT_REACHED: return "limit_reached";
+        default: return "";
+    }
+}
+
+void loadTapDecisions() {
+    tapDecisionLen = 0;
+    tapDecisionFlushRequested = false;
+    tapDecisionNextFlushMs = 0;
+    tapDecisionFlushFailureStreak = 0;
+
+    File f = LittleFS.open(TAP_DECISIONS_PATH, "r");
+    if (!f) {
+        File seed = LittleFS.open(TAP_DECISIONS_PATH, "w");
+        if (seed) {
+            seed.print("[]");
+            seed.close();
+        }
+        return;
+    }
+
+    DynamicJsonDocument doc(24576);
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) {
+        Serial.printf("[AUTHQ] Error JSON: %s\n", err.c_str());
+        return;
+    }
+
+    JsonArray arr = doc.as<JsonArray>();
+    for (JsonObject ev : arr) {
+        if (tapDecisionLen >= MAX_TAP_DECISIONS) break;
+        strlcpy(tapDecisionBuf[tapDecisionLen].uid, ev["uid"] | "", sizeof(tapDecisionBuf[0].uid));
+        tapDecisionBuf[tapDecisionLen].approved = (ev["approved"] | false) ? 1 : 0;
+        tapDecisionBuf[tapDecisionLen].reason = (uint8_t)(ev["reason"] | 0);
+        tapDecisionBuf[tapDecisionLen].reserved = 0;
+        tapDecisionBuf[tapDecisionLen].ts = (uint32_t)(ev["ts"] | 0);
+        tapDecisionLen++;
+    }
+
+    tapDecisionFlushRequested = tapDecisionLen > 0;
+    if (tapDecisionFlushRequested) {
+        scheduleTapDecisionFlush(TAP_DECISION_FLUSH_BASE_RETRY_MS);
+    }
+    Serial.printf("[AUTHQ] Cola cargada: %d decision(es) pendientes\n", tapDecisionLen);
+}
+
+void saveTapDecisions() {
+    if (tapDecisionLen <= 0) {
+        if (LittleFS.exists(TAP_DECISIONS_PATH)) LittleFS.remove(TAP_DECISIONS_PATH);
+        return;
+    }
+
+    File f = LittleFS.open(TAP_DECISIONS_PATH, "w");
+    if (!f) {
+        Serial.println("[AUTHQ] Error guardando tap_decisions.json");
+        return;
+    }
+
+    f.print("[");
+    for (int i = 0; i < tapDecisionLen; i++) {
+        if (i > 0) f.print(",");
+        f.printf("{\"uid\":\"%s\",\"approved\":%s,\"reason\":%u,\"ts\":%lu}",
+                 tapDecisionBuf[i].uid,
+                 tapDecisionBuf[i].approved ? "true" : "false",
+                 (unsigned)tapDecisionBuf[i].reason,
+                 (unsigned long)tapDecisionBuf[i].ts);
+    }
+    f.print("]");
+    f.close();
+}
+
+unsigned long nextTapDecisionRetryDelayMs() {
+    unsigned long delayMs = TAP_DECISION_FLUSH_BASE_RETRY_MS;
+    uint8_t steps = tapDecisionFlushFailureStreak;
+    while (steps > 1 && delayMs < TAP_DECISION_FLUSH_MAX_RETRY_MS) {
+        delayMs *= 2UL;
+        if (delayMs >= TAP_DECISION_FLUSH_MAX_RETRY_MS) {
+            delayMs = TAP_DECISION_FLUSH_MAX_RETRY_MS;
+            break;
+        }
+        steps--;
+    }
+    return delayMs;
+}
+
+void scheduleTapDecisionFlush(unsigned long delayMs) {
+    tapDecisionFlushRequested = (tapDecisionLen > 0);
+    tapDecisionNextFlushMs = tapDecisionFlushRequested ? (millis() + delayMs) : 0;
+}
+
+void requestTapDecisionFlush() {
+    if (tapDecisionLen <= 0) {
+        tapDecisionFlushRequested = false;
+        tapDecisionNextFlushMs = 0;
+        tapDecisionFlushFailureStreak = 0;
+        return;
+    }
+    scheduleTapDecisionFlush(0);
+}
+
+void enqueueTapDecision(const String& uid, bool approved, uint8_t reason, uint32_t ts) {
+    if (tapDecisionLen >= MAX_TAP_DECISIONS) {
+        Serial.println("[AUTHQ] ADVERTENCIA — cola de decisiones llena, evento descartado");
+        return;
+    }
+
+    TapDecisionEntry entry{};
+    strlcpy(entry.uid, uid.c_str(), sizeof(entry.uid));
+    entry.approved = approved ? 1 : 0;
+    entry.reason = reason;
+    entry.ts = ts > 0 ? ts : getCurrentTs();
+
+    tapDecisionBuf[tapDecisionLen] = entry;
+    tapDecisionLen++;
+    saveTapDecisions();
+    scheduleTapDecisionFlush(TAP_DECISION_FLUSH_INITIAL_DELAY_MS);
+
+    Serial.printf("[AUTHQ] Encolada decision — uid:%s approved:%d total:%d\n",
+                  uid.c_str(),
+                  approved ? 1 : 0,
+                  tapDecisionLen);
+}
+
+void flushTapDecisions() {
+    if (tapDecisionLen == 0 || WiFi.status() != WL_CONNECTED) return;
+
+    Serial.printf("[AUTHQ] Enviando %d decision(es) al backend...\n", tapDecisionLen);
+
+    const int BATCH = 50;
+    int sent = 0;
+    bool flushFailed = false;
+    while (sent < tapDecisionLen) {
+        int end = min(sent + BATCH, tapDecisionLen);
+        feedWatchdog();
+
+        String body = "[";
+        for (int i = sent; i < end; i++) {
+            if (i > sent) body += ",";
+            body += "{\"uid\":\""; body += tapDecisionBuf[i].uid;
+            body += "\",\"approved\":"; body += (tapDecisionBuf[i].approved ? "true" : "false");
+            const char* reasonLabel = localTapReasonLabel(tapDecisionBuf[i].reason);
+            if (reasonLabel[0] != '\0') {
+                body += ",\"reason\":\"";
+                body += reasonLabel;
+                body += "\"";
+            }
+            body += ",\"ts\":";
+            body += (unsigned long)tapDecisionBuf[i].ts;
+            body += "}";
+        }
+        body += "]";
+
+        String url = backendBase + "/api/tap/decisions";
+        WiFiClient client;
+        WiFiClientSecure secureClient;
+        HTTPClient http;
+        if (!beginHttpRequest(http, client, secureClient, url)) {
+            markBackendOffline("No se pudo iniciar POST /api/tap/decisions");
+            flushFailed = true;
+            break;
+        }
+
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("X-Machine-Mac", macAddress);
+        prepareHttpClient(http, HTTP_TIMEOUT_MS * 3);
+
+        int code = http.POST(body);
+        String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
+        http.end();
+        feedWatchdog();
+
+        if (code == 200 || code == 204) {
+            markBackendOk();
+            sent = end;
+        } else {
+            flushFailed = true;
+            if (code > 0) {
+                markBackendResponseError("HTTP " + String(code) + " en /api/tap/decisions");
+            } else if (detail.length() > 0) {
+                markBackendOffline("POST /api/tap/decisions sin respuesta (" + detail + ")");
+            }
+            Serial.printf("[AUTHQ] Error HTTP %d — abortando flush\n", code);
+            break;
+        }
+    }
+
+    if (sent > 0) {
+        int remaining = tapDecisionLen - sent;
+        for (int i = 0; i < remaining; i++) tapDecisionBuf[i] = tapDecisionBuf[sent + i];
+        tapDecisionLen = remaining;
+        saveTapDecisions();
+        Serial.printf("[AUTHQ] Flush OK: %d enviadas, %d pendientes\n", sent, remaining);
+    }
+
+    if (tapDecisionLen == 0) {
+        tapDecisionFlushRequested = false;
+        tapDecisionNextFlushMs = 0;
+        tapDecisionFlushFailureStreak = 0;
+        return;
+    }
+
+    if (flushFailed) {
+        if (tapDecisionFlushFailureStreak < 255) tapDecisionFlushFailureStreak++;
+        unsigned long retryDelayMs = nextTapDecisionRetryDelayMs();
+        scheduleTapDecisionFlush(retryDelayMs);
+        Serial.printf("[AUTHQ] Reintento programado en %lu ms (%d pendientes)\n",
+                      retryDelayMs,
+                      tapDecisionLen);
+        return;
+    }
+
+    tapDecisionFlushFailureStreak = 0;
+    scheduleTapDecisionFlush(TAP_DECISION_FLUSH_INITIAL_DELAY_MS);
+}
+
+void flushPendingBackendArtifactsNow() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    if (tapDecisionLen > 0) {
+        tapDecisionFlushFailureStreak = 0;
+        requestTapDecisionFlush();
+        flushTapDecisions();
+    }
+
+    if (queueLen > 0) {
+        flushQueue();
+    }
+}
+
 
 // ══════════════════════════════════════════════════════
 //  OFFLINE: autenticación local con cache
@@ -1594,7 +1864,7 @@ uint32_t getCurrentTs() {
     return (uint32_t)(millis() / 1000);  // fallback: uptime
 }
 
-void enqueueEvent(const String& uid, uint16_t itemId, uint16_t amount, bool ok) {
+void enqueueEvent(const String& uid, uint32_t tapTs, uint16_t itemId, uint16_t amount, bool ok) {
     if (queueLen >= MAX_QUEUE) {
         Serial.println("[QUEUE] ADVERTENCIA — cola llena, evento descartado");
         logDiagEvent(EVT_QUEUE_FULL, queueLen, amount);
@@ -1606,7 +1876,7 @@ void enqueueEvent(const String& uid, uint16_t itemId, uint16_t amount, bool ok) 
     entry.item_id = itemId;
     entry.amount = amount;
     entry.vend_success = ok;
-    entry.ts = getCurrentTs();
+    entry.ts = tapTs > 0 ? tapTs : getCurrentTs();
 
     if (!offlineQueueAppend(LittleFS, QUEUE_PATH, entry)) {
         queueBuf[queueLen] = entry;
@@ -2330,7 +2600,7 @@ int postTap(const String& uid) {
     return code;
 }
 
-void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool ok) {
+void notifyVendResult(const String& uid, uint32_t tapTs, uint16_t itemId, uint16_t amount, bool ok) {
     uint32_t humanAmount = amount > 0 ? pricingMdbAmountToHuman(pricingConfig, amount) : 0;
     Serial.printf("[TAP] Resultado venta %s — item #%d $%lu centavos (MDB=%u)\n",
                   ok ? "EXITOSA" : "FALLIDA",
@@ -2338,23 +2608,23 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
                   (unsigned long)humanAmount,
                   (unsigned int)amount);
 
-    // Si la sesión fue offline OR el WiFi cayó durante la sesión → encolar
+    if (ok && uid.length() > 0) {
+        incrementLocalUsed(uid);
+    }
+
     if (mdbRuntime.sessionIsOffline || WiFi.status() != WL_CONNECTED) {
         Serial.println("[TAP] Sin conexion online — encolando evento");
-        enqueueEvent(uid, itemId, humanAmount, ok);
-        if (ok) incrementLocalUsed(uid);
+        enqueueEvent(uid, tapTs, itemId, humanAmount, ok);
         return;
     }
 
-    // Online: notificar al backend directamente
     String url = backendBase + "/api/tap/result";
     WiFiClient client;
     WiFiClientSecure secureClient;
     HTTPClient http;
     if (!beginHttpRequest(http, client, secureClient, url)) {
-        // Si falla begin, encolar como fallback
         markBackendOffline("No se pudo abrir /api/tap/result");
-        enqueueEvent(uid, itemId, amount, ok);
+        enqueueEvent(uid, tapTs, itemId, humanAmount, ok);
         return;
     }
 
@@ -2364,6 +2634,7 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
 
     String body = "{\"nfc_uid\":\"" + uid
                 + "\",\"vend_success\":" + (ok ? "true" : "false")
+                + ",\"tap_ts\":" + tapTs
                 + ",\"item_id\":" + itemId
                 + ",\"amount\":" + humanAmount + "}";
 
@@ -2373,14 +2644,14 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
     feedWatchdog();
 
     if (code <= 0) {
-        // Sin respuesta → encolar para reintentar
         if (detail.length() > 0) markBackendOffline("POST /api/tap/result sin respuesta (" + detail + ")");
         Serial.println("[TAP] Sin respuesta backend — encolando evento");
-        enqueueEvent(uid, itemId, humanAmount, ok);
+        enqueueEvent(uid, tapTs, itemId, humanAmount, ok);
     } else {
         markBackendOk();
     }
 }
+
 
 void reconcileTaps() {
     if (!wifiReady) return;
@@ -2503,6 +2774,7 @@ void registerMachine() {
     if (code == 200) {
         markBackendOk();
         Serial.println("[REG] OK — maquina APROBADA");
+        flushPendingBackendArtifactsNow();
         requestImmediateRemoteCommandPoll();
         if (otaPendingAfterRegister && canProcessRemoteCommand()) {
             Serial.printf("[REG] OTA pendiente detectada (%s) — consultando comandos remotos ahora\n",
@@ -2601,6 +2873,7 @@ void processBackendSync() {
 
             if (registerResponsive) {
                 reconcileTaps();
+                flushTapDecisions();
                 flushQueue();
                 downloadCards();
 
@@ -2630,6 +2903,64 @@ void processBackendSync() {
         case BACKEND_SYNC_IDLE:
         default:
             return;
+    }
+}
+
+void backendServiceTask(void*) {
+    unsigned long lastWifiCheck = 0;
+    unsigned long lastHeartbeat = 0;
+
+    for (;;) {
+        if (portalMode) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        processBackendSync();
+
+        unsigned long now = millis();
+
+        if (now - lastWifiCheck > 30000) {
+            lastWifiCheck = now;
+            bool nowConnected = (WiFi.status() == WL_CONNECTED);
+
+            if (!nowConnected) {
+                wifiReady = false;
+                Serial.println("[WiFi] Reconectando...");
+                WiFi.reconnect();
+            } else if (!wifiReady) {
+                wifiReady = true;
+                Serial.println("[WiFi] Reconectado");
+                logDiagEvent(EVT_WIFI_RECONNECTED, WiFi.RSSI(), WiFi.localIP());
+                syncBackendAfterWiFi("reconexion WiFi");
+            }
+        }
+
+        if (!isBackendSyncActive()
+            && (remoteCommandPollRequested || (now - lastCommandPollMs > COMMAND_POLL_MS))
+            && WiFi.status() == WL_CONNECTED) {
+            remoteCommandPollRequested = false;
+            lastCommandPollMs = now;
+            pollRemoteCommands();
+        }
+
+        if (!isBackendSyncActive() && now - lastHeartbeat > 60000) {
+            lastHeartbeat = now;
+            registerMachine();
+
+            const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
+            const char* clockSource = "UPTIME";
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) clockSource = "NTP";
+            else if (mdbMachineTimeValid) clockSource = "MDB";
+            Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | Clock:%s\n",
+                         WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
+                          backendReady ? "OK" : "OFFLINE",
+                          stStr[mdbRuntime.phase], cardCount, queueLen,
+                          clockSource);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -3070,7 +3401,6 @@ void handleNFC() {
     if (millis() - lastNFCRead < NFC_COOLDOWN_MS) return;
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
 
-    // Fix Bug 6: no aceptar nuevos taps si hay sesión MDB activa
     if (mdbRuntime.phase == VEND_PENDING || mdbRuntime.phase == SESSION_IDLE) {
         Serial.println("[NFC] TAP IGNORADO — sesion MDB activa");
         rfid.PICC_HaltA();
@@ -3081,7 +3411,6 @@ void handleNFC() {
 
     lastNFCRead = millis();
 
-    // Leer UID
     String uid = "";
     for (byte i = 0; i < rfid.uid.size; i++) {
         if (rfid.uid.uidByte[i] < 0x10) uid += "0";
@@ -3094,64 +3423,29 @@ void handleNFC() {
     Serial.printf("[NFC] Tarjeta: %s\n", uid.c_str());
     logDiagEvent(EVT_NFC_READ, 0, uid.length() >= 4 ? strtoul(uid.substring(0, 4).c_str(), nullptr, 16) : 0);
     ledTagReadPending();
-    bool approved    = false;
-    bool isOffline   = false;
 
-    // ── Intentar autenticación online ────────────────
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("[TAP] Consultando backend...");
-        int code = postTap(uid);
+    uint32_t tapTs = getCurrentTs();
+    int result = localAuth(uid);
 
-        if (code == 200) {
-            Serial.println("[TAP] APROBADO (online)");
-            approved = true;
-            logDiagEvent(EVT_NFC_APPROVED_ONLINE, 200, 0);
-        } else if (code == 403) {
-            // Leer body para distinguir razón
-            // (postTap devuelve solo el código; la razón viene en el body — se loguea genérico)
-            Serial.println("[TAP] DENEGADO (online) — verificar razon en backend");
-            logDiagEvent(EVT_NFC_DENIED, 403, 0);
-            ledTagRejectedPattern();
-            return;
-        } else if (code == 401) {
-            Serial.println("[TAP] ERROR 401 — re-registrando maquina...");
-            logDiagEvent(EVT_NFC_DENIED, 401, 0);
-            registerMachine();
-            ledTagRejectedPattern();
-            return;
-        } else if (code > 0) {
-            Serial.printf("[TAP] ERROR HTTP %d\n", code);
-            logDiagEvent(EVT_NFC_DENIED, code, 0);
-            ledTagRejectedPattern();
-            return;
-        }
-        // code <= 0: sin respuesta → caer a modo offline
+    if (result == LOCAL_AUTH_OK) {
+        Serial.println("[TAP] APROBADO (cache local)");
+        logDiagEvent(EVT_NFC_APPROVED_OFFLINE, 1, 0);
+        enqueueTapDecision(uid, true, LOCAL_TAP_REASON_NONE, tapTs);
+    } else if (result == LOCAL_AUTH_OVERLIMIT) {
+        Serial.println("[TAP] DENEGADO — limite diario alcanzado (cache local)");
+        logDiagEvent(EVT_NFC_DENIED, 1, 0);
+        enqueueTapDecision(uid, false, LOCAL_TAP_REASON_LIMIT_REACHED, tapTs);
+        ledTagRejectedPattern();
+        return;
+    } else {
+        Serial.println("[TAP] DENEGADO — tarjeta desconocida (cache local)");
+        logDiagEvent(EVT_NFC_DENIED, 2, 0);
+        enqueueTapDecision(uid, false, LOCAL_TAP_REASON_CARD_UNKNOWN, tapTs);
+        ledTagRejectedPattern();
+        return;
     }
 
-    // ── Fallback offline ──────────────────────────────
-    if (!approved) {
-        Serial.println("[TAP] Backend no disponible — modo offline (cache local)");
-        isOffline = true;
-        int result = localAuth(uid);
-
-        if (result == LOCAL_AUTH_OK) {
-            Serial.println("[TAP] APROBADO (offline — cache local)");
-            approved = true;
-            logDiagEvent(EVT_NFC_APPROVED_OFFLINE, 1, 0);
-        } else if (result == LOCAL_AUTH_OVERLIMIT) {
-            Serial.println("[TAP] DENEGADO — limite diario alcanzado (offline)");
-            logDiagEvent(EVT_NFC_DENIED, 1, 0);
-            ledTagRejectedPattern();
-            return;
-        } else {
-            Serial.println("[TAP] DENEGADO — tarjeta desconocida (offline)");
-            logDiagEvent(EVT_NFC_DENIED, 2, 0);
-            ledTagRejectedPattern();
-            return;
-        }
-    }
-
-    if (!enqueueMdbStartSession(uid, isOffline)) {
+    if (!enqueueMdbStartSession(uid, WiFi.status() != WL_CONNECTED, tapTs)) {
         Serial.println("[MDB] ERROR — no se pudo encolar inicio de sesion");
         ledTagRejectedPattern();
         return;
@@ -3194,9 +3488,7 @@ void cmdReset() {
     mdbRuntime.vendApproved = false;
     mdbRuntime.vendDecisionSent = false;
     mdbRuntime.endSessionPending = false;
-    mdbRuntime.vendUsed = false;
-    mdbRuntime.sessionUID = "";
-    mdbRuntime.sessionItemId = 0;
+        mdbRuntime.sessionItemId = 0;
     mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
     mdbRuntime.vendAmount = currentConfiguredHumanPrice();
     mdbRuntime.sessionIsOffline = false;
@@ -3412,6 +3704,7 @@ void cmdPoll() {
         mdbRuntime.endSessionPending = false;
         mdbRuntime.phase = ENABLED;
         mdbRuntime.sessionUID = "";
+        mdbRuntime.sessionTapTs = 0;
         mdbRuntime.sessionItemId = 0;
         mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
         mdbRuntime.vendAmount = currentConfiguredHumanPrice();
@@ -3528,7 +3821,7 @@ void cmdVend(uint8_t* d, uint8_t len) {
             }
             MDB_LOG_EVENTLN("[MDB] VEND_SUCCESS — venta confirmada");
             logDiagEvent(EVT_MDB_VEND_SUCCESS, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
-            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, true);
+            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionTapTs, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, true);
             mdbRuntime.vendUsed = true;  // Fix Bug 2
             mdbSendACK();
             mdbRuntime.phase = SESSION_IDLE;
@@ -3537,11 +3830,12 @@ void cmdVend(uint8_t* d, uint8_t len) {
         case VEND_FAILURE:
             MDB_LOG_EVENTLN("[MDB] VEND_FAILURE — venta fallida");
             logDiagEvent(EVT_MDB_VEND_FAILURE, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount);
-            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, false);
+            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionTapTs, mdbRuntime.sessionItemId, mdbRuntime.sessionAmount, false);
             ledTagRejectedPattern();
             mdbSendACK();
             mdbRuntime.phase = SESSION_IDLE;
             mdbRuntime.sessionUID = "";
+            mdbRuntime.sessionTapTs = 0;
             mdbRuntime.vendUsed = false;
             mdbRuntime.sessionIsOffline = false;
             break;
@@ -3553,7 +3847,7 @@ void cmdVend(uint8_t* d, uint8_t len) {
             if (mdbRuntime.sessionUID.length() > 0 && !mdbRuntime.vendUsed) {
                 MDB_LOG_EVENT("[MDB] VEND_END sin dispensado — cancelando tap de %s\n",
                               mdbRuntime.sessionUID.c_str());
-                notifyVendResult(mdbRuntime.sessionUID, 0, 0, false);
+                notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionTapTs, 0, 0, false);
             }
             mdbSendACK();
             mdbRuntime.endSessionPending = true;
@@ -3583,10 +3877,11 @@ void cmdReader(uint8_t* d, uint8_t len) {
         if (mdbRuntime.sessionUID.length() > 0 && !mdbRuntime.vendUsed) {
             MDB_LOG_EVENT("[MDB] READER_DISABLE mid-session — cancelando tap de %s\n",
                           mdbRuntime.sessionUID.c_str());
-            notifyVendResult(mdbRuntime.sessionUID, 0, 0, false);
+            notifyVendResult(mdbRuntime.sessionUID, mdbRuntime.sessionTapTs, 0, 0, false);
         }
         mdbRuntime.phase = MDB_DISABLED;
         mdbRuntime.sessionUID = "";
+        mdbRuntime.sessionTapTs = 0;
         mdbRuntime.sessionItemId = 0;
         mdbRuntime.sessionAmount = currentConfiguredHumanPrice();
         mdbRuntime.vendAmount = currentConfiguredHumanPrice();
@@ -3705,6 +4000,7 @@ void setup() {
         Serial.println("[FS] LittleFS OK");
         loadCards();
         loadQueue();
+        loadTapDecisions();
     }
 
     // SPI + RC522
@@ -3777,6 +4073,13 @@ void setup() {
     }
 
     initWatchdog();
+
+    xTaskCreatePinnedToCore(
+        backendServiceTask,
+        "backend_srv", 12288, NULL, 3, NULL, 1
+    );
+    Serial.println("[BACKEND] Tarea backend service iniciada");
+
     Serial.println("[BOOT] Sistema listo\n");
 }
 
@@ -3798,41 +4101,22 @@ void loop() {
     // Modo normal: NFC (MDB ahora corre en tarea independiente)
     handleNFC();
 
-    processBackendSync();
-
-    // ── Reconexión WiFi cada 30s ──────────────────────
-    static unsigned long lastWifiCheck = 0;
-    if (millis() - lastWifiCheck > 30000) {
-        lastWifiCheck = millis();
-        bool nowConnected = (WiFi.status() == WL_CONNECTED);
-
-        if (!nowConnected) {
-            wifiReady = false;
-            Serial.println("[WiFi] Reconectando...");
-            WiFi.reconnect();
-        } else if (!wifiReady) {
-            // Reconectado: resincronizar contra backend y refrescar cache
-            wifiReady = true;
-            Serial.println("[WiFi] Reconectado");
-            logDiagEvent(EVT_WIFI_RECONNECTED, WiFi.RSSI(), WiFi.localIP());
-            syncBackendAfterWiFi("reconexion WiFi");
-        }
+    static unsigned long lastTapDecisionFlush = 0;
+    if (!isBackendSyncActive()
+        && tapDecisionFlushRequested
+        && WiFi.status() == WL_CONNECTED
+        && (long)(millis() - tapDecisionNextFlushMs) >= 0
+        && millis() - lastTapDecisionFlush > 250) {
+        lastTapDecisionFlush = millis();
+        flushTapDecisions();
     }
+
 
     // ── Refresh de tarjetas cada 10 minutos ──────────
     static unsigned long lastCardsRefresh = 0;
     if (wifiReady && millis() - lastCardsRefresh > 600000) {
         lastCardsRefresh = millis();
         downloadCards();
-    }
-
-    // ── Poll de comandos remotos cada 5s o inmediatamente tras reconectar/registrar ──
-    if (!isBackendSyncActive()
-        && (remoteCommandPollRequested || (millis() - lastCommandPollMs > COMMAND_POLL_MS))
-        && WiFi.status() == WL_CONNECTED) {
-        remoteCommandPollRequested = false;
-        lastCommandPollMs = millis();
-        pollRemoteCommands();
     }
 
     // ── Reset de contadores al detectar día nuevo ─────
@@ -3847,23 +4131,6 @@ void loop() {
     if (cardsDirty && millis() - lastSaveCheck > 5000) {
         lastSaveCheck = millis();
         saveCards();
-    }
-
-    // ── Heartbeat cada 60s ────────────────────────────
-    static unsigned long lastHeartbeat = 0;
-    if (!isBackendSyncActive() && millis() - lastHeartbeat > 60000) {
-        lastHeartbeat = millis();
-        registerMachine();  // actualiza last_seen y telemetría de red
-        const char* stStr[] = {"INACTIVE","MDB_DISABLED","ENABLED","SESSION_IDLE","VEND_PENDING"};
-        const char* clockSource = "UPTIME";
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) clockSource = "NTP";
-        else if (mdbMachineTimeValid) clockSource = "MDB";
-        Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | Clock:%s\n",
-                     WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
-                      backendReady ? "OK" : "OFFLINE",
-                      stStr[mdbRuntime.phase], cardCount, queueLen,
-                      clockSource);
     }
 
     updateStatusLed();

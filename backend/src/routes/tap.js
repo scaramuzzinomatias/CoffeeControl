@@ -39,6 +39,201 @@ function normalizedCardStatus(row) {
 
 const effectivePolicy = effectivePolicyExpressions('e', 'al');
 
+function normalizeSyncedReason(reason) {
+    const normalized = String(reason || '').trim().toLowerCase();
+    if ([
+        'card_unknown',
+        'limit_reached',
+        'card_inactive',
+        'card_lost',
+        'inactive',
+        'vend_cancelled'
+    ].includes(normalized)) {
+        return normalized;
+    }
+    return '';
+}
+
+async function fetchCardContext(uid) {
+    const result = await pool.query(
+        `SELECT nc.id, nc.employee_id, nc.active AS card_active,
+                COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
+                e.name, e.department, e.active,
+                e.access_level_id,
+                al.name AS access_level_name,
+                ${effectivePolicy.dailyLimit} AS daily_limit,
+                ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
+                ${effectivePolicy.warningEnabled} AS warning_enabled,
+                ${effectivePolicy.source} AS policy_source
+         FROM nfc_cards nc
+         JOIN employees e ON e.id = nc.employee_id
+         LEFT JOIN access_levels al ON al.id = e.access_level_id
+         WHERE nc.uid = $1`,
+        [uid]
+    );
+    return result.rowCount > 0 ? result.rows[0] : null;
+}
+
+async function countApprovedBeforeTap(employeeId, tappedAt) {
+    const timeZone = await systemSettings.getBusinessTimeZone();
+    const businessDate = formatBusinessDate(tappedAt, timeZone);
+    const countResult = await pool.query(
+        `SELECT COUNT(*) AS cnt
+         FROM taps
+         WHERE employee_id = $1
+           AND approved    = true
+           AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}
+           AND tapped_at   < $4`,
+        [employeeId, timeZone, businessDate, tappedAt]
+    );
+    return parseInt(countResult.rows[0]?.cnt || '0', 10);
+}
+
+async function findExactTapByEvent({ machineId, uid, tappedAt }) {
+    if (!tappedAt) return null;
+    const result = await pool.query(
+        `SELECT id, approved, confirmed, item_id, amount_cents
+         FROM taps
+         WHERE nfc_uid = $1
+           AND machine_id = $2
+           AND tapped_at = $3
+         ORDER BY id DESC
+         LIMIT 1`,
+        [uid, machineId, tappedAt]
+    );
+    return result.rowCount > 0 ? result.rows[0] : null;
+}
+
+async function findPendingApprovedTap({ machineId, uid, tappedAt }) {
+    if (tappedAt) {
+        const exact = await pool.query(
+            `SELECT id, item_id, amount_cents
+             FROM taps
+             WHERE nfc_uid = $1
+               AND machine_id = $2
+               AND tapped_at = $3
+               AND approved = true
+               AND confirmed IS NULL
+             ORDER BY id DESC
+             LIMIT 1`,
+            [uid, machineId, tappedAt]
+        );
+        if (exact.rowCount > 0) return exact.rows[0];
+    }
+
+    const fallback = await pool.query(
+        `SELECT id, item_id, amount_cents
+         FROM taps
+         WHERE nfc_uid = $1
+           AND machine_id = $2
+           AND approved = true
+           AND confirmed IS NULL
+         ORDER BY tapped_at DESC
+         LIMIT 1`,
+        [uid, machineId]
+    );
+    return fallback.rowCount > 0 ? fallback.rows[0] : null;
+}
+
+async function insertSyncedTapDecision({ machine, uid, approved, reason, tappedAt }) {
+    const existing = await findExactTapByEvent({ machineId: machine.id, uid, tappedAt });
+    if (existing) return existing.id;
+
+    const card = await fetchCardContext(uid);
+    const employeeId = card?.employee_id || null;
+
+    if (!approved) {
+        const denyReason = normalizeSyncedReason(reason) || 'card_unknown';
+        const result = await pool.query(
+            `INSERT INTO taps
+                (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
+             VALUES ($1, $2, $3, false, $4, false, $5)
+             RETURNING id`,
+            [uid, machine.id, employeeId, denyReason, tappedAt]
+        );
+        return result.rows[0]?.id;
+    }
+
+    let overLimit = false;
+    if (employeeId) {
+        const countBefore = await countApprovedBeforeTap(employeeId, tappedAt);
+        overLimit = shouldMarkOverLimit({
+            dailyLimit: card.daily_limit,
+            mode: card.daily_limit_mode,
+            tapsBefore: countBefore
+        });
+    }
+
+    const result = await pool.query(
+        `INSERT INTO taps
+            (nfc_uid, machine_id, employee_id, approved, confirmed, over_limit, tapped_at)
+         VALUES ($1, $2, $3, true, NULL, $4, $5)
+         RETURNING id`,
+        [uid, machine.id, employeeId, overLimit, tappedAt]
+    );
+    return result.rows[0]?.id;
+}
+
+async function upsertVendResult({ machine, uid, vendSuccess, itemId, amount, tappedAt }) {
+    const pendingTap = await findPendingApprovedTap({ machineId: machine.id, uid, tappedAt });
+
+    if (pendingTap) {
+        if (vendSuccess) {
+            const result = await pool.query(
+                `UPDATE taps
+                 SET confirmed = true, item_id = $1, amount_cents = $2
+                 WHERE id = $3
+                 RETURNING id, item_id, amount_cents`,
+                [itemId || null, amount || null, pendingTap.id]
+            );
+            return { tap: result.rows[0] || null, created: false, success: true };
+        }
+
+        const result = await pool.query(
+            `UPDATE taps
+             SET confirmed = false, approved = false, deny_reason = 'vend_cancelled'
+             WHERE id = $1
+             RETURNING id`,
+            [pendingTap.id]
+        );
+        return { tap: result.rows[0] || null, created: false, success: false };
+    }
+
+    const card = await fetchCardContext(uid);
+    const employeeId = card?.employee_id || null;
+
+    if (vendSuccess) {
+        let overLimit = false;
+        if (employeeId) {
+            const countBefore = await countApprovedBeforeTap(employeeId, tappedAt);
+            overLimit = shouldMarkOverLimit({
+                dailyLimit: card.daily_limit,
+                mode: card.daily_limit_mode,
+                tapsBefore: countBefore
+            });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO taps
+                (nfc_uid, machine_id, employee_id, approved, confirmed,
+                 item_id, amount_cents, over_limit, tapped_at)
+             VALUES ($1, $2, $3, true, true, $4, $5, $6, $7)
+             RETURNING id, item_id, amount_cents`,
+            [uid, machine.id, employeeId, itemId || null, amount || null, overLimit, tappedAt]
+        );
+        return { tap: result.rows[0] || null, created: true, success: true };
+    }
+
+    const result = await pool.query(
+        `INSERT INTO taps
+            (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
+         VALUES ($1, $2, $3, false, 'vend_cancelled', false, $4)
+         RETURNING id`,
+        [uid, machine.id, employeeId, tappedAt]
+    );
+    return { tap: result.rows[0] || null, created: true, success: false };
+}
+
 // ══════════════════════════════════════════════════════
 //  POST /api/tap
 //  El ESP8266 manda: { nfc_uid, machine_id }
@@ -217,73 +412,55 @@ router.post('/', async (req, res) => {
 //  Body: { nfc_uid, vend_success, item_id?, amount? }
 // ══════════════════════════════════════════════════════
 router.post('/result', async (req, res) => {
-    const { nfc_uid, vend_success, item_id, amount } = req.body;
+    const { nfc_uid, vend_success, item_id, amount, tap_ts } = req.body;
     const machine = req.machine;
 
     if (!nfc_uid) return res.status(400).json({ error: 'nfc_uid requerido' });
 
+    const uid = nfc_uid.toUpperCase().trim();
+    const tappedAt = tap_ts ? new Date(Number(tap_ts) * 1000) : new Date();
+
     try {
-        if (vend_success) {
-            const updateResult = await pool.query(
-                `UPDATE taps SET confirmed = true, item_id = $1, amount_cents = $2
-                 WHERE id = (
-                    SELECT id FROM taps
-                    WHERE nfc_uid    = $3
-                      AND machine_id = $4
-                      AND approved   = true
-                      AND confirmed  IS NULL
-                    ORDER BY tapped_at DESC
-                    LIMIT 1
-                 )
-                 RETURNING id, item_id, amount_cents`,
-                [item_id, amount, nfc_uid.toUpperCase(), machine.id]
-            );
-            if (updateResult.rowCount > 0) {
-                const confirmedTap = updateResult.rows[0];
-                broadcast({
-                    event: 'vend_confirmed',
-                    machine: machine.name,
-                    item_id: confirmedTap.item_id,
-                    amount: confirmedTap.amount_cents
+        const outcome = await upsertVendResult({
+            machine,
+            uid,
+            vendSuccess: !!vend_success,
+            itemId: item_id,
+            amount,
+            tappedAt
+        });
+
+        if (vend_success && outcome.tap) {
+            broadcast({
+                event: 'vend_confirmed',
+                machine: machine.name,
+                item_id: outcome.tap.item_id,
+                amount: outcome.tap.amount_cents
+            });
+            try {
+                const stockResult = await stock.recordSale({
+                    machineId: machine.id,
+                    itemId: outcome.tap.item_id,
+                    tapId: outcome.tap.id
                 });
-                try {
-                    const stockResult = await stock.recordSale({
-                        machineId: machine.id,
-                        itemId: confirmedTap.item_id,
-                        tapId: confirmedTap.id
+                if (stockResult?.configured) {
+                    await alerts.syncStockLowAlert({
+                        machine,
+                        stockItem: stockResult.stockItem
                     });
-                    if (stockResult?.configured) {
-                        await alerts.syncStockLowAlert({
-                            machine,
-                            stockItem: stockResult.stockItem
-                        });
-                        broadcast({
-                            event: 'machine_stock_updated',
-                            machine_id: machine.id,
-                            machine: machine.name
-                        });
-                    }
-                } catch (stockErr) {
-                    console.error(`[STOCK] No se pudo descontar stock en ${machine.name}:`, stockErr.message);
+                    broadcast({
+                        event: 'machine_stock_updated',
+                        machine_id: machine.id,
+                        machine: machine.name
+                    });
                 }
+            } catch (stockErr) {
+                console.error(`[STOCK] No se pudo descontar stock en ${machine.name}:`, stockErr.message);
             }
-        } else {
-            // Revertir approved para que no cuente en el límite diario
-            await pool.query(
-                `UPDATE taps SET confirmed = false, approved = false
-                 WHERE id = (
-                    SELECT id FROM taps
-                    WHERE nfc_uid    = $1
-                      AND machine_id = $2
-                      AND approved   = true
-                      AND confirmed  IS NULL
-                    ORDER BY tapped_at DESC
-                    LIMIT 1
-                 )`,
-                [nfc_uid.toUpperCase(), machine.id]
-            );
+        } else if (!vend_success) {
             broadcast({ event: 'vend_cancelled', machine: machine.name });
         }
+
         res.status(200).json({ ok: true });
 
     } catch (err) {
@@ -322,6 +499,60 @@ router.post('/reconcile', async (req, res) => {
         console.error('[RECONCILE] Error:', err.message);
         res.status(500).json({ error: 'Error interno' });
     }
+});
+
+// ══════════════════════════════════════════════════════
+//  POST /api/tap/decisions
+//  El firmware sincroniza decisiones locales de aprobación/denegación.
+//  Body: [ { uid, approved, reason?, ts } ]
+// ══════════════════════════════════════════════════════
+router.post('/decisions', require('../middleware/machineAuth'), async (req, res) => {
+    const events = req.body;
+    const machine = req.machine;
+
+    if (!Array.isArray(events)) {
+        return res.status(400).json({ error: 'Body debe ser un array JSON' });
+    }
+    if (events.length > 100) {
+        return res.status(400).json({ error: 'Máximo 100 eventos por lote' });
+    }
+
+    let processed = 0;
+    let errors = 0;
+
+    for (const ev of events) {
+        const { uid, approved, reason, ts } = ev;
+        if (!uid) continue;
+
+        const upperUid = String(uid).toUpperCase().trim();
+        const tappedAt = ts ? new Date(Number(ts) * 1000) : new Date();
+
+        try {
+            await insertSyncedTapDecision({
+                machine,
+                uid: upperUid,
+                approved: !!approved,
+                reason,
+                tappedAt
+            });
+
+            if (!approved) {
+                const syncedReason = normalizeSyncedReason(reason) || 'card_unknown';
+                if (syncedReason === 'card_unknown') {
+                    broadcast({ event: 'card_unknown', uid: upperUid, machine: machine.name, machine_id: machine.id });
+                } else {
+                    broadcast({ event: 'tap_denied', uid: upperUid, machine: machine.name, machine_id: machine.id, reason: syncedReason });
+                }
+            }
+
+            processed++;
+        } catch (err) {
+            console.error(`[DECISIONS] Error uid=${upperUid}:`, err.message);
+            errors++;
+        }
+    }
+
+    res.status(200).json({ ok: true, processed, errors });
 });
 
 // ══════════════════════════════════════════════════════
@@ -390,147 +621,34 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
 
     let processed = 0;
     let errors    = 0;
-    const timeZone = await systemSettings.getBusinessTimeZone();
 
     for (const ev of events) {
         const { uid, item_id, amount, ok, ts } = ev;
         if (!uid) continue;
 
         const upperUid = String(uid).toUpperCase().trim();
-        // ts es Unix timestamp en segundos; si falta, usar "ahora"
         const tappedAt = ts ? new Date(Number(ts) * 1000) : new Date();
 
         try {
-            // Buscar tarjeta y empleado
-            const cardResult = await pool.query(
-                `SELECT nc.employee_id, nc.active AS card_active,
-                        COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
-                        e.name, e.active,
-                        e.access_level_id,
-                        al.name AS access_level_name,
-                        ${effectivePolicy.dailyLimit} AS daily_limit,
-                        ${effectivePolicy.dailyLimitMode} AS daily_limit_mode,
-                        ${effectivePolicy.warningEnabled} AS warning_enabled,
-                        ${effectivePolicy.source} AS policy_source
-                 FROM nfc_cards nc
-                 JOIN employees e ON e.id = nc.employee_id
-                 LEFT JOIN access_levels al ON al.id = e.access_level_id
-                 WHERE nc.uid = $1`,
-                [upperUid]
-            );
-
-            if (cardResult.rowCount === 0) {
-                // Tarjeta desconocida: registrar como rechazada
-                await pool.query(
-                    `INSERT INTO taps
-                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
-                     VALUES ($1, $2, NULL, false, 'card_unknown', NULL, $3)`,
-                    [upperUid, machine.id, tappedAt]
-                );
-                processed++;
-                continue;
-            }
-
-            const {
-                employee_id,
-                name,
-                card_active,
-                card_status,
-                daily_limit,
-                daily_limit_mode,
-                warning_enabled,
-                active
-            } = cardResult.rows[0];
-
-            const resolvedCardStatus = normalizedCardStatus({ card_active, card_status });
-
-            if (resolvedCardStatus === 'lost') {
-                await pool.query(
-                    `INSERT INTO taps
-                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
-                     VALUES ($1, $2, $3, false, 'card_lost', false, $4)`,
-                    [upperUid, machine.id, employee_id, tappedAt]
-                );
-                processed++;
-                continue;
-            }
-
-            if (!card_active || resolvedCardStatus !== 'active') {
-                await pool.query(
-                    `INSERT INTO taps
-                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
-                     VALUES ($1, $2, $3, false, 'card_inactive', false, $4)`,
-                    [upperUid, machine.id, employee_id, tappedAt]
-                );
-                processed++;
-                continue;
-            }
-
-            if (!active || !ok) {
-                // Empleado inactivo o venta fallida → no cuenta contra el límite
-                await pool.query(
-                    `INSERT INTO taps
-                        (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
-                     VALUES ($1, $2, $3, false, $4, false, $5)`,
-                    [upperUid, machine.id, employee_id,
-                     active ? null : 'inactive', tappedAt]
-                );
-                processed++;
-                continue;
-            }
-
-            // ok = true: café dispensado offline
-            // Verificar si superó el límite: contar taps aprobados ese día ANTES de este evento
-            const businessDate = formatBusinessDate(tappedAt, timeZone);
-
-            const countResult = await pool.query(
-                `SELECT COUNT(*) AS cnt
-                 FROM taps
-                 WHERE employee_id = $1
-                   AND approved    = true
-                   AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}
-                   AND tapped_at   < $4`,
-                [employee_id, timeZone, businessDate, tappedAt]
-            );
-            const countBefore = parseInt(countResult.rows[0].cnt, 10);
-            const overLimit = shouldMarkOverLimit({
-                dailyLimit: daily_limit,
-                mode: daily_limit_mode,
-                tapsBefore: countBefore
+            const outcome = await upsertVendResult({
+                machine,
+                uid: upperUid,
+                vendSuccess: !!ok,
+                itemId: item_id,
+                amount,
+                tappedAt
             });
 
-            await pool.query(
-                `INSERT INTO taps
-                    (nfc_uid, machine_id, employee_id, approved, confirmed,
-                     item_id, amount_cents, over_limit, tapped_at)
-                 VALUES ($1, $2, $3, true, true, $4, $5, $6, $7)`,
-                [upperUid, machine.id, employee_id,
-                 item_id || null, amount || null, overLimit, tappedAt]
-            );
-
-            if (overLimit) {
-                console.log(`[QUEUE] over_limit: uid=${upperUid} (${countBefore}/${daily_limit} ese dia)`);
+            if (ok && outcome.tap) {
+                broadcast({
+                    event: 'queue_event',
+                    machine: machine.name,
+                    uid: upperUid,
+                    tap_id: outcome.tap.id
+                });
             }
 
-            const warningLead = await alerts.getEmployeeLimitWarningLead();
-            if (warning_enabled && shouldWarnAfterApproval({
-                dailyLimit: daily_limit,
-                mode: daily_limit_mode,
-                tapsBefore: countBefore,
-                warningLead
-            })) {
-                alerts.notifyEmployeeLimitWarning({
-                    employeeId: employee_id,
-                    dailyLimit: daily_limit,
-                    tapsToday: countBefore + 1,
-                    machineName: machine.name,
-                    uid: upperUid
-                }).catch(err => console.error(`[ALERT] Error alerta advertencia uid=${upperUid}:`, err.message));
-            }
-
-            broadcast({ event: 'queue_event', machine: machine.name, uid: upperUid, over_limit: overLimit });
             processed++;
-
         } catch (err) {
             console.error(`[QUEUE] Error uid=${upperUid}:`, err.message);
             errors++;
