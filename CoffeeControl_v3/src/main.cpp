@@ -595,6 +595,12 @@ bool getGatewayCurrentTime(struct tm* out, const char** sourceLabel = nullptr) {
     return false;
 }
 
+bool getLocalTimeFast(struct tm* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    return getLocalTime(out, 0);
+}
+
 uint8_t gatewayFeatureLevelForVmc() {
     const uint8_t supportedLevel = 0x03;
     if (mdbGatewayRuntime.vmcFeatureLevel == 0) return supportedLevel;
@@ -1853,7 +1859,7 @@ void incrementLocalUsed(const String& uid) {
 
 uint32_t getCurrentTs() {
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
+    if (getLocalTimeFast(&timeinfo)) {
         timeinfo.tm_isdst = 0;
         return (uint32_t)mktime(&timeinfo);
     }
