@@ -365,6 +365,39 @@ bool beginHttpRequest(HTTPClient& http,
     return http.begin(plainClient, url);
 }
 
+void markBackendOk() {
+    backendReady = true;
+    backendLastError = "";
+}
+
+void markBackendResponseError(const String& error) {
+    backendReady = true;
+    backendLastError = error;
+}
+
+void markBackendOffline(const String& error) {
+    backendReady = false;
+    backendLastError = error;
+}
+
+String httpErrorDetail(HTTPClient& http, int code) {
+    String detail = http.errorToString(code);
+    detail.trim();
+    return detail;
+}
+
+void prepareHttpClient(HTTPClient& http, uint32_t timeoutMs) {
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.setTimeout(timeoutMs);
+}
+
+void registerMachine();
+void reconcileTaps();
+void flushQueue();
+void downloadCards();
+void syncBackendAfterWiFi(const char* reason);
+
 void logDiagEvent(uint16_t code, int16_t arg1 = 0, uint32_t arg2 = 0) {
     diagEventLog.push(code, arg1, arg2, millis());
 }
@@ -1497,15 +1530,22 @@ void flushQueue() {
 
         http.addHeader("Content-Type", "application/json");
         http.addHeader("X-Machine-Mac", macAddress);
-        http.setTimeout(HTTP_TIMEOUT_MS * 3);
+        prepareHttpClient(http, HTTP_TIMEOUT_MS * 3);
 
         int code = http.POST(body);
+        String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
         http.end();
         feedWatchdog();
 
         if (code == 200 || code == 204) {
+            markBackendOk();
             sent = end;
         } else {
+            if (code > 0) {
+                markBackendResponseError("HTTP " + String(code) + " en /api/tap/queue");
+            } else if (detail.length() > 0) {
+                markBackendOffline("POST /api/tap/queue sin respuesta (" + detail + ")");
+            }
             Serial.printf("[QUEUE] Error HTTP %d — abortando flush\n", code);
             logDiagEvent(EVT_QUEUE_FLUSH_FAIL, code, queueLen);
             break;
@@ -1536,12 +1576,20 @@ void downloadCards() {
     if (!beginHttpRequest(http, client, secureClient, url)) return;
 
     http.addHeader("X-Machine-Mac", macAddress);
-    http.setTimeout(HTTP_TIMEOUT_MS * 3);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS * 3);
 
     feedWatchdog();
     int code = http.GET();
     feedWatchdog();
     if (code != 200) {
+        if (code > 0) {
+            markBackendResponseError("HTTP " + String(code) + " en /api/tap/cards");
+        } else {
+            String detail = httpErrorDetail(http, code);
+            String error = "GET /api/tap/cards sin respuesta";
+            if (detail.length() > 0) error += " (" + detail + ")";
+            markBackendOffline(error);
+        }
         Serial.printf("[CARDS] Error descarga HTTP %d\n", code);
         logDiagEvent(EVT_BACKEND_CARDS_FAIL, code, cardCount);
         http.end();
@@ -1556,10 +1604,13 @@ void downloadCards() {
     feedWatchdog();          // después del parse
 
     if (err) {
+        markBackendResponseError("JSON invalido en /api/tap/cards");
         Serial.printf("[CARDS] Error JSON descarga: %s\n", err.c_str());
         logDiagEvent(EVT_BACKEND_CARDS_FAIL, -2, cardCount);
         return;
     }
+
+    markBackendOk();
 
     JsonArray arr;
     if (doc["cards"].is<JsonArray>()) {
@@ -2071,9 +2122,6 @@ bool connectWiFi() {
 
         // Sincronizar NTP como reloj principal del firmware
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
-        // Verificar conectividad con el backend
-        checkBackend();
         return true;
     }
 
@@ -2088,8 +2136,7 @@ bool connectWiFi() {
 // ══════════════════════════════════════════════════════
 bool checkBackend() {
     if (WiFi.status() != WL_CONNECTED) {
-        backendReady = false;
-        backendLastError = "WiFi desconectado";
+        markBackendOffline("WiFi desconectado");
         logDiagEvent(EVT_BACKEND_HEALTH_FAIL, -1, 0);
         return false;
     }
@@ -2100,28 +2147,29 @@ bool checkBackend() {
     HTTPClient http;
     if (!beginHttpRequest(http, client, secureClient, url)) {
         Serial.println("[BACKEND] http.begin() fallo — URL invalida?");
-        backendReady = false;
-        backendLastError = "URL backend invalida o inaccesible";
+        markBackendOffline("URL backend invalida o inaccesible");
         return false;
     }
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
     int code = http.GET();
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     http.end();
     feedWatchdog();
     Serial.printf("[BACKEND] HTTP code: %d\n", code);
     bool ok = (code == 200);
-    backendReady = ok;
     if (ok) {
-        backendLastError = "";
+        markBackendOk();
         logDiagEvent(EVT_BACKEND_HEALTH_OK, code, 0);
     } else if (code > 0) {
-        backendLastError = "HTTP " + String(code) + " en /health";
+        markBackendResponseError("HTTP " + String(code) + " en /health");
         logDiagEvent(EVT_BACKEND_HEALTH_FAIL, code, 0);
     } else {
-        backendLastError = "Sin respuesta en /health";
+        String error = "Sin respuesta en /health";
+        if (detail.length() > 0) error += " (" + detail + ")";
+        markBackendOffline(error);
         logDiagEvent(EVT_BACKEND_HEALTH_FAIL, -2, 0);
     }
-    Serial.printf("[BACKEND] %s\n", ok ? "CONECTADO" : "SIN RESPUESTA");
+    Serial.printf("[BACKEND] %s\n", ok ? "CONECTADO" : (code > 0 ? "RESPONDIO CON ERROR" : "SIN RESPUESTA"));
     return ok;
 }
 
@@ -2136,11 +2184,14 @@ int postTap(const String& uid) {
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
 
     int code = http.POST("{\"nfc_uid\":\"" + uid + "\"}");
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     http.end();
     feedWatchdog();
+    if (code > 0) markBackendOk();
+    else if (detail.length() > 0) markBackendOffline("POST /api/tap sin respuesta (" + detail + ")");
     return code;
 }
 
@@ -2167,13 +2218,14 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
     HTTPClient http;
     if (!beginHttpRequest(http, client, secureClient, url)) {
         // Si falla begin, encolar como fallback
+        markBackendOffline("No se pudo abrir /api/tap/result");
         enqueueEvent(uid, itemId, amount, ok);
         return;
     }
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
 
     String body = "{\"nfc_uid\":\"" + uid
                 + "\",\"vend_success\":" + (ok ? "true" : "false")
@@ -2181,13 +2233,17 @@ void notifyVendResult(const String& uid, uint16_t itemId, uint16_t amount, bool 
                 + ",\"amount\":" + humanAmount + "}";
 
     int code = http.POST(body);
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     http.end();
     feedWatchdog();
 
     if (code <= 0) {
         // Sin respuesta → encolar para reintentar
+        if (detail.length() > 0) markBackendOffline("POST /api/tap/result sin respuesta (" + detail + ")");
         Serial.println("[TAP] Sin respuesta backend — encolando evento");
         enqueueEvent(uid, itemId, humanAmount, ok);
+    } else {
+        markBackendOk();
     }
 }
 
@@ -2202,14 +2258,23 @@ void reconcileTaps() {
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
 
     int code = http.POST("{}");
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     http.end();
     feedWatchdog();
 
-    if (code == 200) Serial.println("[RECONCILE] OK — taps huerfanos revertidos");
-    else             Serial.printf("[RECONCILE] HTTP %d\n", code);
+    if (code == 200) {
+        markBackendOk();
+        Serial.println("[RECONCILE] OK — taps huerfanos revertidos");
+    } else if (code > 0) {
+        markBackendResponseError("HTTP " + String(code) + " en /api/tap/reconcile");
+        Serial.printf("[RECONCILE] HTTP %d\n", code);
+    } else {
+        if (detail.length() > 0) markBackendOffline("POST /api/tap/reconcile sin respuesta (" + detail + ")");
+        Serial.printf("[RECONCILE] HTTP %d\n", code);
+    }
 }
 
 void registerMachine() {
@@ -2223,7 +2288,7 @@ void registerMachine() {
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Registration-Secret", REGISTRATION_SECRET);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
 
     DynamicJsonDocument doc(1024);
     doc["mac"] = macAddress;
@@ -2249,6 +2314,7 @@ void registerMachine() {
     serializeJson(doc, body);
 
     int code = http.POST(body);
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     String responseBody = (code > 0) ? http.getString() : "";
     http.end();
     feedWatchdog();
@@ -2295,10 +2361,12 @@ void registerMachine() {
             }
         } else {
             Serial.printf("[REG] JSON invalido en respuesta: %s\n", err.c_str());
+            markBackendResponseError("JSON invalido en /api/machines/register");
         }
     }
 
     if (code == 200) {
+        markBackendOk();
         Serial.println("[REG] OK — maquina APROBADA");
         requestImmediateRemoteCommandPoll();
         if (otaPendingAfterRegister && canProcessRemoteCommand()) {
@@ -2310,18 +2378,68 @@ void registerMachine() {
         }
         logDiagEvent(EVT_BACKEND_REGISTER_OK, code, pricingSanitizeHumanPrice(pricingConfig.priceCents));
     } else if (code == 202) {
+        markBackendOk();
         Serial.println("[REG] PENDIENTE — esperando aprobacion");
         logDiagEvent(EVT_BACKEND_REGISTER_PENDING, code, 0);
         ledBlink(2, 300);
     } else if (code == 401) {
+        markBackendResponseError("HTTP 401 en /api/machines/register");
         Serial.println("[REG] ERROR 401 — REGISTRATION_SECRET incorrecto");
         logDiagEvent(EVT_BACKEND_REGISTER_FAIL, code, 0);
     } else if (code <= 0) {
+        String error = "Sin respuesta en /api/machines/register";
+        if (detail.length() > 0) error += " (" + detail + ")";
+        markBackendOffline(error);
         Serial.printf("[REG] Sin respuesta (verificar URL: %s)\n", backendBase.c_str());
         logDiagEvent(EVT_BACKEND_REGISTER_FAIL, -2, 0);
     } else {
+        markBackendResponseError("HTTP " + String(code) + " en /api/machines/register");
         Serial.printf("[REG] HTTP %d\n", code);
         logDiagEvent(EVT_BACKEND_REGISTER_FAIL, code, 0);
+    }
+}
+
+void syncBackendAfterWiFi(const char* reason) {
+    if (!wifiReady) return;
+
+    const char* label = (reason != nullptr && reason[0] != '\0') ? reason : "conexion";
+    Serial.printf("[BACKEND] Sincronizando tras %s...\n", label);
+    delay(700);
+    feedWatchdog();
+
+    const uint8_t maxAttempts = 4;
+    for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt) {
+        Serial.printf("[BACKEND] Intento de sincronizacion %u/%u\n", attempt, maxAttempts);
+
+        bool healthOk = checkBackend();
+        registerMachine();
+
+        if (backendReady) {
+            reconcileTaps();
+            flushQueue();
+            downloadCards();
+
+            if (backendReady && !healthOk) {
+                delay(250);
+                feedWatchdog();
+                healthOk = checkBackend();
+            }
+
+            if (backendReady && healthOk) {
+                return;
+            }
+        }
+
+        if (attempt < maxAttempts) {
+            delay(1200);
+            feedWatchdog();
+        }
+    }
+
+    if (backendLastError.length() > 0) {
+        Serial.printf("[BACKEND] Sincronizacion incompleta: %s\n", backendLastError.c_str());
+    } else {
+        Serial.println("[BACKEND] Sincronizacion incompleta");
     }
 }
 
@@ -2343,14 +2461,23 @@ bool ackRemoteCommandJson(uint32_t commandId, const char* status, const String& 
 
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Machine-Mac", macAddress);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
 
     String body = "{\"status\":\"" + String(status) + "\",\"result\":" + resultJson + "}";
     int code = http.POST(body);
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     http.end();
     feedWatchdog();
 
-    if (code == 200) return true;
+    if (code == 200) {
+        markBackendOk();
+        return true;
+    }
+    if (code > 0) {
+        markBackendResponseError("HTTP " + String(code) + " en ACK remoto");
+    } else if (detail.length() > 0) {
+        markBackendOffline("ACK remoto sin respuesta (" + detail + ")");
+    }
     Serial.printf("[REMOTE] ACK fallo para comando #%lu — HTTP %d\n",
                   (unsigned long)commandId, code);
     return false;
@@ -2633,15 +2760,22 @@ void pollRemoteCommands() {
     if (!beginHttpRequest(http, client, secureClient, url)) return;
 
     http.addHeader("X-Machine-Mac", macAddress);
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    prepareHttpClient(http, HTTP_TIMEOUT_MS);
 
     int code = http.GET();
+    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
     if (code == 204) {
+        markBackendOk();
         http.end();
         feedWatchdog();
         return;
     }
     if (code != 200) {
+        if (code > 0) {
+            markBackendResponseError("HTTP " + String(code) + " en poll remoto");
+        } else if (detail.length() > 0) {
+            markBackendOffline("Poll remoto sin respuesta (" + detail + ")");
+        }
         if (code > 0) Serial.printf("[REMOTE] Poll comandos HTTP %d\n", code);
         http.end();
         feedWatchdog();
@@ -2651,6 +2785,7 @@ void pollRemoteCommands() {
     String body = http.getString();
     http.end();
     feedWatchdog();
+    markBackendOk();
 
     DynamicJsonDocument doc(768);
     DeserializationError err = deserializeJson(doc, body);
@@ -3438,13 +3573,7 @@ void setup() {
             startPortal();
         } else {
             Serial.printf("[CFG] Backend: %s\n", backendBase.c_str());
-
-            checkBackend();
-            registerMachine();
-            reconcileTaps();    // Fix Bug 4: revertir taps huérfanos al reiniciar
-            flushQueue();       // Enviar eventos offline pendientes
-            downloadCards();    // Descargar cache de tarjetas para modo offline
-
+            syncBackendAfterWiFi("arranque");
         }
     }
 
@@ -3481,14 +3610,11 @@ void loop() {
             Serial.println("[WiFi] Reconectando...");
             WiFi.reconnect();
         } else if (!wifiReady) {
-            // Reconectado: vaciar cola y refrescar cards
+            // Reconectado: resincronizar contra backend y refrescar cache
             wifiReady = true;
             Serial.println("[WiFi] Reconectado");
             logDiagEvent(EVT_WIFI_RECONNECTED, WiFi.RSSI(), WiFi.localIP());
-            checkBackend();
-            registerMachine();
-            flushQueue();
-            downloadCards();
+            syncBackendAfterWiFi("reconexion WiFi");
         }
     }
 
