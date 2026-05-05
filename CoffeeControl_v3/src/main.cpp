@@ -2751,7 +2751,6 @@ bool handleRemoteDiagnosticsSnapshot(uint32_t commandId, JsonObject payload) {
 
 void pollRemoteCommands() {
     if (WiFi.status() != WL_CONNECTED) return;
-    if (!canProcessRemoteCommand()) return;
 
     WiFiClient client;
     WiFiClientSecure secureClient;
@@ -2803,6 +2802,15 @@ void pollRemoteCommands() {
 
     Serial.printf("[REMOTE] Comando recibido #%lu: %s\n",
                   (unsigned long)commandId, commandType.c_str());
+
+    bool safeToMutateConfig = canProcessRemoteCommand();
+    bool allowWhileBusy = (commandType == "reboot" || commandType == "diagnostics_snapshot");
+    if (!safeToMutateConfig && !allowWhileBusy) {
+        Serial.printf("[REMOTE] Comando #%lu diferido — sesion MDB activa (%s)\n",
+                      (unsigned long)commandId,
+                      commandType.c_str());
+        return;
+    }
 
     if (commandType == "reboot") {
         if (ackRemoteCommand(commandId, "completed", "Reinicio remoto aceptado por la maquina")) {
@@ -3627,8 +3635,7 @@ void loop() {
 
     // ── Poll de comandos remotos cada 5s o inmediatamente tras reconectar/registrar ──
     if ((remoteCommandPollRequested || (millis() - lastCommandPollMs > COMMAND_POLL_MS))
-        && WiFi.status() == WL_CONNECTED
-        && canProcessRemoteCommand()) {
+        && WiFi.status() == WL_CONNECTED) {
         remoteCommandPollRequested = false;
         lastCommandPollMs = millis();
         pollRemoteCommands();
