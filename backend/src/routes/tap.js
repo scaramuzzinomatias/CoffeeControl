@@ -478,8 +478,17 @@ router.post('/result', async (req, res) => {
 // ══════════════════════════════════════════════════════
 router.post('/reconcile', async (req, res) => {
     const machine = req.machine;
+    const startedAt = Date.now();
+    const client = await pool.connect();
+
+    console.log(`[RECONCILE] START machine=${machine.name} id=${machine.id}`);
     try {
-        const result = await pool.query(
+        await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '1000ms'`);
+        await client.query(`SET LOCAL statement_timeout = '2500ms'`);
+        console.log(`[RECONCILE] QUERY machine=${machine.name} id=${machine.id}`);
+
+        const result = await client.query(
             `UPDATE taps
              SET confirmed = false, approved = false
              WHERE machine_id = $1
@@ -490,14 +499,25 @@ router.post('/reconcile', async (req, res) => {
             [machine.id]
         );
         const count = result.rowCount;
+        console.log(`[RECONCILE] QUERY OK machine=${machine.name} id=${machine.id} rows=${count} after=${Date.now() - startedAt}ms`);
+        await client.query('COMMIT');
+        console.log(`[RECONCILE] COMMIT machine=${machine.name} id=${machine.id} after=${Date.now() - startedAt}ms`);
+
         if (count > 0) {
             console.log(`[RECONCILE] Máquina ${machine.name}: ${count} tap(s) huérfano(s) revertido(s) al boot`);
             broadcast({ event: 'tap_reconciled', machine: machine.name, machine_id: machine.id, count });
         }
         res.status(200).json({ ok: true, reverted: count });
     } catch (err) {
-        console.error('[RECONCILE] Error:', err.message);
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error(`[RECONCILE] Error machine=${machine.name} id=${machine.id} after=${Date.now() - startedAt}ms code=${err.code || '-'} message=${err.message}`);
+
+        if (err.code === '55P03' || err.code === '57014') {
+            return res.status(503).json({ error: 'reconcile_timeout' });
+        }
         res.status(500).json({ error: 'Error interno' });
+    } finally {
+        client.release();
     }
 });
 

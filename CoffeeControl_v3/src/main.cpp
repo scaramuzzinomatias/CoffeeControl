@@ -74,6 +74,7 @@
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 // En esta revisión, la etapa TX aislada hacia MDB requiere inversión final.
 #define MDB_UART_TX_INVERT 1
 #include "MDB9bit.h"
@@ -154,8 +155,10 @@
 #define HTTP_TIMEOUT_MS    4000
 #define OTA_HTTP_TIMEOUT_MS 20000
 #define SESSION_TIMEOUT_MS 12000
-#define BACKEND_SYNC_BOOT_DELAY_MS 5000
+#define BACKEND_SYNC_BOOT_DELAY_MS 8000
 #define BACKEND_SYNC_RECONNECT_DELAY_MS 1500
+#define BACKEND_SYNC_RETRY_DELAY_MS 2500
+#define BACKEND_BOOT_GRACE_MS 30000
 #define TAP_DECISION_FLUSH_INITIAL_DELAY_MS 500
 #define TAP_DECISION_FLUSH_BASE_RETRY_MS    3000
 #define TAP_DECISION_FLUSH_MAX_RETRY_MS    30000
@@ -327,6 +330,7 @@ DNSServer   dnsServer;
 Preferences prefs;
 EventLog diagEventLog;
 volatile bool watchdogReady = false;
+SemaphoreHandle_t cardsMutex = nullptr;
 
 // ── Estado MDB ────────────────────────────────────────
 MdbRuntimeState mdbRuntime;
@@ -349,6 +353,8 @@ bool   portalMode    = false;
 bool   wifiReady     = false;
 bool   backendReady  = false;   // true si /health respondio OK
 uint8_t backendFailureStreak = 0;
+bool backendBootSyncPending = false;
+unsigned long backendBootGraceUntilMs = 0;
 unsigned long lastCommandPollMs = 0;
 bool remoteCommandPollRequested = false;
 unsigned long statusLedSuppressUntilMs = 0;
@@ -397,6 +403,7 @@ uint8_t          tapDecisionFlushFailureStreak = 0;
 
 String jsonEscape(const String& value);
 String buildMdbGatewayJson();
+void feedWatchdog();
 
 bool urlUsesTls(const String& url) {
     return url.startsWith("https://");
@@ -411,6 +418,239 @@ bool beginHttpRequest(HTTPClient& http,
         return http.begin(secureClient, url);
     }
     return http.begin(plainClient, url);
+}
+
+bool parseUrlHostPort(const String& url, String& host, uint16_t& port) {
+    String remainder = url;
+    int schemeSep = remainder.indexOf("://");
+    if (schemeSep >= 0) {
+        remainder = remainder.substring(schemeSep + 3);
+    }
+
+    int slashPos = remainder.indexOf('/');
+    String hostPort = slashPos >= 0 ? remainder.substring(0, slashPos) : remainder;
+    if (hostPort.length() == 0) return false;
+
+    port = urlUsesTls(url) ? 443 : 80;
+
+    if (hostPort.startsWith("[")) {
+        int closeBracket = hostPort.indexOf(']');
+        if (closeBracket <= 0) return false;
+        host = hostPort.substring(1, closeBracket);
+        int colonPos = hostPort.indexOf(':', closeBracket);
+        if (colonPos > closeBracket) {
+            port = (uint16_t)hostPort.substring(colonPos + 1).toInt();
+        }
+        return host.length() > 0 && port > 0;
+    }
+
+    int colonPos = hostPort.lastIndexOf(':');
+    if (colonPos > 0) {
+        host = hostPort.substring(0, colonPos);
+        port = (uint16_t)hostPort.substring(colonPos + 1).toInt();
+    } else {
+        host = hostPort;
+    }
+
+    host.trim();
+    return host.length() > 0 && port > 0;
+}
+
+String buildUrlRequestTarget(const String& url) {
+    String remainder = url;
+    int schemeSep = remainder.indexOf("://");
+    if (schemeSep >= 0) {
+        remainder = remainder.substring(schemeSep + 3);
+    }
+
+    int slashPos = remainder.indexOf('/');
+    if (slashPos < 0) {
+        return "/";
+    }
+
+    String target = remainder.substring(slashPos);
+    return target.length() > 0 ? target : "/";
+}
+
+struct ManualHttpResponse {
+    int code = HTTPC_ERROR_CONNECTION_REFUSED;
+    String detail;
+    String body;
+    unsigned long elapsedMs = 0;
+};
+
+int performManualJsonPost(const String& url,
+                          const String& body,
+                          const char* extraHeaderName,
+                          const char* extraHeaderValue,
+                          uint32_t timeoutMs,
+                          ManualHttpResponse& response) {
+    response = ManualHttpResponse();
+
+    String host;
+    uint16_t port = 0;
+    if (!parseUrlHostPort(url, host, port)) {
+        response.detail = "url parse fail";
+        return response.code;
+    }
+
+    String requestTarget = buildUrlRequestTarget(url);
+    String hostHeader = host;
+    bool isTls = urlUsesTls(url);
+    uint16_t defaultPort = isTls ? 443 : 80;
+    if (host.indexOf(':') >= 0 && !host.startsWith("[")) {
+        hostHeader = "[" + host + "]";
+    }
+    if (port != defaultPort) {
+        hostHeader += ":" + String(port);
+    }
+
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    Client* activeClient = nullptr;
+
+    if (isTls) {
+        secureClient.setInsecure();
+        secureClient.setTimeout(timeoutMs);
+        activeClient = &secureClient;
+    } else {
+        plainClient.setTimeout(timeoutMs);
+        activeClient = &plainClient;
+    }
+
+    unsigned long startedAt = millis();
+    bool connected = false;
+    if (isTls) {
+        connected = secureClient.connect(host.c_str(), port);
+    } else {
+        connected = plainClient.connect(host.c_str(), port, (int32_t)timeoutMs);
+    }
+
+    if (!connected) {
+        response.code = HTTPC_ERROR_CONNECTION_REFUSED;
+        response.detail = "socket connect failed";
+        response.elapsedMs = millis() - startedAt;
+        return response.code;
+    }
+
+    String request =
+        "POST " + requestTarget + " HTTP/1.1\r\n"
+        "Host: " + hostHeader + "\r\n"
+        "Connection: close\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + String(body.length()) + "\r\n";
+    if (extraHeaderName && extraHeaderName[0] != '\0' && extraHeaderValue) {
+        request += String(extraHeaderName) + ": " + String(extraHeaderValue) + "\r\n";
+    }
+    request += "\r\n";
+
+    size_t headerWritten = activeClient->print(request);
+    size_t bodyWritten = activeClient->print(body);
+    if (headerWritten != request.length() || bodyWritten != body.length()) {
+        response.code = HTTPC_ERROR_SEND_PAYLOAD_FAILED;
+        response.detail = "socket write failed";
+        response.elapsedMs = millis() - startedAt;
+        activeClient->stop();
+        return response.code;
+    }
+
+    unsigned long waitStartedAt = millis();
+    while (!activeClient->available() && activeClient->connected() && millis() - waitStartedAt < timeoutMs) {
+        delay(1);
+        feedWatchdog();
+    }
+
+    if (!activeClient->available()) {
+        response.code = HTTPC_ERROR_READ_TIMEOUT;
+        response.detail = "read Timeout";
+        response.elapsedMs = millis() - startedAt;
+        activeClient->stop();
+        return response.code;
+    }
+
+    String statusLine = activeClient->readStringUntil('\n');
+    statusLine.trim();
+    int firstSpace = statusLine.indexOf(' ');
+    int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
+    if (firstSpace < 0 || secondSpace < 0) {
+        response.code = HTTPC_ERROR_NO_HTTP_SERVER;
+        response.detail = "invalid status line";
+        response.elapsedMs = millis() - startedAt;
+        activeClient->stop();
+        return response.code;
+    }
+
+    response.code = statusLine.substring(firstSpace + 1, secondSpace).toInt();
+
+    int contentLength = -1;
+    while (activeClient->connected() || activeClient->available()) {
+        String line = activeClient->readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) break;
+
+        String lower = line;
+        lower.toLowerCase();
+        if (lower.startsWith("content-length:")) {
+            int colonPos = line.indexOf(':');
+            if (colonPos >= 0) {
+                contentLength = line.substring(colonPos + 1).toInt();
+            }
+        }
+    }
+
+    unsigned long bodyWaitStartedAt = millis();
+    while ((activeClient->connected() || activeClient->available())
+           && millis() - bodyWaitStartedAt < timeoutMs) {
+        while (activeClient->available()) {
+            response.body += (char)activeClient->read();
+            bodyWaitStartedAt = millis();
+        }
+
+        if (contentLength >= 0 && response.body.length() >= contentLength) {
+            break;
+        }
+
+        delay(1);
+        feedWatchdog();
+    }
+
+    if ((response.code == 200 || response.code == 202)
+        && contentLength > 0
+        && response.body.length() == 0) {
+        response.code = HTTPC_ERROR_READ_TIMEOUT;
+        response.detail = "response body Timeout";
+    }
+
+    response.elapsedMs = millis() - startedAt;
+    activeClient->stop();
+    return response.code;
+}
+
+String probeTcpEndpoint(const String& baseUrl, uint32_t timeoutMs) {
+    String host;
+    uint16_t port = 0;
+    if (!parseUrlHostPort(baseUrl, host, port)) {
+        return "tcp probe parse fail";
+    }
+
+    WiFiClient probeClient;
+    unsigned long startedAt = millis();
+    bool connected = probeClient.connect(host.c_str(), port, (int32_t)timeoutMs);
+    unsigned long elapsedMs = millis() - startedAt;
+
+    String detail = connected ? "tcp ok " : "tcp fail ";
+    detail += host;
+    detail += ":";
+    detail += String(port);
+    detail += " after ";
+    detail += String(elapsedMs);
+    detail += " ms";
+
+    if (connected) {
+        probeClient.stop();
+    }
+
+    return detail;
 }
 
 void markBackendOk() {
@@ -459,6 +699,19 @@ void processBackendSync();
 bool isBackendSyncActive();
 void syncBackendAfterWiFi(const char* reason);
 void backendServiceTask(void*);
+bool lockCards(TickType_t timeoutTicks = portMAX_DELAY);
+void unlockCards();
+
+bool backendInBootGraceWindow() {
+    if (!backendBootSyncPending) return false;
+    return (long)(backendBootGraceUntilMs - millis()) > 0;
+}
+
+const char* backendStatusLabel() {
+    if (backendReady) return "OK";
+    if (backendInBootGraceWindow()) return "SYNC";
+    return "OFFLINE";
+}
 
 bool isBackendSyncActive() {
     return backendSyncPhase != BACKEND_SYNC_IDLE;
@@ -599,6 +852,17 @@ bool getLocalTimeFast(struct tm* out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     return getLocalTime(out, 0);
+}
+
+bool lockCards(TickType_t timeoutTicks) {
+    if (cardsMutex == nullptr) return true;
+    return xSemaphoreTake(cardsMutex, timeoutTicks) == pdTRUE;
+}
+
+void unlockCards() {
+    if (cardsMutex != nullptr) {
+        xSemaphoreGive(cardsMutex);
+    }
 }
 
 uint8_t gatewayFeatureLevelForVmc() {
@@ -1514,7 +1778,7 @@ void loadCards() {
 }
 
 // Guarda cards.json en streaming para no allocar el doc completo
-void saveCards() {
+static void saveCardsUnlocked() {
     File f = LittleFS.open(CARDS_PATH, "w");
     if (!f) { Serial.println("[CARDS] Error guardando cards.json"); return; }
 
@@ -1533,6 +1797,15 @@ void saveCards() {
 
     cardsDirty = false;
     Serial.printf("[CARDS] Cache guardado: %d tarjetas\n", cardCount);
+}
+
+void saveCards() {
+    if (!lockCards(pdMS_TO_TICKS(250))) {
+        Serial.println("[CARDS] Timeout tomando mutex para guardar cache");
+        return;
+    }
+    saveCardsUnlocked();
+    unlockCards();
 }
 
 bool fillDateFromClock(char* out, size_t outSize) {
@@ -1834,27 +2107,42 @@ void flushPendingBackendArtifactsNow() {
 //  OFFLINE: autenticación local con cache
 // ══════════════════════════════════════════════════════
 int localAuth(const String& uid) {
+    if (!lockCards(pdMS_TO_TICKS(50))) {
+        Serial.println("[CARDS] Timeout tomando mutex para localAuth");
+        return LOCAL_AUTH_UNKNOWN;
+    }
+
+    int result = LOCAL_AUTH_UNKNOWN;
     for (int i = 0; i < cardCount; i++) {
         if (strncmp(cards[i].uid, uid.c_str(), 8) == 0) {
             if (cards[i].mode == LIMIT_MODE_ENFORCE
                 && cards[i].limit > 0
                 && cards[i].used >= cards[i].limit) {
-                return LOCAL_AUTH_OVERLIMIT;
+                result = LOCAL_AUTH_OVERLIMIT;
+                break;
             }
-            return LOCAL_AUTH_OK;
+            result = LOCAL_AUTH_OK;
+            break;
         }
     }
-    return LOCAL_AUTH_UNKNOWN;
+    unlockCards();
+    return result;
 }
 
 void incrementLocalUsed(const String& uid) {
+    if (!lockCards(pdMS_TO_TICKS(50))) {
+        Serial.println("[CARDS] Timeout tomando mutex para incrementar uso local");
+        return;
+    }
     for (int i = 0; i < cardCount; i++) {
         if (strncmp(cards[i].uid, uid.c_str(), 8) == 0) {
             cards[i].used++;
             cardsDirty = true;
+            unlockCards();
             return;
         }
     }
+    unlockCards();
 }
 
 uint32_t getCurrentTs() {
@@ -2020,15 +2308,26 @@ void downloadCards() {
     markBackendOk();
 
     JsonArray arr;
+    char nextSavedDate[11] = "";
+    uint32_t nextResetAtTs = 0;
     if (doc["cards"].is<JsonArray>()) {
-        strlcpy(savedDate, doc["date"] | "", sizeof(savedDate));
-        nextResetTs = (uint32_t)(doc["next_reset_at"] | 0);
+        strlcpy(nextSavedDate, doc["date"] | "", sizeof(nextSavedDate));
+        nextResetAtTs = (uint32_t)(doc["next_reset_at"] | 0);
         arr = doc["cards"].as<JsonArray>();
     } else {
-        fillDateFromClock(savedDate, sizeof(savedDate));
-        nextResetTs = 0;
+        fillDateFromClock(nextSavedDate, sizeof(nextSavedDate));
+        nextResetAtTs = 0;
         arr = doc.as<JsonArray>();
     }
+
+    if (!lockCards(pdMS_TO_TICKS(500))) {
+        markBackendResponseError("Timeout tomando mutex para aplicar /api/tap/cards");
+        Serial.println("[CARDS] Timeout aplicando descarga al cache local");
+        return;
+    }
+
+    strlcpy(savedDate, nextSavedDate, sizeof(savedDate));
+    nextResetTs = nextResetAtTs;
     cardCount = 0;
     for (JsonObject c : arr) {
         if (cardCount >= MAX_CARDS) break;
@@ -2039,10 +2338,15 @@ void downloadCards() {
         cardCount++;
     }
 
-    saveCards();
+    saveCardsUnlocked();
+    int downloadedCount = cardCount;
+    char downloadedDate[11];
+    strlcpy(downloadedDate, savedDate, sizeof(downloadedDate));
+    uint32_t downloadedNextResetTs = nextResetTs;
+    unlockCards();
     Serial.printf("[CARDS] Descarga OK: %d tarjetas (fecha: %s, next_reset_at=%lu)\n",
-                  cardCount, savedDate, (unsigned long)nextResetTs);
-    logDiagEvent(EVT_BACKEND_CARDS_OK, cardCount, nextResetTs);
+                  downloadedCount, downloadedDate, (unsigned long)downloadedNextResetTs);
+    logDiagEvent(EVT_BACKEND_CARDS_OK, downloadedCount, downloadedNextResetTs);
 }
 
 
@@ -2054,6 +2358,11 @@ void checkMidnightReset() {
         uint32_t nowTs = getCurrentTs();
         if (nowTs < nextResetTs) return;
 
+        if (!lockCards(pdMS_TO_TICKS(250))) {
+            Serial.println("[CLOCK] Timeout tomando mutex para reset diario");
+            return;
+        }
+
         char newDate[11] = "";
         bool advanced = false;
         while (nextResetTs > 0 && nowTs >= nextResetTs) {
@@ -2064,22 +2373,34 @@ void checkMidnightReset() {
             nextResetTs += 86400UL;
             advanced = true;
         }
-        if (!advanced) return;
+        if (!advanced) {
+            unlockCards();
+            return;
+        }
 
         Serial.printf("[CLOCK] Nuevo dia operativo — reseteando contadores (fecha=%s)\n", savedDate);
         for (int i = 0; i < cardCount; i++) cards[i].used = 0;
         cardsDirty = true;
+        unlockCards();
         return;
     }
 
     char today[11] = "";
     if (!fillDateFromClock(today, sizeof(today))) return;
-    if (strlen(savedDate) == 0 || strcmp(today, savedDate) == 0) return;
+    if (!lockCards(pdMS_TO_TICKS(250))) {
+        Serial.println("[CLOCK] Timeout tomando mutex para comparar fecha local");
+        return;
+    }
+    if (strlen(savedDate) == 0 || strcmp(today, savedDate) == 0) {
+        unlockCards();
+        return;
+    }
 
     Serial.printf("[CLOCK] Nuevo dia local: %s → %s — reseteando contadores\n", savedDate, today);
     strlcpy(savedDate, today, sizeof(savedDate));
     for (int i = 0; i < cardCount; i++) cards[i].used = 0;
     cardsDirty = true;
+    unlockCards();
 }
 
 
@@ -2693,15 +3014,6 @@ void registerMachine() {
     if (!wifiReady) return;
 
     String url = backendBase + "/api/machines/register";
-    WiFiClient client;
-    WiFiClientSecure secureClient;
-    HTTPClient http;
-    if (!beginHttpRequest(http, client, secureClient, url)) return;
-
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Registration-Secret", REGISTRATION_SECRET);
-    prepareHttpClient(http, HTTP_TIMEOUT_MS);
-
     DynamicJsonDocument doc(1024);
     doc["mac"] = macAddress;
     doc["wifi_ssid"] = wifiSSID;
@@ -2725,10 +3037,19 @@ void registerMachine() {
     String body;
     serializeJson(doc, body);
 
-    int code = http.POST(body);
-    String detail = (code <= 0) ? httpErrorDetail(http, code) : "";
-    String responseBody = (code > 0) ? http.getString() : "";
-    http.end();
+    ManualHttpResponse response;
+    int code = performManualJsonPost(
+        url,
+        body,
+        "X-Registration-Secret",
+        REGISTRATION_SECRET,
+        HTTP_TIMEOUT_MS,
+        response
+    );
+
+    unsigned long requestElapsedMs = response.elapsedMs;
+    String detail = response.detail;
+    String responseBody = response.body;
     feedWatchdog();
     bool otaPendingAfterRegister = false;
     String otaPendingVersion = "";
@@ -2778,8 +3099,9 @@ void registerMachine() {
     }
 
     if (code == 200) {
+        backendBootSyncPending = false;
         markBackendOk();
-        Serial.println("[REG] OK — maquina APROBADA");
+        Serial.printf("[REG] OK — maquina APROBADA (%lu ms)\n", requestElapsedMs);
         flushPendingBackendArtifactsNow();
         requestImmediateRemoteCommandPoll();
         if (otaPendingAfterRegister && canProcessRemoteCommand()) {
@@ -2791,11 +3113,13 @@ void registerMachine() {
         }
         logDiagEvent(EVT_BACKEND_REGISTER_OK, code, pricingSanitizeHumanPrice(pricingConfig.priceCents));
     } else if (code == 202) {
+        backendBootSyncPending = false;
         markBackendOk();
-        Serial.println("[REG] PENDIENTE — esperando aprobacion");
+        Serial.printf("[REG] PENDIENTE — esperando aprobacion (%lu ms)\n", requestElapsedMs);
         logDiagEvent(EVT_BACKEND_REGISTER_PENDING, code, 0);
         ledBlink(2, 300);
     } else if (code == 401) {
+        backendBootSyncPending = false;
         markBackendResponseError("HTTP 401 en /api/machines/register");
         Serial.println("[REG] ERROR 401 — REGISTRATION_SECRET incorrecto");
         logDiagEvent(EVT_BACKEND_REGISTER_FAIL, code, 0);
@@ -2803,11 +3127,22 @@ void registerMachine() {
         String error = "Sin respuesta en /api/machines/register";
         if (detail.length() > 0) error += " (" + detail + ")";
         markBackendOffline(error);
-        Serial.printf("[REG] Sin respuesta (verificar URL: %s)\n", backendBase.c_str());
+        if (detail.length() > 0) {
+            Serial.printf("[REG] Sin respuesta tras %lu ms — code=%d detail=%s (URL: %s)\n",
+                          requestElapsedMs,
+                          code,
+                          detail.c_str(),
+                          backendBase.c_str());
+        } else {
+            Serial.printf("[REG] Sin respuesta tras %lu ms — code=%d (URL: %s)\n",
+                          requestElapsedMs,
+                          code,
+                          backendBase.c_str());
+        }
         logDiagEvent(EVT_BACKEND_REGISTER_FAIL, -2, 0);
     } else {
         markBackendResponseError("HTTP " + String(code) + " en /api/machines/register");
-        Serial.printf("[REG] HTTP %d\n", code);
+        Serial.printf("[REG] HTTP %d (%lu ms)\n", code, requestElapsedMs);
         logDiagEvent(EVT_BACKEND_REGISTER_FAIL, code, 0);
     }
 }
@@ -2816,11 +3151,16 @@ void syncBackendAfterWiFi(const char* reason) {
     if (!wifiReady) return;
 
     const char* label = (reason != nullptr && reason[0] != '\0') ? reason : "conexion";
+    bool bootSync = strcmp(label, "arranque") == 0;
     backendSyncReason = label;
     backendSyncAttempt = 0;
     backendSyncLastHealthOk = false;
     backendSyncPhase = BACKEND_SYNC_INITIAL_DELAY;
-    const unsigned long delayMs = (strcmp(label, "arranque") == 0)
+    if (bootSync) {
+        backendBootSyncPending = true;
+        backendBootGraceUntilMs = millis() + BACKEND_BOOT_GRACE_MS;
+    }
+    const unsigned long delayMs = bootSync
         ? BACKEND_SYNC_BOOT_DELAY_MS
         : BACKEND_SYNC_RECONNECT_DELAY_MS;
     backendSyncNextStepMs = millis() + delayMs;
@@ -2829,10 +3169,18 @@ void syncBackendAfterWiFi(const char* reason) {
 
 void finishBackendSync(bool success) {
     if (!success) {
-        if (backendLastError.length() > 0) {
-            Serial.printf("[BACKEND] Sincronizacion incompleta: %s\n", backendLastError.c_str());
+        if (backendInBootGraceWindow()) {
+            if (backendLastError.length() > 0) {
+                Serial.printf("[BACKEND] Sincronizacion inicial pendiente: %s\n", backendLastError.c_str());
+            } else {
+                Serial.println("[BACKEND] Sincronizacion inicial pendiente");
+            }
         } else {
-            Serial.println("[BACKEND] Sincronizacion incompleta");
+            if (backendLastError.length() > 0) {
+                Serial.printf("[BACKEND] Sincronizacion incompleta: %s\n", backendLastError.c_str());
+            } else {
+                Serial.println("[BACKEND] Sincronizacion incompleta");
+            }
         }
     }
 
@@ -2893,7 +3241,7 @@ void processBackendSync() {
 
             if (backendSyncAttempt < maxAttempts) {
                 backendSyncPhase = BACKEND_SYNC_RETRY_DELAY;
-                backendSyncNextStepMs = millis() + 1200UL;
+                backendSyncNextStepMs = millis() + BACKEND_SYNC_RETRY_DELAY_MS;
                 return;
             }
 
@@ -2915,6 +3263,7 @@ void processBackendSync() {
 void backendServiceTask(void*) {
     unsigned long lastWifiCheck = 0;
     unsigned long lastHeartbeat = 0;
+    unsigned long lastCardsRefresh = 0;
 
     for (;;) {
         if (portalMode) {
@@ -2961,9 +3310,17 @@ void backendServiceTask(void*) {
             else if (mdbMachineTimeValid) clockSource = "MDB";
             Serial.printf("[STATUS] WiFi:%s | Backend:%s | MDB:%s | Cards:%d | Queue:%d | Clock:%s\n",
                          WiFi.status() == WL_CONNECTED ? "OK" : "DESCONECTADO",
-                          backendReady ? "OK" : "OFFLINE",
-                          stStr[mdbRuntime.phase], cardCount, queueLen,
+                          backendStatusLabel(),
+                         stStr[mdbRuntime.phase], cardCount, queueLen,
                           clockSource);
+        }
+
+        if (!isBackendSyncActive()
+            && wifiReady
+            && WiFi.status() == WL_CONNECTED
+            && now - lastCardsRefresh > 600000) {
+            lastCardsRefresh = now;
+            downloadCards();
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -4004,6 +4361,10 @@ void setup() {
         Serial.println("[FS] ERROR critico — LittleFS no pudo iniciar");
     } else {
         Serial.println("[FS] LittleFS OK");
+        cardsMutex = xSemaphoreCreateMutex();
+        if (cardsMutex == nullptr) {
+            Serial.println("[CARDS] ERROR — no se pudo crear mutex del cache");
+        }
         loadCards();
         loadQueue();
         loadTapDecisions();
@@ -4115,14 +4476,6 @@ void loop() {
         && millis() - lastTapDecisionFlush > 250) {
         lastTapDecisionFlush = millis();
         flushTapDecisions();
-    }
-
-
-    // ── Refresh de tarjetas cada 10 minutos ──────────
-    static unsigned long lastCardsRefresh = 0;
-    if (wifiReady && millis() - lastCardsRefresh > 600000) {
-        lastCardsRefresh = millis();
-        downloadCards();
     }
 
     // ── Reset de contadores al detectar día nuevo ─────

@@ -28,7 +28,45 @@ const mobileTechRoutes = require('./routes/mobileTech');
 const alertsRoutes = require('./routes/alerts');
 
 const app = express();
-app.use(express.json());
+app.use((req, res, next) => {
+    const startedAt = Date.now();
+    const remoteIp = req.socket?.remoteAddress || '-';
+    const remotePort = req.socket?.remotePort || '-';
+    const contentLength = req.headers['content-length'] || '0';
+    const requestLabel = `${req.method} ${req.originalUrl || req.url}`;
+
+    console.log(`${new Date().toISOString()} [HTTP] START ${requestLabel} from=${remoteIp}:${remotePort} len=${contentLength}`);
+
+    req.on('aborted', () => {
+        console.warn(`${new Date().toISOString()} [HTTP] ABORT ${requestLabel} after=${Date.now() - startedAt}ms from=${remoteIp}:${remotePort}`);
+    });
+
+    req.on('error', (err) => {
+        console.error(`${new Date().toISOString()} [HTTP] REQERR ${requestLabel} after=${Date.now() - startedAt}ms from=${remoteIp}:${remotePort} err=${err.message}`);
+    });
+
+    res.on('finish', () => {
+        console.log(`${new Date().toISOString()} [HTTP] END ${requestLabel} status=${res.statusCode} after=${Date.now() - startedAt}ms from=${remoteIp}:${remotePort}`);
+    });
+
+    res.on('close', () => {
+        if (!res.writableEnded) {
+            console.warn(`${new Date().toISOString()} [HTTP] CLOSE ${requestLabel} status=${res.statusCode} after=${Date.now() - startedAt}ms from=${remoteIp}:${remotePort}`);
+        }
+    });
+
+    next();
+});
+
+app.use(express.json({ limit: '1mb' }));
+app.use((err, req, res, next) => {
+    if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) {
+        console.error(`${new Date().toISOString()} [HTTP] JSONERR ${req.method} ${req.originalUrl || req.url} err=${err.message}`);
+        return res.status(400).json({ error: 'JSON inválido' });
+    }
+    return next(err);
+});
+
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type, X-Machine-Secret, X-Machine-Mac, X-Registration-Secret, Authorization');
@@ -36,7 +74,6 @@ app.use((req, res, next) => {
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
-app.use((req, res, next) => { console.log(`${new Date().toISOString()} ${req.method} ${req.path}`); next(); });
 
 // Rutas públicas
 app.use('/api/auth', authRoutes);
@@ -86,6 +123,12 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
+server.on('clientError', (err, socket) => {
+    console.error(`${new Date().toISOString()} [HTTP] CLIENTERR err=${err.message}`);
+    if (socket.writable) {
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    }
+});
 initWebSocket(server);
 server.listen(PORT, '0.0.0.0', () => {
     if (process.env.DISABLE_ALERT_MONITOR !== 'true') {
