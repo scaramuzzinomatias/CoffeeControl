@@ -13,7 +13,7 @@ router.use(requireCardOperator);
 
 router.get('/employees/search', async (req, res) => {
     try {
-        const employees = await searchEmployeesForCardOps(req.query.q, { limit: req.query.limit });
+        const employees = await searchEmployeesForCardOps(req.db, req.user.tenant_id, req.query.q, { limit: req.query.limit });
         res.json({
             employees,
             query: String(req.query.q || '').trim()
@@ -25,7 +25,7 @@ router.get('/employees/search', async (req, res) => {
 
 router.get('/cards/lookup/:uid', async (req, res) => {
     try {
-        const card = await lookupCardByUid(req.params.uid);
+        const card = await lookupCardByUid(req.db, req.user.tenant_id, req.params.uid);
         res.json({
             found: Boolean(card),
             card
@@ -41,6 +41,8 @@ router.post('/employees/:id/cards', async (req, res) => {
 
     try {
         const result = await registerOrAssignCard({
+            db: req.db,
+            tenantId: req.user.tenant_id,
             req,
             employeeId: Number.parseInt(req.params.id, 10),
             uid,
@@ -57,6 +59,8 @@ router.patch('/employees/:id/cards/:cardId', async (req, res) => {
     const { label, employee_id, status, active } = req.body || {};
     try {
         const result = await updateCardAssignment({
+            db: req.db,
+            tenantId: req.user.tenant_id,
             req,
             cardId: Number.parseInt(req.params.cardId, 10),
             label,

@@ -3,6 +3,7 @@ const express = require('express');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const pool    = require('../db/pool');
+const bootstrapPool = require('../db/bootstrapPool');
 const audit = require('../services/audit');
 const { getUserDepartmentScopes } = require('../lib/accessScope');
 
@@ -17,9 +18,18 @@ router.post('/login', async (req, res) => {
         return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
 
     try {
-        const result = await pool.query(
-            'SELECT * FROM admin_users WHERE username = $1 AND active = true',
-            [username.trim().toLowerCase()]
+        const tenantId = Number(req.tenant_id);
+        if (!Number.isInteger(tenantId) || tenantId < 1) {
+            return res.status(400).json({ error: 'Tenant no resuelto' });
+        }
+        const result = await bootstrapPool.query(
+            `SELECT id, username, password_hash, role, department,
+                    is_protected, active, tenant_id
+             FROM admin_users
+             WHERE username = $1
+               AND tenant_id = $2
+               AND active = true`,
+            [username.trim().toLowerCase(), tenantId]
         );
 
         if (result.rowCount === 0)
@@ -35,6 +45,7 @@ router.post('/login', async (req, res) => {
         const token = jwt.sign(
             {
                 id: user.id,
+                tenant_id: user.tenant_id,
                 username: user.username,
                 role: user.role,
                 is_protected: Boolean(user.is_protected),

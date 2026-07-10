@@ -5,9 +5,9 @@ const audit = require('../services/audit');
 
 const router = express.Router();
 
-router.get('/', requireManager, async (_req, res) => {
+router.get('/', requireManager, async (req, res) => {
     try {
-        const settings = await alerts.getNotificationSettings();
+        const settings = await alerts.getNotificationSettings(req.user.tenant_id);
         return res.json({ settings });
     } catch (err) {
         return res.status(500).json({ error: err.message });
@@ -16,8 +16,8 @@ router.get('/', requireManager, async (_req, res) => {
 
 router.put('/', requireManager, async (req, res) => {
     try {
-        const before = await alerts.getNotificationSettings();
-        const settings = await alerts.saveNotificationSettings(req.body || {});
+        const before = await alerts.getNotificationSettings(req.user.tenant_id);
+        const settings = await alerts.saveNotificationSettings(req.body || {}, req.user.tenant_id);
         await audit.logAuditEvent({
             req,
             action: 'notification_settings.update',
@@ -55,7 +55,7 @@ router.put('/', requireManager, async (req, res) => {
 
 router.post('/test', requireManager, async (req, res) => {
     try {
-        const result = await alerts.sendTestNotification(req.body || {});
+        const result = await alerts.sendTestNotification(req.body || {}, req.user.tenant_id);
         await audit.logAuditEvent({
             req,
             action: 'notification_settings.test',

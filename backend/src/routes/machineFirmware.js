@@ -13,7 +13,7 @@ router.get('/releases/:id/download', async (req, res) => {
     }
 
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT fr.id,
                     fr.version,
                     fr.filename,
@@ -24,8 +24,9 @@ router.get('/releases/:id/download', async (req, res) => {
              FROM machines m
              JOIN firmware_releases fr ON fr.id = m.desired_firmware_release_id
              WHERE m.id = $1
-               AND fr.id = $2`,
-            [req.machine.id, releaseId]
+               AND fr.id = $2
+               AND fr.tenant_id = $3`,
+            [req.machine.id, releaseId, req.machine.tenant_id]
         );
         if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Release OTA no autorizada para esta máquina.' });

@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
+const bootstrapPool = require('../db/bootstrapPool');
 const { getUserDepartmentScopes } = require('./accessScope');
 
 const SECRET = process.env.JWT_SECRET || 'cc-dev-secret-change-in-prod';
@@ -36,12 +37,17 @@ function generateRefreshToken() {
     return crypto.randomBytes(48).toString('hex');
 }
 
-async function getActiveAdminUserByUsername(username) {
+async function getActiveAdminUserByUsername(username, tenantId) {
     const normalized = normalizeUsername(username);
     if (!normalized) return null;
-    const result = await pool.query(
-        'SELECT * FROM admin_users WHERE username = $1 AND active = true',
-        [normalized]
+    const result = await bootstrapPool.query(
+        `SELECT id, username, password_hash, role, department,
+                is_protected, active, tenant_id
+         FROM admin_users
+         WHERE username = $1
+           AND tenant_id = $2
+           AND active = true`,
+        [normalized, tenantId]
     );
     return result.rowCount ? result.rows[0] : null;
 }
@@ -209,8 +215,9 @@ async function revokeMobileSession(refreshToken) {
     return result.rowCount ? result.rows[0] : null;
 }
 
-async function isMobileSessionActive(sessionId, userId) {
-    const result = await pool.query(
+async function isMobileSessionActive(sessionId, userId, client) {
+    const db = client || pool;
+    const result = await db.query(
         `SELECT 1
          FROM mobile_sessions
          WHERE id = $1

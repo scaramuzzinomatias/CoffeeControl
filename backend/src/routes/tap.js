@@ -54,8 +54,8 @@ function normalizeSyncedReason(reason) {
     return '';
 }
 
-async function fetchCardContext(uid) {
-    const result = await pool.query(
+async function fetchCardContext(uid, db, tenantId) {
+    const result = await db.query(
         `SELECT nc.id, nc.employee_id, nc.active AS card_active,
                 COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
                 e.name, e.department, e.active,
@@ -66,47 +66,49 @@ async function fetchCardContext(uid) {
                 ${effectivePolicy.warningEnabled} AS warning_enabled,
                 ${effectivePolicy.source} AS policy_source
          FROM nfc_cards nc
-         JOIN employees e ON e.id = nc.employee_id
-         LEFT JOIN access_levels al ON al.id = e.access_level_id
-         WHERE nc.uid = $1`,
-        [uid]
+         JOIN employees e ON e.id = nc.employee_id AND e.tenant_id = $2
+         LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $2
+         WHERE nc.uid = $1 AND nc.tenant_id = $2`,
+        [uid, tenantId]
     );
     return result.rowCount > 0 ? result.rows[0] : null;
 }
 
-async function countApprovedBeforeTap(employeeId, tappedAt) {
+async function countApprovedBeforeTap(employeeId, tappedAt, tenantId, db) {
     const timeZone = await systemSettings.getBusinessTimeZone();
     const businessDate = formatBusinessDate(tappedAt, timeZone);
-    const countResult = await pool.query(
+    const countResult = await db.query(
         `SELECT COUNT(*) AS cnt
          FROM taps
          WHERE employee_id = $1
            AND approved    = true
            AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}
-           AND tapped_at   < $4`,
-        [employeeId, timeZone, businessDate, tappedAt]
+           AND tapped_at   < $4
+           AND tenant_id   = $5`,
+        [employeeId, timeZone, businessDate, tappedAt, tenantId]
     );
     return parseInt(countResult.rows[0]?.cnt || '0', 10);
 }
 
-async function findExactTapByEvent({ machineId, uid, tappedAt }) {
+async function findExactTapByEvent({ machineId, uid, tappedAt, tenantId, db }) {
     if (!tappedAt) return null;
-    const result = await pool.query(
+    const result = await db.query(
         `SELECT id, approved, confirmed, item_id, amount_cents
          FROM taps
          WHERE nfc_uid = $1
            AND machine_id = $2
            AND tapped_at = $3
+           AND tenant_id = $4
          ORDER BY id DESC
          LIMIT 1`,
-        [uid, machineId, tappedAt]
+        [uid, machineId, tappedAt, tenantId]
     );
     return result.rowCount > 0 ? result.rows[0] : null;
 }
 
-async function findPendingApprovedTap({ machineId, uid, tappedAt }) {
+async function findPendingApprovedTap({ machineId, uid, tappedAt, tenantId, db }) {
     if (tappedAt) {
-        const exact = await pool.query(
+        const exact = await db.query(
             `SELECT id, item_id, amount_cents
              FROM taps
              WHERE nfc_uid = $1
@@ -114,49 +116,52 @@ async function findPendingApprovedTap({ machineId, uid, tappedAt }) {
                AND tapped_at = $3
                AND approved = true
                AND confirmed IS NULL
+               AND tenant_id = $4
              ORDER BY id DESC
              LIMIT 1`,
-            [uid, machineId, tappedAt]
+            [uid, machineId, tappedAt, tenantId]
         );
         if (exact.rowCount > 0) return exact.rows[0];
     }
 
-    const fallback = await pool.query(
+    const fallback = await db.query(
         `SELECT id, item_id, amount_cents
          FROM taps
          WHERE nfc_uid = $1
            AND machine_id = $2
            AND approved = true
            AND confirmed IS NULL
+           AND tenant_id = $3
          ORDER BY tapped_at DESC
          LIMIT 1`,
-        [uid, machineId]
+        [uid, machineId, tenantId]
     );
     return fallback.rowCount > 0 ? fallback.rows[0] : null;
 }
 
-async function insertSyncedTapDecision({ machine, uid, approved, reason, tappedAt }) {
-    const existing = await findExactTapByEvent({ machineId: machine.id, uid, tappedAt });
+async function insertSyncedTapDecision({ machine, uid, approved, reason, tappedAt, db }) {
+    const tenantId = machine.tenant_id;
+    const existing = await findExactTapByEvent({ machineId: machine.id, uid, tappedAt, tenantId, db });
     if (existing) return existing.id;
 
-    const card = await fetchCardContext(uid);
+    const card = await fetchCardContext(uid, db, tenantId);
     const employeeId = card?.employee_id || null;
 
     if (!approved) {
         const denyReason = normalizeSyncedReason(reason) || 'card_unknown';
-        const result = await pool.query(
+        const result = await db.query(
             `INSERT INTO taps
-                (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
-             VALUES ($1, $2, $3, false, $4, false, $5)
+                (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at, tenant_id)
+             VALUES ($1, $2, $3, false, $4, false, $5, $6)
              RETURNING id`,
-            [uid, machine.id, employeeId, denyReason, tappedAt]
+            [uid, machine.id, employeeId, denyReason, tappedAt, tenantId]
         );
         return result.rows[0]?.id;
     }
 
     let overLimit = false;
     if (employeeId) {
-        const countBefore = await countApprovedBeforeTap(employeeId, tappedAt);
+        const countBefore = await countApprovedBeforeTap(employeeId, tappedAt, tenantId, db);
         overLimit = shouldMarkOverLimit({
             dailyLimit: card.daily_limit,
             mode: card.daily_limit_mode,
@@ -164,48 +169,49 @@ async function insertSyncedTapDecision({ machine, uid, approved, reason, tappedA
         });
     }
 
-    const result = await pool.query(
+    const result = await db.query(
         `INSERT INTO taps
-            (nfc_uid, machine_id, employee_id, approved, confirmed, over_limit, tapped_at)
-         VALUES ($1, $2, $3, true, NULL, $4, $5)
+            (nfc_uid, machine_id, employee_id, approved, confirmed, over_limit, tapped_at, tenant_id)
+         VALUES ($1, $2, $3, true, NULL, $4, $5, $6)
          RETURNING id`,
-        [uid, machine.id, employeeId, overLimit, tappedAt]
+        [uid, machine.id, employeeId, overLimit, tappedAt, tenantId]
     );
     return result.rows[0]?.id;
 }
 
-async function upsertVendResult({ machine, uid, vendSuccess, itemId, amount, tappedAt }) {
-    const pendingTap = await findPendingApprovedTap({ machineId: machine.id, uid, tappedAt });
+async function upsertVendResult({ machine, uid, vendSuccess, itemId, amount, tappedAt, db }) {
+    const tenantId = machine.tenant_id;
+    const pendingTap = await findPendingApprovedTap({ machineId: machine.id, uid, tappedAt, tenantId, db });
 
     if (pendingTap) {
         if (vendSuccess) {
-            const result = await pool.query(
+            const result = await db.query(
                 `UPDATE taps
                  SET confirmed = true, item_id = $1, amount_cents = $2
-                 WHERE id = $3
+                 WHERE id = $3 AND tenant_id = $4
                  RETURNING id, item_id, amount_cents`,
-                [itemId || null, amount || null, pendingTap.id]
+                [itemId || null, amount || null, pendingTap.id, tenantId]
             );
             return { tap: result.rows[0] || null, created: false, success: true };
         }
 
-        const result = await pool.query(
+        const result = await db.query(
             `UPDATE taps
              SET confirmed = false, approved = false, deny_reason = 'vend_cancelled'
-             WHERE id = $1
+             WHERE id = $1 AND tenant_id = $2
              RETURNING id`,
-            [pendingTap.id]
+            [pendingTap.id, tenantId]
         );
         return { tap: result.rows[0] || null, created: false, success: false };
     }
 
-    const card = await fetchCardContext(uid);
+    const card = await fetchCardContext(uid, db, tenantId);
     const employeeId = card?.employee_id || null;
 
     if (vendSuccess) {
         let overLimit = false;
         if (employeeId) {
-            const countBefore = await countApprovedBeforeTap(employeeId, tappedAt);
+            const countBefore = await countApprovedBeforeTap(employeeId, tappedAt, tenantId, db);
             overLimit = shouldMarkOverLimit({
                 dailyLimit: card.daily_limit,
                 mode: card.daily_limit_mode,
@@ -213,23 +219,23 @@ async function upsertVendResult({ machine, uid, vendSuccess, itemId, amount, tap
             });
         }
 
-        const result = await pool.query(
+        const result = await db.query(
             `INSERT INTO taps
                 (nfc_uid, machine_id, employee_id, approved, confirmed,
-                 item_id, amount_cents, over_limit, tapped_at)
-             VALUES ($1, $2, $3, true, true, $4, $5, $6, $7)
+                 item_id, amount_cents, over_limit, tapped_at, tenant_id)
+             VALUES ($1, $2, $3, true, true, $4, $5, $6, $7, $8)
              RETURNING id, item_id, amount_cents`,
-            [uid, machine.id, employeeId, itemId || null, amount || null, overLimit, tappedAt]
+            [uid, machine.id, employeeId, itemId || null, amount || null, overLimit, tappedAt, tenantId]
         );
         return { tap: result.rows[0] || null, created: true, success: true };
     }
 
-    const result = await pool.query(
+    const result = await db.query(
         `INSERT INTO taps
-            (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at)
-         VALUES ($1, $2, $3, false, 'vend_cancelled', false, $4)
+            (nfc_uid, machine_id, employee_id, approved, deny_reason, confirmed, tapped_at, tenant_id)
+         VALUES ($1, $2, $3, false, 'vend_cancelled', false, $4, $5)
          RETURNING id`,
-        [uid, machine.id, employeeId, tappedAt]
+        [uid, machine.id, employeeId, tappedAt, tenantId]
     );
     return { tap: result.rows[0] || null, created: true, success: false };
 }
@@ -251,7 +257,7 @@ router.post('/', async (req, res) => {
 
     try {
         // ── 1. Buscar la tarjeta NFC ────────────────────────
-        const cardResult = await pool.query(
+        const cardResult = await req.db.query(
             `SELECT nc.id, nc.employee_id, nc.active AS card_active,
                     COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) AS card_status,
                     e.name, e.department, e.active,
@@ -262,14 +268,14 @@ router.post('/', async (req, res) => {
                     ${effectivePolicy.warningEnabled} AS warning_enabled,
                     ${effectivePolicy.source} AS policy_source
              FROM nfc_cards nc
-             JOIN employees e ON e.id = nc.employee_id
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
-             WHERE nc.uid = $1`,
-            [uid]
+             JOIN employees e ON e.id = nc.employee_id AND e.tenant_id = $2
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $2
+             WHERE nc.uid = $1 AND nc.tenant_id = $2`,
+            [uid, req.machine.tenant_id]
         );
 
         if (cardResult.rowCount === 0) {
-            await logTap({ uid, machine, approved: false, reason: 'card_unknown' });
+            await logTap({ uid, machine, approved: false, reason: 'card_unknown', db: req.db });
             console.log(`[TAP] UID desconocido: ${uid}`);
             broadcast({ event: 'card_unknown', uid, machine: machine.name, machine_id: machine.id });
             return res.status(403).json({ error: 'Tarjeta no registrada', reason: 'card_unknown' });
@@ -290,38 +296,39 @@ router.post('/', async (req, res) => {
         const resolvedCardStatus = normalizedCardStatus({ card_active, card_status });
 
         if (resolvedCardStatus === 'lost') {
-            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_lost' });
+            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_lost', db: req.db });
             broadcast({ event: 'tap_denied', uid, employee: name, employee_id, department, machine: machine.name, reason: 'card_lost' });
             return res.status(403).json({ error: 'TAG reportado como perdido', reason: 'card_lost' });
         }
 
         if (!card_active || resolvedCardStatus !== 'active') {
-            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_inactive' });
+            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'card_inactive', db: req.db });
             broadcast({ event: 'tap_denied', uid, employee: name, employee_id, department, machine: machine.name, reason: 'card_inactive' });
             return res.status(403).json({ error: 'TAG desactivado', reason: 'card_inactive' });
         }
 
         if (!active) {
-            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'inactive' });
+            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'inactive', db: req.db });
             return res.status(403).json({ error: 'Empleado inactivo', reason: 'inactive' });
         }
 
         // ── 2. Contar consumo de hoy ─────────────────────────
         const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
-        const countResult = await pool.query(
+        const countResult = await req.db.query(
             `SELECT COUNT(*) AS taps_today
              FROM taps
              WHERE employee_id = $1
                AND approved    = true
-               AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}`,
-            [employee_id, timeZone, businessDate]
+               AND ${buildBusinessDayRangeSql('tapped_at', 2, 3)}
+               AND tenant_id   = $4`,
+            [employee_id, timeZone, businessDate, req.machine.tenant_id]
         );
 
         const tapsToday = parseInt(countResult.rows[0].taps_today, 10);
 
         // ── 3. Verificar límite ──────────────────────────────
         if (isLimitReached({ dailyLimit: daily_limit, mode: daily_limit_mode, tapsToday })) {
-            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'limit_reached' });
+            await logTap({ uid, machine, employeeId: employee_id, approved: false, reason: 'limit_reached', db: req.db });
 
             console.log(`[TAP] DENEGADO — ${name} (${tapsToday}/${daily_limit} hoy)`);
 
@@ -333,7 +340,8 @@ router.post('/', async (req, res) => {
                 dailyLimit: daily_limit,
                 tapsToday,
                 machineName: machine.name,
-                uid
+                uid,
+                tenantId: req.machine.tenant_id
             }).catch(err => console.error('[ALERT] Error alerta empleado bloqueado:', err.message));
 
             return res.status(403).json({
@@ -356,12 +364,13 @@ router.post('/', async (req, res) => {
                 dailyLimit: daily_limit,
                 mode: daily_limit_mode,
                 tapsBefore: tapsToday
-            })
+            }),
+            db: req.db
         });
 
         console.log(`[TAP] APROBADO — ${name} (${tapsToday + 1}/${daily_limit} hoy)`);
 
-        const warningLead = await alerts.getEmployeeLimitWarningLead();
+        const warningLead = await alerts.getEmployeeLimitWarningLead(req.machine.tenant_id);
         if (warning_enabled && shouldWarnAfterApproval({
             dailyLimit: daily_limit,
             mode: daily_limit_mode,
@@ -373,7 +382,8 @@ router.post('/', async (req, res) => {
                 dailyLimit: daily_limit,
                 tapsToday: tapsToday + 1,
                 machineName: machine.name,
-                uid
+                uid,
+                tenantId: req.machine.tenant_id
             }).catch(err => console.error('[ALERT] Error alerta de advertencia:', err.message));
         }
 
@@ -427,7 +437,8 @@ router.post('/result', async (req, res) => {
             vendSuccess: !!vend_success,
             itemId: item_id,
             amount,
-            tappedAt
+            tappedAt,
+            db: req.db
         });
 
         if (vend_success && outcome.tap) {
@@ -479,29 +490,26 @@ router.post('/result', async (req, res) => {
 router.post('/reconcile', async (req, res) => {
     const machine = req.machine;
     const startedAt = Date.now();
-    const client = await pool.connect();
 
     console.log(`[RECONCILE] START machine=${machine.name} id=${machine.id}`);
     try {
-        await client.query('BEGIN');
-        await client.query(`SET LOCAL lock_timeout = '1000ms'`);
-        await client.query(`SET LOCAL statement_timeout = '2500ms'`);
+        await req.db.query(`SET LOCAL lock_timeout = '1000ms'`);
+        await req.db.query(`SET LOCAL statement_timeout = '2500ms'`);
         console.log(`[RECONCILE] QUERY machine=${machine.name} id=${machine.id}`);
 
-        const result = await client.query(
+        const result = await req.db.query(
             `UPDATE taps
              SET confirmed = false, approved = false
              WHERE machine_id = $1
+               AND tenant_id  = $2
                AND approved   = true
                AND confirmed  IS NULL
                AND tapped_at  < NOW() - INTERVAL '2 minutes'
              RETURNING id`,
-            [machine.id]
+            [machine.id, machine.tenant_id]
         );
         const count = result.rowCount;
         console.log(`[RECONCILE] QUERY OK machine=${machine.name} id=${machine.id} rows=${count} after=${Date.now() - startedAt}ms`);
-        await client.query('COMMIT');
-        console.log(`[RECONCILE] COMMIT machine=${machine.name} id=${machine.id} after=${Date.now() - startedAt}ms`);
 
         if (count > 0) {
             console.log(`[RECONCILE] Máquina ${machine.name}: ${count} tap(s) huérfano(s) revertido(s) al boot`);
@@ -509,15 +517,12 @@ router.post('/reconcile', async (req, res) => {
         }
         res.status(200).json({ ok: true, reverted: count });
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
         console.error(`[RECONCILE] Error machine=${machine.name} id=${machine.id} after=${Date.now() - startedAt}ms code=${err.code || '-'} message=${err.message}`);
 
         if (err.code === '55P03' || err.code === '57014') {
             return res.status(503).json({ error: 'reconcile_timeout' });
         }
         res.status(500).json({ error: 'Error interno' });
-    } finally {
-        client.release();
     }
 });
 
@@ -553,7 +558,8 @@ router.post('/decisions', require('../middleware/machineAuth'), async (req, res)
                 uid: upperUid,
                 approved: !!approved,
                 reason,
-                tappedAt
+                tappedAt,
+                db: req.db
             });
 
             if (!approved) {
@@ -583,7 +589,7 @@ router.post('/decisions', require('../middleware/machineAuth'), async (req, res)
 router.get('/cards', require('../middleware/machineAuth'), async (req, res) => {
     try {
         const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 nc.uid,
                 ${effectivePolicy.dailyLimit} AS daily_limit,
@@ -593,17 +599,18 @@ router.get('/cards', require('../middleware/machineAuth'), async (req, res) => {
                       AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
                 ), 0)::int AS used_today
              FROM nfc_cards nc
-             JOIN employees e ON e.id = nc.employee_id
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
+             JOIN employees e ON e.id = nc.employee_id AND e.tenant_id = $3
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $3
              LEFT JOIN taps t ON t.employee_id = nc.employee_id
              WHERE nc.active = true
+               AND nc.tenant_id = $3
                AND COALESCE(nc.status, CASE WHEN nc.active THEN 'active' ELSE 'inactive' END) = 'active'
                AND e.active = true
              GROUP BY nc.uid, e.id, al.id`
             ,
-            [timeZone, businessDate]
+            [timeZone, businessDate, req.machine.tenant_id]
         );
-        const resetResult = await pool.query(
+        const resetResult = await req.db.query(
             `SELECT EXTRACT(EPOCH FROM ((($2::date + INTERVAL '1 day')::timestamp) AT TIME ZONE $1))::bigint AS next_reset_at`,
             [timeZone, businessDate]
         );
@@ -656,7 +663,8 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
                 vendSuccess: !!ok,
                 itemId: item_id,
                 amount,
-                tappedAt
+                tappedAt,
+                db: req.db
             });
 
             if (ok && outcome.tap) {
@@ -680,12 +688,12 @@ router.post('/queue', require('../middleware/machineAuth'), async (req, res) => 
 });
 
 // ── Helper: insertar registro en taps ────────────────
-async function logTap({ uid, machine, employeeId, approved, reason, overLimit = false }) {
-    const result = await pool.query(
-        `INSERT INTO taps (nfc_uid, machine_id, employee_id, approved, deny_reason, over_limit)
-         VALUES ($1, $2, $3, $4, $5, $6)
+async function logTap({ uid, machine, employeeId, approved, reason, overLimit = false, db }) {
+    const result = await db.query(
+        `INSERT INTO taps (nfc_uid, machine_id, employee_id, approved, deny_reason, over_limit, tenant_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id`,
-        [uid, machine.id, employeeId || null, approved, reason || null, overLimit]
+        [uid, machine.id, employeeId || null, approved, reason || null, overLimit, machine.tenant_id]
     );
     return result.rows[0]?.id;
 }

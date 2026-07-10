@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db/pool');
+const bootstrapPool = require('../db/bootstrapPool');
 const { broadcast } = require('../ws');
 const {
     requireManager,
@@ -292,15 +293,16 @@ function buildReportedMachineTechnicalConfig(machine, body = {}) {
     return reported;
 }
 
-async function bumpMachineTechnicalConfigVersion(client, machineId, baseVersion, source = 'backend') {
+async function bumpMachineTechnicalConfigVersion(client, machineId, baseVersion, machineTenantId, source = 'backend') {
     const result = await client.query(
         `UPDATE machines
          SET technical_config_version = GREATEST(COALESCE(technical_config_version, 1), $2) + 1,
              technical_config_source = $3,
              technical_config_updated_at = NOW()
          WHERE id = $1
+           AND tenant_id = $4
          RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
-        [machineId, Math.max(1, Number(baseVersion) || 1), normalizeConfigSource(source, 'backend')]
+        [machineId, Math.max(1, Number(baseVersion) || 1), normalizeConfigSource(source, 'backend'), machineTenantId]
     );
     return result.rows[0] || null;
 }
@@ -310,14 +312,15 @@ async function syncMachineTechnicalConfig({ req, previousMachine, updatedMachine
         return 'unchanged';
     }
 
-    const existing = await pool.query(
+    const existing = await req.db.query(
         `SELECT id
          FROM machine_commands
          WHERE machine_id = $1
+           AND tenant_id = $2
            AND status = 'queued'
          ORDER BY queued_at DESC
          LIMIT 1`,
-        [updatedMachine.id]
+        [updatedMachine.id, req.user.tenant_id]
     );
 
     if (existing.rowCount > 0) {
@@ -329,11 +332,13 @@ async function syncMachineTechnicalConfig({ req, previousMachine, updatedMachine
     }
 
     await queueMachineCommand({
+        db: req.db,
         machineId: updatedMachine.id,
         machineName: updatedMachine.name,
         commandType: 'config_update',
         payload: buildMachineTechnicalConfig(updatedMachine),
-        req
+        req,
+        tenantId: req.user.tenant_id
     });
     return 'queued';
 }
@@ -429,12 +434,13 @@ function buildFirmwareCommandPayload(release) {
     };
 }
 
-async function getFirmwareReleaseById(releaseId) {
-    const result = await pool.query(
+async function getFirmwareReleaseById(db, tenantId, releaseId) {
+    const result = await db.query(
         `SELECT id, version, filename, size_bytes, md5, notes, created_at, created_by_username
          FROM firmware_releases
-         WHERE id = $1`,
-        [releaseId]
+         WHERE id = $1
+           AND tenant_id = $2`,
+        [releaseId, tenantId]
     );
     return result.rows[0] || null;
 }
@@ -443,12 +449,12 @@ function otaCanQueueAfterRegister(status) {
     return ['queued', 'in_progress', 'pending_reconnect'].includes(status || 'idle');
 }
 
-async function queueMachineCommand({ machineId, machineName, commandType, payload, req }) {
-    const insertResult = await pool.query(
-        `INSERT INTO machine_commands(machine_id, command_type, payload)
-         VALUES ($1, $2, $3::jsonb)
+async function queueMachineCommand({ db, machineId, machineName, commandType, payload, req, tenantId }) {
+    const insertResult = await db.query(
+        `INSERT INTO machine_commands(machine_id, command_type, payload, tenant_id)
+         VALUES ($1, $2, $3::jsonb, $4)
          RETURNING id, machine_id, command_type, payload, status, queued_at`,
-        [machineId, commandType, JSON.stringify(payload || {})]
+        [machineId, commandType, JSON.stringify(payload || {}), tenantId]
     );
 
     if (req) {
@@ -477,44 +483,48 @@ async function queueMachineCommand({ machineId, machineName, commandType, payloa
     return insertResult.rows[0];
 }
 
-async function getActiveMachineById(machineId) {
-    const result = await pool.query(
+async function getActiveMachineById(db, tenantId, machineId) {
+    const result = await db.query(
         `SELECT id, name, location, last_seen
          FROM machines
          WHERE id = $1
+           AND tenant_id = $2
            AND active = true`,
-        [machineId]
+        [machineId, tenantId]
     );
     return result.rows[0] || null;
 }
 
-async function getQueuedMachineCommand(machineId) {
-    const result = await pool.query(
+async function getQueuedMachineCommand(db, tenantId, machineId) {
+    const result = await db.query(
         `SELECT id, command_type, status
          FROM machine_commands
          WHERE machine_id = $1
+           AND tenant_id = $2
            AND status IN ('queued', 'delivered')
          ORDER BY
            CASE WHEN status = 'delivered' THEN 0 ELSE 1 END,
            delivered_at DESC NULLS LAST,
            queued_at DESC
          LIMIT 1`,
-        [machineId]
+        [machineId, tenantId]
     );
     return result.rows[0] || null;
 }
 
-async function queueFirmwareUpdateForMachine({ machine, release, req, statusWhenQueued = 'queued', messageWhenQueued = null }) {
+async function queueFirmwareUpdateForMachine({ machine, release, req, db, tenantId, statusWhenQueued = 'queued', messageWhenQueued = null }) {
     const payload = buildFirmwareCommandPayload(release);
     const queuedCommand = await queueMachineCommand({
+        db,
         machineId: machine.id,
         machineName: machine.name,
         commandType: 'firmware_update',
         payload,
-        req
+        req,
+        tenantId
     });
 
-    await pool.query(
+    await db.query(
         `UPDATE machines
          SET desired_firmware_release_id = $2,
              desired_firmware_version = $3,
@@ -522,44 +532,48 @@ async function queueFirmwareUpdateForMachine({ machine, release, req, statusWhen
              firmware_update_message = $5,
              firmware_update_started_at = NULL,
              firmware_update_completed_at = NULL
-         WHERE id = $1`,
+         WHERE id = $1
+           AND tenant_id = $6`,
         [
             machine.id,
             release.id,
             release.version,
             statusWhenQueued,
-            messageWhenQueued || `Release ${release.version} encolada para OTA`
+            messageWhenQueued || `Release ${release.version} encolada para OTA`,
+            tenantId
         ]
     );
 
     return queuedCommand;
 }
 
-async function maybeQueuePendingFirmwareUpdate(machine) {
+async function maybeQueuePendingFirmwareUpdate(db, tenantId, machine) {
     if (!machine?.desired_firmware_release_id || !machine?.desired_firmware_version) {
         return machine;
     }
 
     const currentVersion = normalizeFirmwareVersion(machine.current_firmware_version);
     if (currentVersion && currentVersion === machine.desired_firmware_version) {
-        await pool.query(
+        await db.query(
             `UPDATE machine_commands
              SET status = 'completed',
                  completed_at = COALESCE(completed_at, NOW()),
                  result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('message', $2::text, 'version', $3::text)
              WHERE machine_id = $1
+               AND tenant_id = $4
                AND command_type = 'firmware_update'
                AND status IN ('queued', 'delivered')`,
-            [machine.id, `Firmware ${currentVersion} activo`, currentVersion]
+            [machine.id, `Firmware ${currentVersion} activo`, currentVersion, tenantId]
         );
-        const synced = await pool.query(
+        const synced = await db.query(
             `UPDATE machines
              SET firmware_update_status = 'success',
                  firmware_update_message = $2,
                  firmware_update_completed_at = NOW()
              WHERE id = $1
+               AND tenant_id = $3
              RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
-            [machine.id, `Firmware ${currentVersion} activo`]
+            [machine.id, `Firmware ${currentVersion} activo`, tenantId]
         );
         return synced.rows[0] || machine;
     }
@@ -568,29 +582,31 @@ async function maybeQueuePendingFirmwareUpdate(machine) {
         return machine;
     }
 
-    const existing = await getQueuedMachineCommand(machine.id);
+    const existing = await getQueuedMachineCommand(db, tenantId, machine.id);
     if (existing) {
-        const pending = await pool.query(
+        const pending = await db.query(
             `UPDATE machines
              SET firmware_update_status = 'pending_reconnect',
                  firmware_update_message = $2
              WHERE id = $1
+               AND tenant_id = $3
              RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
-            [machine.id, `OTA pendiente; hay otro comando remoto en cola (${existing.command_type})`]
+            [machine.id, `OTA pendiente; hay otro comando remoto en cola (${existing.command_type})`, tenantId]
         );
         return pending.rows[0] || machine;
     }
 
-    const release = await getFirmwareReleaseById(machine.desired_firmware_release_id);
+    const release = await getFirmwareReleaseById(db, tenantId, machine.desired_firmware_release_id);
     if (!release) {
-        const failed = await pool.query(
+        const failed = await db.query(
             `UPDATE machines
              SET firmware_update_status = 'failed',
                  firmware_update_message = $2,
                  firmware_update_completed_at = NOW()
              WHERE id = $1
+               AND tenant_id = $3
              RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
-            [machine.id, 'La release OTA deseada ya no existe en backend']
+            [machine.id, 'La release OTA deseada ya no existe en backend', tenantId]
         );
         return failed.rows[0] || machine;
     }
@@ -598,16 +614,19 @@ async function maybeQueuePendingFirmwareUpdate(machine) {
     await queueFirmwareUpdateForMachine({
         machine,
         release,
+        db,
+        tenantId,
         req: null,
         statusWhenQueued: 'queued',
         messageWhenQueued: `Release ${release.version} encolada al reconectarse`
     });
 
-    const refreshed = await pool.query(
+    const refreshed = await db.query(
         `SELECT ${MACHINE_TECH_CONFIG_SELECT}
          FROM machines
-         WHERE id = $1`,
-        [machine.id]
+         WHERE id = $1
+           AND tenant_id = $2`,
+        [machine.id, tenantId]
     );
     return refreshed.rows[0] || machine;
 }
@@ -659,7 +678,11 @@ function normalizeCommandPayload(type, payload) {
     throw new Error('Tipo de comando no soportado');
 }
 
-router.post('/register', async (req, res) => {
+// Separado como función nombrada para exportarlo y montarlo
+// con su propio middleware (resolveTenantFromHost + checkRegistrationSecret)
+// sin pasar por authJwt. Ver server.js. No hay router.post('/register', ...)
+// porque esa ruta se monta explícitamente en server.js (app.post).
+async function registerHandler(req, res) {
     const {
         mac,
         wifi_ssid,
@@ -688,7 +711,7 @@ router.post('/register', async (req, res) => {
     const backendError = normalizeOptionalString(backend_error, 255);
 
     try {
-        const approved = await pool.query(
+        const approved = await bootstrapPool.query(
             `SELECT id, name, ${MACHINE_TECH_CONFIG_SQL}, ${MACHINE_TECH_META_SQL}
              FROM machines
              WHERE mac = $1
@@ -709,7 +732,7 @@ router.post('/register', async (req, res) => {
                 config_version: reportedConfigVersion,
                 config_source: reportedConfigSource
             });
-            const updateResult = await pool.query(
+            const updateResult = await bootstrapPool.query(
                 `UPDATE machines
                  SET last_seen = NOW(),
                     wifi_ssid = COALESCE($2, wifi_ssid),
@@ -731,14 +754,15 @@ router.post('/register', async (req, res) => {
                 .some(field => reportedConfig[field] !== desiredConfig[field]);
             if (deviceMismatch && (reportedConfig.config_version >= desiredConfig.config_version)) {
                 machineState = await bumpMachineTechnicalConfigVersion(
-                    pool,
+                    bootstrapPool,
                     machineState.id,
-                    reportedConfig.config_version,
+                    reportedConfigVersion,
+                    req.tenant_id,
                     'backend'
                 ) || machineState;
             }
-            machineState = await maybeQueuePendingFirmwareUpdate(machineState);
-            alerts.resolveMachineOffline(machineState.id).catch(err => console.error('[ALERT] Error resolviendo offline:', err.message));
+            machineState = await maybeQueuePendingFirmwareUpdate(bootstrapPool, req.tenant_id, machineState);
+            alerts.resolveMachineOffline(machineState.id, req.tenant_id).catch(err => console.error('[ALERT] Error resolviendo offline:', err.message));
             return res.status(200).json({
                 status: 'approved',
                 machine: approved.rows[0].name,
@@ -747,17 +771,20 @@ router.post('/register', async (req, res) => {
             });
         }
 
-        const pending = await pool.query(
+        const pending = await bootstrapPool.query(
             'SELECT id FROM pending_machines WHERE mac = $1',
             [macClean]
         );
 
         if (pending.rowCount > 0) {
-            await pool.query('UPDATE pending_machines SET last_ping = NOW() WHERE mac = $1', [macClean]);
+            await bootstrapPool.query('UPDATE pending_machines SET last_ping = NOW() WHERE mac = $1', [macClean]);
             return res.status(202).json({ status: 'pending' });
         }
 
-        await pool.query('INSERT INTO pending_machines(mac) VALUES ($1)', [macClean]);
+        await bootstrapPool.query(
+            'INSERT INTO pending_machines(mac, tenant_id) VALUES ($1, $2)',
+            [macClean, req.tenant_id]
+        );
         console.log('[REG] Nueva pendiente:', macClean);
         broadcast({ event: 'machine_pending', mac: macClean, message: `Nueva máquina pendiente: ${macClean}` });
         return res.status(202).json({ status: 'pending' });
@@ -765,12 +792,13 @@ router.post('/register', async (req, res) => {
         console.error('[REG] Error:', err.message);
         return res.status(500).json({ error: err.message });
     }
-});
+}
 
 router.get('/pending', requireMachineSetup, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT id, mac, first_seen, last_ping FROM pending_machines WHERE approved = false ORDER BY first_seen DESC'
+        const result = await req.db.query(
+            'SELECT id, mac, first_seen, last_ping FROM pending_machines WHERE approved = false AND tenant_id = $1 ORDER BY first_seen DESC',
+            [req.user.tenant_id]
         );
         res.json({ pending: result.rows });
     } catch (err) {
@@ -784,23 +812,24 @@ router.post('/pending/:id/approve', requireMachineSetup, async (req, res) => {
     const priceCents = normalizePositiveInteger(price_cents) || 1200;
 
     try {
-        const pending = await pool.query(
-            'SELECT id, mac FROM pending_machines WHERE id = $1',
-            [req.params.id]
+        const pending = await req.db.query(
+            'SELECT id, mac, tenant_id FROM pending_machines WHERE id = $1 AND tenant_id = $2',
+            [req.params.id, req.user.tenant_id]
         );
         if (pending.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
 
         const mac = pending.rows[0].mac;
-        const machine = await pool.query(
-            `INSERT INTO machines(name, location, mac, secret, active, price_cents)
-             VALUES ($1, $2, $3, $3, true, $4)
+        const machineTenantId = pending.rows[0].tenant_id;
+        const machine = await req.db.query(
+            `INSERT INTO machines(name, location, mac, secret, active, price_cents, tenant_id)
+             VALUES ($1, $2, $3, $3, true, $4, $5)
              ON CONFLICT(mac) DO UPDATE
-             SET name = $1, location = $2, active = true, price_cents = $4
+             SET name = $1, location = $2, active = true, price_cents = $4, tenant_id = $5
              RETURNING *`,
-            [name.trim(), location?.trim() || null, mac, priceCents]
+            [name.trim(), location?.trim() || null, mac, priceCents, machineTenantId]
         );
 
-        await pool.query('UPDATE pending_machines SET approved = true WHERE id = $1', [req.params.id]);
+        await req.db.query('UPDATE pending_machines SET approved = true WHERE id = $1 AND tenant_id = $2', [req.params.id, machineTenantId]);
         broadcast({ event: 'machine_approved', mac, machine: name });
         await audit.logAuditEvent({
             req,
@@ -824,9 +853,9 @@ router.post('/pending/:id/approve', requireMachineSetup, async (req, res) => {
 
 router.post('/pending/:id/reject', requireMachineSetup, async (req, res) => {
     try {
-        const pending = await pool.query(
-            'DELETE FROM pending_machines WHERE id = $1 RETURNING id, mac',
-            [req.params.id]
+        const pending = await req.db.query(
+            'DELETE FROM pending_machines WHERE id = $1 AND tenant_id = $2 RETURNING id, mac',
+            [req.params.id, req.user.tenant_id]
         );
         if (pending.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         await audit.logAuditEvent({
@@ -848,7 +877,7 @@ router.post('/pending/:id/reject', requireMachineSetup, async (req, res) => {
 
 router.get('/', requireMachineOperator, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM machine_status WHERE active = true ORDER BY id');
+        const result = await req.db.query('SELECT * FROM machine_status WHERE active = true AND tenant_id = $1 ORDER BY id', [req.user.tenant_id]);
         const stockSummaryMap = await stock.getMachineStockSummaryMap(result.rows.map(row => row.id));
         const now = Date.now();
         const machines = result.rows.map(machine => ({
@@ -874,11 +903,11 @@ router.post('/', requireManager, async (req, res) => {
     const priceCents = normalizePositiveInteger(price_cents) || 1200;
 
     try {
-        const result = await pool.query(
-            `INSERT INTO machines(name, location, mac, secret, price_cents)
-             VALUES ($1, $2, $3, $3, $4)
+        const result = await req.db.query(
+            `INSERT INTO machines(name, location, mac, secret, price_cents, tenant_id)
+             VALUES ($1, $2, $3, $3, $4, $5)
              RETURNING *`,
-            [name.trim(), location?.trim() || null, mac.toUpperCase().replace(/[^A-F0-9]/g, ''), priceCents]
+            [name.trim(), location?.trim() || null, mac.toUpperCase().replace(/[^A-F0-9]/g, ''), priceCents, req.user.tenant_id]
         );
         await audit.logAuditEvent({
             req,
@@ -902,11 +931,12 @@ router.post('/', requireManager, async (req, res) => {
 
 router.get('/:id/technical-config', requireMachineTechnicalConfig, async (req, res) => {
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT ${MACHINE_TECH_CONFIG_SELECT}
              FROM machines
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1
+               AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         const machine = result.rows[0];
@@ -933,16 +963,17 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
     }
 
     try {
-        const before = await pool.query(
+        const before = await req.db.query(
             `SELECT ${MACHINE_TECH_CONFIG_SELECT}
              FROM machines
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1
+               AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
 
         const previousMachine = before.rows[0];
-        const result = await pool.query(
+        const result = await req.db.query(
             `UPDATE machines
              SET price_cents = COALESCE($1, price_cents),
                  pricing_profile = COALESCE($2, pricing_profile),
@@ -953,6 +984,7 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
                  mdb_max_response_time = COALESCE($7, mdb_max_response_time),
                  mdb_misc_options = COALESCE($8, mdb_misc_options)
              WHERE id = $9
+               AND tenant_id = $10
              RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
             [
                 patch.price_cents,
@@ -963,16 +995,18 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
                 patch.mdb_decimal_places,
                 patch.mdb_max_response_time,
                 patch.mdb_misc_options,
-                req.params.id
+                req.params.id,
+                req.user.tenant_id
             ]
         );
 
         let updatedMachine = result.rows[0];
         if (machineTechnicalConfigChanged(previousMachine, updatedMachine)) {
             updatedMachine = await bumpMachineTechnicalConfigVersion(
-                pool,
+                req.db,
                 updatedMachine.id,
                 previousMachine.technical_config_version || previousMachine.config_version || 1,
+                req.user.tenant_id,
                 'backend'
             ) || updatedMachine;
         }
@@ -1009,24 +1043,27 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
 
 router.get('/:id/ota', requireMachineTechnicalConfig, async (req, res) => {
     try {
-        const machineResult = await pool.query(
+        const machineResult = await req.db.query(
             `SELECT ${MACHINE_TECH_CONFIG_SELECT}
              FROM machines
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1
+               AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (machineResult.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
 
         const machine = machineResult.rows[0];
         let desiredRelease = null;
         if (machine.desired_firmware_release_id) {
-            desiredRelease = await getFirmwareReleaseById(machine.desired_firmware_release_id);
+            desiredRelease = await getFirmwareReleaseById(req.db, req.user.tenant_id, machine.desired_firmware_release_id);
         }
 
-        const releasesResult = await pool.query(
+        const releasesResult = await req.db.query(
             `SELECT id, version, filename, size_bytes, md5, notes, created_at, created_by_username
              FROM firmware_releases
-             ORDER BY created_at DESC, id DESC`
+             WHERE tenant_id = $1
+             ORDER BY created_at DESC, id DESC`,
+            [req.user.tenant_id]
         );
 
         res.json({
@@ -1053,19 +1090,20 @@ router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) =
     }
 
     try {
-        const machineResult = await pool.query(
+        const machineResult = await req.db.query(
             `SELECT ${MACHINE_TECH_CONFIG_SELECT}
              FROM machines
              WHERE id = $1
+               AND tenant_id = $2
                AND active = true`,
-            [machineId]
+            [machineId, req.user.tenant_id]
         );
         if (machineResult.rowCount === 0) {
             return res.status(404).json({ error: 'No encontrada' });
         }
 
         const machine = machineResult.rows[0];
-        const release = await getFirmwareReleaseById(releaseId);
+        const release = await getFirmwareReleaseById(req.db, req.user.tenant_id, releaseId);
         if (!release) {
             return res.status(404).json({ error: 'Release OTA no encontrada' });
         }
@@ -1074,7 +1112,7 @@ router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) =
             return res.status(409).json({ error: 'La máquina ya reporta esa versión de firmware.' });
         }
 
-        const existing = await getQueuedMachineCommand(machine.id);
+        const existing = await getQueuedMachineCommand(req.db, req.user.tenant_id, machine.id);
         let otaStatus = isMachineOnline(machine.last_seen) ? 'queued' : 'pending_reconnect';
         let otaMessage = isMachineOnline(machine.last_seen)
             ? `Release ${release.version} encolada para OTA`
@@ -1085,7 +1123,7 @@ router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) =
             otaMessage = `Release ${release.version} pendiente; ya existe un comando remoto en cola (${existing.command_type})`;
         }
 
-        await pool.query(
+        await req.db.query(
             `UPDATE machines
              SET desired_firmware_release_id = $2,
                  desired_firmware_version = $3,
@@ -1093,8 +1131,9 @@ router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) =
                  firmware_update_message = $5,
                  firmware_update_started_at = NULL,
                  firmware_update_completed_at = NULL
-             WHERE id = $1`,
-            [machine.id, release.id, release.version, otaStatus, otaMessage]
+             WHERE id = $1
+               AND tenant_id = $6`,
+            [machine.id, release.id, release.version, otaStatus, otaMessage, req.user.tenant_id]
         );
 
         let queuedCommand = null;
@@ -1103,6 +1142,8 @@ router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) =
                 machine,
                 release,
                 req,
+                db: req.db,
+                tenantId: req.user.tenant_id,
                 statusWhenQueued: 'queued',
                 messageWhenQueued: otaMessage
             });
@@ -1122,11 +1163,12 @@ router.post('/:id/ota/deploy', requireMachineTechnicalConfig, async (req, res) =
             }
         });
 
-        const refreshedResult = await pool.query(
+        const refreshedResult = await req.db.query(
             `SELECT ${MACHINE_TECH_CONFIG_SELECT}
              FROM machines
-             WHERE id = $1`,
-            [machine.id]
+             WHERE id = $1
+               AND tenant_id = $2`,
+            [machine.id, req.user.tenant_id]
         );
         const refreshed = refreshedResult.rows[0];
 
@@ -1154,29 +1196,32 @@ router.patch('/:id', requireMachineSetup, async (req, res) => {
         return res.status(400).json({ error: 'price_cents inválido' });
     }
     try {
-        const before = await pool.query(
+        const before = await req.db.query(
             `SELECT ${MACHINE_TECH_CONFIG_SELECT}
              FROM machines
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1
+               AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         const previousMachine = before.rows[0];
-        const result = await pool.query(
+        const result = await req.db.query(
             `UPDATE machines
              SET name = COALESCE($1, name),
                  location = COALESCE($2, location),
                  price_cents = COALESCE($3, price_cents)
              WHERE id = $4
+               AND tenant_id = $5
              RETURNING ${MACHINE_TECH_CONFIG_SELECT}`,
-            [name, location, priceCents, req.params.id]
+            [name, location, priceCents, req.params.id, req.user.tenant_id]
         );
         let updatedMachine = result.rows[0];
         if (machineTechnicalConfigChanged(previousMachine, updatedMachine)) {
             updatedMachine = await bumpMachineTechnicalConfigVersion(
-                pool,
+                req.db,
                 updatedMachine.id,
                 previousMachine.technical_config_version || previousMachine.config_version || 1,
+                req.user.tenant_id,
                 'backend'
             ) || updatedMachine;
         }
@@ -1216,11 +1261,13 @@ router.post('/:id/commands', requireMachineOperator, async (req, res) => {
     try {
         const commandType = String(type || '').trim();
         const normalizedPayload = normalizeCommandPayload(commandType, payload || {});
-        const machineResult = await pool.query(
+        const machineResult = await req.db.query(
             `SELECT id, name, last_seen
              FROM machines
-             WHERE id = $1 AND active = true`,
-            [machineId]
+             WHERE id = $1
+               AND tenant_id = $2
+               AND active = true`,
+            [machineId, req.user.tenant_id]
         );
         if (machineResult.rowCount === 0) {
             return res.status(404).json({ error: 'No encontrada' });
@@ -1231,25 +1278,28 @@ router.post('/:id/commands', requireMachineOperator, async (req, res) => {
             return res.status(409).json({ error: 'La máquina está offline. Los comandos remotos solo se envían a equipos online.' });
         }
 
-        const existing = await pool.query(
+        const existing = await req.db.query(
             `SELECT id
              FROM machine_commands
              WHERE machine_id = $1
+               AND tenant_id = $2
                AND status = 'queued'
              ORDER BY queued_at DESC
              LIMIT 1`,
-            [machineId]
+            [machineId, req.user.tenant_id]
         );
         if (existing.rowCount > 0) {
             return res.status(409).json({ error: 'Ya hay un comando pendiente para esta máquina.' });
         }
 
         const queuedCommand = await queueMachineCommand({
+            db: req.db,
             machineId: machine.id,
             machineName: machine.name,
             commandType,
             payload: normalizedPayload,
-            req
+            req,
+            tenantId: req.user.tenant_id
         });
 
         return res.status(201).json({
@@ -1279,11 +1329,11 @@ router.get('/:id/commands/:commandId', requireMachineOperator, async (req, res) 
     }
 
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT id, machine_id, command_type, payload, status, queued_at, delivered_at, completed_at, result
              FROM machine_commands
-             WHERE id = $1 AND machine_id = $2`,
-            [commandId, machineId]
+             WHERE id = $1 AND machine_id = $2 AND tenant_id = $3`,
+            [commandId, machineId, req.user.tenant_id]
         );
         if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Comando no encontrado' });
@@ -1305,9 +1355,9 @@ router.get('/:id/commands/:commandId', requireMachineOperator, async (req, res) 
 router.post('/:id/block', requireManager, async (req, res) => {
     const { reason } = req.body;
     try {
-        const result = await pool.query(
-            'UPDATE machines SET blocked = true, blocked_reason = $1 WHERE id = $2 RETURNING id, name, blocked_reason',
-            [reason || 'Bloqueada por administrador', req.params.id]
+        const result = await req.db.query(
+            'UPDATE machines SET blocked = true, blocked_reason = $1 WHERE id = $2 AND tenant_id = $3 RETURNING id, name, blocked_reason',
+            [reason || 'Bloqueada por administrador', req.params.id, req.user.tenant_id]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         broadcast({ event: 'machine_blocked', machine_id: parseInt(req.params.id, 10), machine: result.rows[0].name });
@@ -1330,9 +1380,9 @@ router.post('/:id/block', requireManager, async (req, res) => {
 
 router.post('/:id/unblock', requireManager, async (req, res) => {
     try {
-        const result = await pool.query(
-            'UPDATE machines SET blocked = false, blocked_reason = NULL WHERE id = $1 RETURNING id, name',
-            [req.params.id]
+        const result = await req.db.query(
+            'UPDATE machines SET blocked = false, blocked_reason = NULL WHERE id = $1 AND tenant_id = $2 RETURNING id, name',
+            [req.params.id, req.user.tenant_id]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         broadcast({ event: 'machine_unblocked', machine_id: parseInt(req.params.id, 10) });
@@ -1352,9 +1402,9 @@ router.post('/:id/unblock', requireManager, async (req, res) => {
 
 router.delete('/:id', requireManager, async (req, res) => {
     try {
-        const result = await pool.query(
-            'UPDATE machines SET active = false WHERE id = $1 RETURNING id, name, mac, location',
-            [req.params.id]
+        const result = await req.db.query(
+            'UPDATE machines SET active = false WHERE id = $1 AND tenant_id = $2 RETURNING id, name, mac, location',
+            [req.params.id, req.user.tenant_id]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'No encontrada' });
         broadcast({ event: 'machine_deleted', machine_id: parseInt(req.params.id, 10) });
@@ -1382,7 +1432,7 @@ router.get('/:id/stock', requireMachineOperator, async (req, res) => {
         return res.status(400).json({ error: 'ID de máquina inválido' });
     }
     try {
-        const machine = await getActiveMachineById(machineId);
+        const machine = await getActiveMachineById(req.db, req.user.tenant_id, machineId);
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const data = await stock.getMachineStock(machineId);
         return res.json({
@@ -1406,7 +1456,7 @@ router.post('/:id/stock', requireMachineOperator, async (req, res) => {
         return res.status(400).json({ error: 'ID de máquina inválido' });
     }
     try {
-        const machine = await getActiveMachineById(machineId);
+        const machine = await getActiveMachineById(req.db, req.user.tenant_id, machineId);
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const created = await stock.createStockItem({
             machineId,
@@ -1455,7 +1505,7 @@ router.patch('/:id/stock/:stockItemId', requireMachineOperator, async (req, res)
         return res.status(400).json({ error: 'ID inválido' });
     }
     try {
-        const machine = await getActiveMachineById(machineId);
+        const machine = await getActiveMachineById(req.db, req.user.tenant_id, machineId);
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const result = await stock.updateStockItem({
             machineId,
@@ -1506,7 +1556,7 @@ router.post('/:id/stock/:stockItemId/restock', requireMachineOperator, async (re
         return res.status(400).json({ error: 'ID inválido' });
     }
     try {
-        const machine = await getActiveMachineById(machineId);
+        const machine = await getActiveMachineById(req.db, req.user.tenant_id, machineId);
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const result = await stock.restockStockItem({
             machineId,
@@ -1549,7 +1599,7 @@ router.post('/:id/stock/:stockItemId/adjust', requireMachineOperator, async (req
         return res.status(400).json({ error: 'ID inválido' });
     }
     try {
-        const machine = await getActiveMachineById(machineId);
+        const machine = await getActiveMachineById(req.db, req.user.tenant_id, machineId);
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const result = await stock.adjustStockItem({
             machineId,
@@ -1587,7 +1637,7 @@ router.post('/:id/stock/:stockItemId/adjust', requireMachineOperator, async (req
 router.get('/:id/taps', requireManager, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 t.id,
                 e.name AS employee_name,
@@ -1598,10 +1648,11 @@ router.get('/:id/taps', requireManager, async (req, res) => {
                 t.tapped_at
              FROM taps t
              JOIN employees e ON e.id = t.employee_id
+              AND e.tenant_id = $3
              WHERE t.machine_id = $1
              ORDER BY t.tapped_at DESC
              LIMIT $2`,
-            [req.params.id, limit]
+            [req.params.id, limit, req.user.tenant_id]
         );
         res.json({ taps: result.rows });
     } catch (err) {
@@ -1610,3 +1661,4 @@ router.get('/:id/taps', requireManager, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.registerHandler = registerHandler;

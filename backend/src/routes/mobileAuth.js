@@ -18,7 +18,11 @@ router.post('/login', async (req, res) => {
     }
 
     try {
-        const user = await getActiveAdminUserByUsername(username);
+        const tenantId = Number(req.tenant_id);
+        if (!Number.isInteger(tenantId) || tenantId < 1) {
+            return res.status(400).json({ error: 'Tenant no resuelto' });
+        }
+        const user = await getActiveAdminUserByUsername(username, tenantId);
         if (!user) return res.status(401).json({ error: 'Credenciales incorrectas' });
 
         const valid = await verifyAdminPassword(user, password);

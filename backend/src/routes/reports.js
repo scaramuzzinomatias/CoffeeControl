@@ -158,11 +158,14 @@ router.get('/overview', async (req, res) => {
             params,
             column: 'e_filter.access_level_id'
         });
+        params.push(req.user.tenant_id);
+        const tenantIdIdx = params.length;
         const departmentClause = scope.sql
             ? ` AND EXISTS (
                     SELECT 1
                     FROM employees e_filter
                     WHERE e_filter.id = t.employee_id
+                      AND e_filter.tenant_id = $${tenantIdIdx}
                       ${scope.sql}
                       ${accessLevel.sql}
                 )`
@@ -171,10 +174,11 @@ router.get('/overview', async (req, res) => {
                         SELECT 1
                         FROM employees e_filter
                         WHERE e_filter.id = t.employee_id
+                          AND e_filter.tenant_id = $${tenantIdIdx}
                           ${accessLevel.sql}
                     )`
                 : '';
-        const summaryResult = await pool.query(
+        const summaryResult = await req.db.query(
             `SELECT
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS approved_taps,
                 COUNT(t.id) FILTER (WHERE t.approved = false) AS denied_taps,
@@ -184,11 +188,12 @@ router.get('/overview', async (req, res) => {
                 COUNT(DISTINCT t.employee_id) FILTER (WHERE t.approved = true) AS employees_with_sales
              FROM taps t
              WHERE ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
+               AND t.tenant_id = $${tenantIdIdx}
                ${departmentClause}`,
             params
         );
 
-        const seriesResult = await pool.query(
+        const seriesResult = await req.db.query(
             `WITH days AS (
                 SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS business_day
              )
@@ -237,7 +242,8 @@ router.get('/machines', async (req, res) => {
             params,
             column: 'e_filter.access_level_id'
         });
-        const result = await pool.query(
+        params.push(req.user.tenant_id);
+        const result = await req.db.query(
             `SELECT
                 m.id,
                 m.name,
@@ -252,7 +258,9 @@ router.get('/machines', async (req, res) => {
                ON t.machine_id = m.id
               AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              LEFT JOIN employees e_filter ON e_filter.id = t.employee_id
+              AND e_filter.tenant_id = $${params.length}
              WHERE m.active = true
+               AND m.tenant_id = $${params.length}
                ${scope.sql}
                ${accessLevel.sql}
              GROUP BY m.id, m.name, m.location
@@ -289,7 +297,7 @@ router.get('/machines/:id/employees', async (req, res) => {
             params,
             column: 'e.access_level_id'
         });
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 e.id,
                 e.name AS employee_name,
@@ -304,15 +312,16 @@ router.get('/machines/:id/employees', async (req, res) => {
                 COUNT(t.id) FILTER (WHERE t.approved = false) AS denied_taps,
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents
              FROM taps t
-             JOIN employees e ON e.id = t.employee_id
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
+             JOIN employees e ON e.id = t.employee_id AND e.tenant_id = $${params.length + 1}
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${params.length + 1}
              WHERE t.machine_id = $1
+               AND t.tenant_id = $${params.length + 1}
                AND ${buildBusinessDateRangeSql('t.tapped_at', 2, 3, 4)}
                ${scope.sql}
                ${accessLevel.sql}
              GROUP BY e.id, al.id
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
-            params
+            params.concat([req.user.tenant_id])
         );
         return res.json({
             ...reportMeta(range),
@@ -347,6 +356,7 @@ router.get('/employees', async (req, res) => {
         });
         if (scope.sql) whereClauses.push(scope.sql.replace(/^ AND /, ''));
         if (accessLevel.sql) whereClauses.push(accessLevel.sql.replace(/^ AND /, ''));
+        whereClauses.push(`e.tenant_id = $${params.length + 1}`);
         if (employeeSearch) {
             params.push(`%${employeeSearch}%`);
             whereClauses.push(`(
@@ -358,7 +368,7 @@ router.get('/employees', async (req, res) => {
             )`);
         }
 
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 e.id,
                 e.name,
@@ -376,14 +386,14 @@ router.get('/employees', async (req, res) => {
                 COUNT(DISTINCT t.machine_id) FILTER (WHERE t.approved = true) AS machines_count,
                 MAX(t.tapped_at) AS last_tap_at
              FROM employees e
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${params.length + 1}
              LEFT JOIN taps t
                ON t.employee_id = e.id
                AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              WHERE ${whereClauses.join(' AND ')}
              GROUP BY e.id, al.id
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
-            params
+            params.concat([req.user.tenant_id])
         );
 
         return res.json({
@@ -416,7 +426,8 @@ router.get('/employees/:id/machines', async (req, res) => {
             params,
             column: 'e.access_level_id'
         });
-        const result = await pool.query(
+        params.push(req.user.tenant_id);
+        const result = await req.db.query(
             `SELECT
                 m.id,
                 m.name AS machine_name,
@@ -427,8 +438,11 @@ router.get('/employees/:id/machines', async (req, res) => {
                 MAX(t.tapped_at) AS last_tap_at
              FROM taps t
              JOIN employees e ON e.id = t.employee_id
+              AND e.tenant_id = $${params.length}
              JOIN machines m ON m.id = t.machine_id
+              AND m.tenant_id = $${params.length}
              WHERE t.employee_id = $1
+               AND t.tenant_id = $${params.length}
                AND ${buildBusinessDateRangeSql('t.tapped_at', 2, 3, 4)}
                ${scope.sql}
                ${accessLevel.sql}
@@ -468,7 +482,9 @@ router.get('/departments', async (req, res) => {
         });
         if (scope.sql) whereClauses.push(scope.sql.replace(/^ AND /, ''));
         if (accessLevel.sql) whereClauses.push(accessLevel.sql.replace(/^ AND /, ''));
-        const result = await pool.query(
+        params.push(req.user.tenant_id);
+        const tenantIdIdx = params.length;
+        const result = await req.db.query(
             `SELECT
                 COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área') AS department,
                 COUNT(t.id) FILTER (WHERE t.approved = true) AS taps_count,
@@ -479,8 +495,10 @@ router.get('/departments', async (req, res) => {
              FROM employees e
              LEFT JOIN taps t
                ON t.employee_id = e.id
+               AND t.tenant_id = $${tenantIdIdx}
                AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              WHERE ${whereClauses.join(' AND ')}
+               AND e.tenant_id = $${tenantIdIdx}
              GROUP BY COALESCE(NULLIF(TRIM(e.department), ''), 'Sin área')
              ORDER BY spent_cents DESC, taps_count DESC, department`,
             params
@@ -531,8 +549,21 @@ router.get('/recent-taps', async (req, res) => {
             clauses.push(`t.employee_id = $${params.length}`);
         }
 
+        // ═══════════════════════════════════════════════════════
+        //  Los índices se capturan en variables inmediatamente
+        //  después de cada push() y se usan explícitamente en el
+        //  template literal. NO se lee params.length dentro del
+        //  SQL porque el template se evalúa una sola vez: dos
+        //  lecturas de params.length darían el mismo valor,
+        //  haciendo que dos placeholders $N apunten al mismo
+        //  parámetro — bug de indexado cross-tenant.
+        // ═══════════════════════════════════════════════════════
+        params.push(req.user.tenant_id);
+        const tenantIdIdx = params.length;
         params.push(limit);
-        const result = await pool.query(
+        const limitIdx = params.length;
+
+        const result = await req.db.query(
             `SELECT
                 t.id,
                 t.nfc_uid,
@@ -548,12 +579,13 @@ router.get('/recent-taps', async (req, res) => {
                 m.name AS machine_name,
                 m.location
              FROM taps t
-             LEFT JOIN employees e ON e.id = t.employee_id
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
-             JOIN machines m ON m.id = t.machine_id
+             LEFT JOIN employees e ON e.id = t.employee_id AND e.tenant_id = $${tenantIdIdx}
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${tenantIdIdx}
+             JOIN machines m ON m.id = t.machine_id AND m.tenant_id = $${tenantIdIdx}
              WHERE ${clauses.join(' AND ')}
+               AND t.tenant_id = $${tenantIdIdx}
              ORDER BY t.tapped_at DESC
-             LIMIT $${params.length}`,
+             LIMIT $${limitIdx}`,
             params
         );
 

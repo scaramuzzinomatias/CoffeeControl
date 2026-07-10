@@ -23,16 +23,17 @@ function normalizeOptionalBoolean(value) {
     return null;
 }
 
-async function fetchAccessLevelById(id) {
-    return pool.query(
+// NOTA: el filtro al.tenant_id será redundante cuando RLS de access_levels esté activo
+async function fetchAccessLevelById(db, id, tenantId) {
+    return db.query(
         `SELECT
             al.*,
             COUNT(e.id)::int AS employees_count
          FROM access_levels al
          LEFT JOIN employees e ON e.access_level_id = al.id AND e.active = true
-         WHERE al.id = $1
+         WHERE al.id = $1 AND al.tenant_id = $2
          GROUP BY al.id`,
-        [id]
+        [id, tenantId]
     );
 }
 
@@ -40,15 +41,16 @@ router.get('/', requireAnalyticsViewer, async (req, res) => {
     try {
         const includeInactive = isManagerRole(req.user?.role)
             && String(req.query.include_inactive || '').trim().toLowerCase() === 'true';
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 al.*,
                 COUNT(e.id)::int AS employees_count
              FROM access_levels al
              LEFT JOIN employees e ON e.access_level_id = al.id AND e.active = true
-             ${includeInactive ? '' : 'WHERE al.active = true'}
+             WHERE al.tenant_id = $1${includeInactive ? '' : ' AND al.active = true'}
              GROUP BY al.id
-             ORDER BY al.active DESC, al.sort_order ASC, LOWER(al.name) ASC, al.id ASC`
+             ORDER BY al.active DESC, al.sort_order ASC, LOWER(al.name) ASC, al.id ASC`,
+            [req.user.tenant_id]
         );
         res.json({ access_levels: result.rows });
     } catch (err) {
@@ -70,7 +72,7 @@ router.post('/', requireManager, async (req, res) => {
         const sortOrder = normalizeAccessLevelSortOrder(req.body.sort_order, 100);
         const active = normalizeOptionalBoolean(req.body.active);
 
-        const result = await pool.query(
+        const result = await req.db.query(
             `INSERT INTO access_levels(
                 code,
                 name,
@@ -80,9 +82,10 @@ router.post('/', requireManager, async (req, res) => {
                 warning_enabled,
                 sort_order,
                 active,
+                tenant_id,
                 updated_at
             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
              RETURNING *`,
             [
                 code,
@@ -92,11 +95,12 @@ router.post('/', requireManager, async (req, res) => {
                 dailyLimitMode,
                 warningEnabled === null ? true : warningEnabled,
                 sortOrder,
-                active === null ? true : active
+                active === null ? true : active,
+                req.user.tenant_id
             ]
         );
 
-        const created = (await fetchAccessLevelById(result.rows[0].id)).rows[0];
+        const created = (await fetchAccessLevelById(req.db, result.rows[0].id, req.user.tenant_id)).rows[0];
         await audit.logAuditEvent({
             req,
             action: 'access_level.create',
@@ -124,7 +128,7 @@ router.post('/', requireManager, async (req, res) => {
 
 router.patch('/:id', requireManager, async (req, res) => {
     try {
-        const beforeResult = await fetchAccessLevelById(req.params.id);
+        const beforeResult = await fetchAccessLevelById(req.db, req.params.id, req.user.tenant_id);
         if (beforeResult.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
         const before = beforeResult.rows[0];
 
@@ -183,15 +187,15 @@ router.patch('/:id', requireManager, async (req, res) => {
             return res.json({ access_level: before });
         }
 
-        values.push(req.params.id);
-        await pool.query(
+        values.push(req.params.id, req.user.tenant_id);
+        await req.db.query(
             `UPDATE access_levels
              SET ${updates.join(', ')}, updated_at = NOW()
-             WHERE id = $${values.length}`,
+             WHERE id = $${values.length - 1} AND tenant_id = $${values.length}`,
             values
         );
 
-        const after = (await fetchAccessLevelById(req.params.id)).rows[0];
+        const after = (await fetchAccessLevelById(req.db, req.params.id, req.user.tenant_id)).rows[0];
         await audit.logAuditEvent({
             req,
             action: after.active === false && before.active !== false
@@ -226,18 +230,18 @@ router.patch('/:id', requireManager, async (req, res) => {
 
 router.delete('/:id', requireManager, async (req, res) => {
     try {
-        const beforeResult = await fetchAccessLevelById(req.params.id);
+        const beforeResult = await fetchAccessLevelById(req.db, req.params.id, req.user.tenant_id);
         if (beforeResult.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
         const before = beforeResult.rows[0];
 
-        await pool.query(
+        await req.db.query(
             `UPDATE access_levels
              SET active = false, updated_at = NOW()
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1 AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
 
-        const after = (await fetchAccessLevelById(req.params.id)).rows[0];
+        const after = (await fetchAccessLevelById(req.db, req.params.id, req.user.tenant_id)).rows[0];
         await audit.logAuditEvent({
             req,
             action: 'access_level.deactivate',

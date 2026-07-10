@@ -45,12 +45,14 @@ function serializeRelease(row) {
     };
 }
 
-router.get('/releases', requireMachineTechnicalConfig, async (_req, res) => {
+router.get('/releases', requireMachineTechnicalConfig, async (req, res) => {
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT id, version, filename, size_bytes, md5, notes, created_at, created_by_username
              FROM firmware_releases
-             ORDER BY created_at DESC, id DESC`
+             WHERE tenant_id = $1
+             ORDER BY created_at DESC, id DESC`,
+            [req.user.tenant_id]
         );
         return res.json({ releases: result.rows.map(serializeRelease) });
     } catch (err) {
@@ -91,8 +93,9 @@ router.post(
 
         try {
             fs.writeFileSync(targetPath, binary);
-            const insert = await pool.query(
+            const insert = await req.db.query(
                 `INSERT INTO firmware_releases(
+                    tenant_id,
                     version,
                     filename,
                     storage_path,
@@ -103,9 +106,10 @@ router.post(
                     created_by_user_id,
                     created_by_username
                  )
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  RETURNING id, version, filename, size_bytes, md5, notes, created_at, created_by_username`,
                 [
+                    req.user.tenant_id,
                     version,
                     filename,
                     storageName,
