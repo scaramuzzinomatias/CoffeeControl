@@ -11,7 +11,7 @@ const backendRoot = path.join(__dirname, '..');
 dotenv.config({ path: path.join(backendRoot, '.env') });
 
 const TEST_PORT = 3101;
-const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
+const BASE_URL = `http://legacy.localhost:${TEST_PORT}`;
 const TEST_PREFIX = `itest_${Date.now()}`;
 
 let serverProcess = null;
@@ -70,7 +70,7 @@ async function waitForHealth() {
 }
 
 async function withDb(callback) {
-    const client = new Client({ connectionString: process.env.DATABASE_URL });
+    const client = new Client({ connectionString: process.env.DATABASE_URL_OWNER });
     await client.connect();
     try {
         return await callback(client);
@@ -1855,3 +1855,4 @@ test('cuenta protegida no puede cambiar su contraseña desde el panel', async ()
     assert.equal(response.status, 403);
     assert.match(response.json.error, /soporte local/i);
 });
+
