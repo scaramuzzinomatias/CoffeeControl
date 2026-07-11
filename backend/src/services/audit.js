@@ -72,9 +72,10 @@ async function logAuditEvent({
                 entity_id,
                 entity_label,
                 summary,
-                details
+                details,
+                tenant_id
             )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)`,
             [
                 actor.id,
                 actor.username || null,
@@ -86,7 +87,8 @@ async function logAuditEvent({
                 entityId === null || entityId === undefined ? null : String(entityId),
                 entityLabel || null,
                 summary,
-                cleanDetails ? JSON.stringify(cleanDetails) : null
+                cleanDetails ? JSON.stringify(cleanDetails) : null,
+                actor.tenant_id
             ]
         );
     } catch (err) {
@@ -94,9 +96,9 @@ async function logAuditEvent({
     }
 }
 
-async function getAuditLogs({ entityType, action, q, limit = 200 } = {}) {
-    const clauses = [];
-    const params = [];
+async function getAuditLogs({ entityType, action, q, limit = 200, tenantId }) {
+    const clauses = ['tenant_id = $1'];
+    const params = [tenantId];
 
     if (entityType) {
         params.push(String(entityType).trim());
@@ -117,7 +119,7 @@ async function getAuditLogs({ entityType, action, q, limit = 200 } = {}) {
     }
 
     params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
-    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const whereSql = `WHERE ${clauses.join(' AND ')}`;
 
     const result = await pool.query(
         `SELECT

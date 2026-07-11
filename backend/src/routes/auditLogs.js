@@ -10,7 +10,8 @@ router.get('/', requireManager, async (req, res) => {
             entityType: req.query.entity_type || '',
             action: req.query.action || '',
             q: req.query.q || '',
-            limit: req.query.limit || 200
+            limit: req.query.limit || 200,
+            tenantId: req.user.tenant_id
         });
         return res.json({ logs });
     } catch (err) {

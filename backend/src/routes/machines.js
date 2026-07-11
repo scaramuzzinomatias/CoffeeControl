@@ -202,7 +202,7 @@ function buildMachineTechnicalDrift(desiredConfig, reportedConfig) {
         }));
 }
 
-async function getLastMachineTechnicalAudit(machineId) {
+async function getLastMachineTechnicalAudit(machineId, tenantId) {
     const result = await pool.query(
         `SELECT action,
                 actor_username,
@@ -213,10 +213,11 @@ async function getLastMachineTechnicalAudit(machineId) {
          FROM audit_logs
          WHERE entity_type = 'machine'
            AND entity_id = $1
+           AND tenant_id = $2
            AND action IN ('machine.update_technical_config', 'machine.update')
          ORDER BY created_at DESC, id DESC
          LIMIT 1`,
-        [String(machineId)]
+        [String(machineId), tenantId]
     );
     if (result.rowCount === 0) return null;
     const row = result.rows[0];
@@ -230,11 +231,11 @@ async function getLastMachineTechnicalAudit(machineId) {
     };
 }
 
-async function buildMachineTechnicalSupport(machine) {
+async function buildMachineTechnicalSupport(machine, tenantId) {
     const desiredConfig = buildMachineTechnicalConfig(machine);
     const reportedConfig = buildReportedMachineTechnicalSnapshot(machine);
     const drift = buildMachineTechnicalDrift(desiredConfig, reportedConfig);
-    const lastBackendChange = await getLastMachineTechnicalAudit(machine?.id);
+    const lastBackendChange = await getLastMachineTechnicalAudit(machine?.id, tenantId);
     return {
         status: reportedConfig ? (drift.length ? 'drift' : 'in_sync') : 'not_reported',
         reported_config: reportedConfig,
@@ -947,7 +948,7 @@ router.get('/:id/technical-config', requireMachineTechnicalConfig, async (req, r
                 location: machine.location
             },
             technical_config: buildMachineTechnicalConfig(machine),
-            support: await buildMachineTechnicalSupport(machine)
+            support: await buildMachineTechnicalSupport(machine, req.user.tenant_id)
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1034,7 +1035,7 @@ router.patch('/:id/technical-config', requireMachineTechnicalConfig, async (req,
             },
             technical_config: buildMachineTechnicalConfig(updatedMachine),
             config_sync: configSync,
-            support: await buildMachineTechnicalSupport(updatedMachine)
+            support: await buildMachineTechnicalSupport(updatedMachine, req.user.tenant_id)
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
