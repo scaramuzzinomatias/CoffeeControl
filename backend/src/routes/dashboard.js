@@ -201,14 +201,15 @@ router.get('/feed', async (req, res) => {
 // Historial de intentos de acceso de un UID específico
 router.get('/uid-history/:uid', requireManager, async (req, res) => {
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT t.tapped_at, m.name AS machine, t.approved, t.deny_reason
              FROM taps t
              JOIN machines m ON m.id = t.machine_id
              WHERE t.nfc_uid = $1
+               AND t.tenant_id = $2
              ORDER BY t.tapped_at DESC
              LIMIT 50`,
-            [req.params.uid.toUpperCase()]
+            [req.params.uid.toUpperCase(), req.user.tenant_id]
         );
         res.json({ taps: result.rows, total: result.rowCount });
     } catch (err) {
@@ -230,6 +231,7 @@ router.get('/unknown-uids', requireManager, async (req, res) => {
              FROM taps t
              JOIN machines m ON m.id = t.machine_id
              WHERE t.deny_reason = 'card_unknown'
+               AND t.tenant_id = $1
                AND NOT EXISTS (
                    SELECT 1 FROM nfc_cards nc
                    WHERE nc.uid = t.nfc_uid

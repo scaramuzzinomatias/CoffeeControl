@@ -204,9 +204,10 @@ router.get('/overview', async (req, res) => {
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_cents
              FROM days
              LEFT JOIN taps t
-               ON t.tapped_at >= (days.business_day::timestamp AT TIME ZONE $3)
-               AND t.tapped_at < (((days.business_day + INTERVAL '1 day')::timestamp) AT TIME ZONE $3)
-               ${departmentClause}
+                ON t.tapped_at >= (days.business_day::timestamp AT TIME ZONE $3)
+                AND t.tapped_at < (((days.business_day + INTERVAL '1 day')::timestamp) AT TIME ZONE $3)
+                AND t.tenant_id = $${tenantIdIdx}
+                ${departmentClause}
               GROUP BY days.business_day
               ORDER BY days.business_day`,
             params
@@ -255,8 +256,9 @@ router.get('/machines', async (req, res) => {
                 MAX(t.tapped_at) AS last_tap_at
              FROM machines m
              LEFT JOIN taps t
-               ON t.machine_id = m.id
-              AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
+                ON t.machine_id = m.id
+               AND t.tenant_id = $${params.length}
+               AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              LEFT JOIN employees e_filter ON e_filter.id = t.employee_id
               AND e_filter.tenant_id = $${params.length}
              WHERE m.active = true
@@ -388,12 +390,13 @@ router.get('/employees', async (req, res) => {
              FROM employees e
              LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${params.length + 1}
              LEFT JOIN taps t
-               ON t.employee_id = e.id
-               AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
+                ON t.employee_id = e.id
+                AND t.tenant_id = $${params.length + 1}
+                AND ${buildBusinessDateRangeSql('t.tapped_at', 1, 2, 3)}
              WHERE ${whereClauses.join(' AND ')}
              GROUP BY e.id, al.id
              ORDER BY spent_cents DESC, taps_count DESC, e.name`,
-            params.concat([req.user.tenant_id])
+             params.concat([req.user.tenant_id])
         );
 
         return res.json({

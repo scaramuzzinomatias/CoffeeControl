@@ -451,6 +451,7 @@ router.post('/result', async (req, res) => {
             try {
                 const stockResult = await stock.recordSale({
                     machineId: machine.id,
+                    tenantId: machine.tenant_id,
                     itemId: outcome.tap.item_id,
                     tapId: outcome.tap.id
                 });

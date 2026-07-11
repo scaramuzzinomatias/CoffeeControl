@@ -154,12 +154,13 @@ async function withTransaction(work) {
     }
 }
 
-async function getMachineStock(machineId, { includeInactive = true, movementLimit = 20 } = {}) {
+async function getMachineStock(machineId, tenantId, { includeInactive = true, movementLimit = 20 } = {}) {
     const machineIdInt = parseInteger(machineId, null);
     if (!Number.isInteger(machineIdInt)) {
         throw stockError(400, 'ID de máquina inválido.');
     }
-    const itemParams = [machineIdInt];
+    const tenantIdInt = parseInteger(tenantId, null);
+    const itemParams = [machineIdInt, tenantIdInt];
     const inactiveSql = includeInactive ? '' : 'AND si.active = true';
     const itemsResult = await pool.query(
         `SELECT
@@ -176,6 +177,7 @@ async function getMachineStock(machineId, { includeInactive = true, movementLimi
             si.updated_at
          FROM machine_stock_items si
          WHERE si.machine_id = $1
+           AND si.tenant_id = $2
            ${inactiveSql}
          ORDER BY si.active DESC, si.item_id ASC, si.id ASC`,
         itemParams
@@ -202,9 +204,10 @@ async function getMachineStock(machineId, { includeInactive = true, movementLimi
          LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
          LEFT JOIN admin_users au ON au.id = sm.actor_user_id
          WHERE sm.machine_id = $1
+           AND sm.tenant_id = $2
          ORDER BY sm.created_at DESC, sm.id DESC
-         LIMIT $2`,
-        [machineIdInt, Math.min(Math.max(parseInteger(movementLimit, 20) || 20, 1), 100)]
+         LIMIT $3`,
+        [machineIdInt, tenantIdInt, Math.min(Math.max(parseInteger(movementLimit, 20) || 20, 1), 100)]
     );
     return {
         summary: buildSummary(items),
@@ -213,12 +216,13 @@ async function getMachineStock(machineId, { includeInactive = true, movementLimi
     };
 }
 
-async function getMachineStockSummaryMap(machineIds = []) {
+async function getMachineStockSummaryMap(machineIds = [], tenantId = null) {
     const ids = (Array.isArray(machineIds) ? machineIds : [])
         .map(id => parseInteger(id, null))
         .filter(id => Number.isInteger(id));
     if (!ids.length) return new Map();
 
+    const tenantIdInt = parseInteger(tenantId, null);
     const result = await pool.query(
         `SELECT
             machine_id,
@@ -229,8 +233,9 @@ async function getMachineStockSummaryMap(machineIds = []) {
             COALESCE(SUM(current_units) FILTER (WHERE active = true), 0) AS total_units
          FROM machine_stock_items
          WHERE machine_id = ANY($1::int[])
+           AND tenant_id = $2
          GROUP BY machine_id`,
-        [ids]
+        [ids, tenantIdInt]
     );
 
     const map = new Map();
@@ -248,6 +253,7 @@ async function getMachineStockSummaryMap(machineIds = []) {
 
 async function createStockItem({
     machineId,
+    tenantId,
     itemId,
     productName,
     slotLabel,
@@ -267,11 +273,13 @@ async function createStockItem({
         min_units: minUnits,
         active
     });
+    const tenantIdInt = parseInteger(tenantId, null);
 
     return withTransaction(async (client) => {
         const insertResult = await client.query(
             `INSERT INTO machine_stock_items(
                 machine_id,
+                tenant_id,
                 item_id,
                 product_name,
                 slot_label,
@@ -280,10 +288,11 @@ async function createStockItem({
                 min_units,
                 active
              )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING *`,
             [
                 machineId,
+                tenantIdInt,
                 draft.item_id,
                 draft.product_name,
                 draft.slot_label,
@@ -299,6 +308,7 @@ async function createStockItem({
             await client.query(
                 `INSERT INTO stock_movements(
                     machine_id,
+                    tenant_id,
                     stock_item_id,
                     item_id,
                     movement_type,
@@ -308,9 +318,10 @@ async function createStockItem({
                     actor_user_id,
                     note
                  )
-                 VALUES ($1, $2, $3, 'adjustment', $4, 0, $5, $6, $7)`,
+                 VALUES ($1, $2, $3, $4, 'adjustment', $5, 0, $6, $7, $8)`,
                 [
                     machineId,
+                    tenantIdInt,
                     stockItem.id,
                     stockItem.item_id,
                     stockItem.current_units,
@@ -327,6 +338,7 @@ async function createStockItem({
 
 async function updateStockItem({
     machineId,
+    tenantId,
     stockItemId,
     itemId,
     productName,
@@ -347,14 +359,15 @@ async function updateStockItem({
         min_units: minUnits,
         active
     }, { partial: true });
+    const tenantIdInt = parseInteger(tenantId, null);
 
     return withTransaction(async (client) => {
         const existingResult = await client.query(
             `SELECT *
              FROM machine_stock_items
-             WHERE id = $1 AND machine_id = $2
+             WHERE id = $1 AND machine_id = $2 AND tenant_id = $3
              FOR UPDATE`,
-            [stockItemId, machineId]
+            [stockItemId, machineId, tenantIdInt]
         );
         if (existingResult.rowCount === 0) {
             throw stockError(404, 'Selección de stock no encontrada.');
@@ -381,7 +394,7 @@ async function updateStockItem({
                  min_units = $6,
                  active = $7,
                  updated_at = NOW()
-             WHERE id = $8 AND machine_id = $9
+             WHERE id = $8 AND machine_id = $9 AND tenant_id = $10
              RETURNING *`,
             [
                 next.item_id,
@@ -392,7 +405,8 @@ async function updateStockItem({
                 next.min_units,
                 next.active,
                 stockItemId,
-                machineId
+                machineId,
+                tenantIdInt
             ]
         );
 
@@ -401,6 +415,7 @@ async function updateStockItem({
             await client.query(
                 `INSERT INTO stock_movements(
                     machine_id,
+                    tenant_id,
                     stock_item_id,
                     item_id,
                     movement_type,
@@ -410,9 +425,10 @@ async function updateStockItem({
                     actor_user_id,
                     note
                  )
-                 VALUES ($1, $2, $3, 'adjustment', $4, $5, $6, $7, $8)`,
+                 VALUES ($1, $2, $3, $4, 'adjustment', $5, $6, $7, $8, $9)`,
                 [
                     machineId,
+                    tenantIdInt,
                     after.id,
                     after.item_id,
                     after.current_units - before.current_units,
@@ -430,6 +446,7 @@ async function updateStockItem({
 
 async function restockStockItem({
     machineId,
+    tenantId,
     stockItemId,
     quantity,
     actorUserId = null,
@@ -439,14 +456,15 @@ async function restockStockItem({
     if (!Number.isInteger(quantityInt) || quantityInt <= 0) {
         throw stockError(400, 'La reposición debe ser un entero mayor a cero.');
     }
+    const tenantIdInt = parseInteger(tenantId, null);
 
     return withTransaction(async (client) => {
         const existingResult = await client.query(
             `SELECT *
              FROM machine_stock_items
-             WHERE id = $1 AND machine_id = $2
+             WHERE id = $1 AND machine_id = $2 AND tenant_id = $3
              FOR UPDATE`,
-            [stockItemId, machineId]
+            [stockItemId, machineId, tenantIdInt]
         );
         if (existingResult.rowCount === 0) {
             throw stockError(404, 'Selección de stock no encontrada.');
@@ -457,15 +475,16 @@ async function restockStockItem({
             `UPDATE machine_stock_items
              SET current_units = current_units + $1,
                  updated_at = NOW()
-             WHERE id = $2 AND machine_id = $3
+             WHERE id = $2 AND machine_id = $3 AND tenant_id = $4
              RETURNING *`,
-            [quantityInt, stockItemId, machineId]
+            [quantityInt, stockItemId, machineId, tenantIdInt]
         );
         const after = serializeStockItem(updateResult.rows[0]);
 
         await client.query(
             `INSERT INTO stock_movements(
                 machine_id,
+                tenant_id,
                 stock_item_id,
                 item_id,
                 movement_type,
@@ -475,9 +494,10 @@ async function restockStockItem({
                 actor_user_id,
                 note
              )
-             VALUES ($1, $2, $3, 'restock', $4, $5, $6, $7, $8)`,
+             VALUES ($1, $2, $3, $4, 'restock', $5, $6, $7, $8, $9)`,
             [
                 machineId,
+                tenantIdInt,
                 after.id,
                 after.item_id,
                 quantityInt,
@@ -494,6 +514,7 @@ async function restockStockItem({
 
 async function adjustStockItem({
     machineId,
+    tenantId,
     stockItemId,
     currentUnits,
     actorUserId = null,
@@ -503,14 +524,15 @@ async function adjustStockItem({
     if (!Number.isInteger(currentUnitsInt) || currentUnitsInt < 0) {
         throw stockError(400, 'El nuevo stock debe ser un entero mayor o igual a cero.');
     }
+    const tenantIdInt = parseInteger(tenantId, null);
 
     return withTransaction(async (client) => {
         const existingResult = await client.query(
             `SELECT *
              FROM machine_stock_items
-             WHERE id = $1 AND machine_id = $2
+             WHERE id = $1 AND machine_id = $2 AND tenant_id = $3
              FOR UPDATE`,
-            [stockItemId, machineId]
+            [stockItemId, machineId, tenantIdInt]
         );
         if (existingResult.rowCount === 0) {
             throw stockError(404, 'Selección de stock no encontrada.');
@@ -521,15 +543,16 @@ async function adjustStockItem({
             `UPDATE machine_stock_items
              SET current_units = $1,
                  updated_at = NOW()
-             WHERE id = $2 AND machine_id = $3
+             WHERE id = $2 AND machine_id = $3 AND tenant_id = $4
              RETURNING *`,
-            [currentUnitsInt, stockItemId, machineId]
+            [currentUnitsInt, stockItemId, machineId, tenantIdInt]
         );
         const after = serializeStockItem(updateResult.rows[0]);
         if (after.current_units !== before.current_units) {
             await client.query(
                 `INSERT INTO stock_movements(
                     machine_id,
+                    tenant_id,
                     stock_item_id,
                     item_id,
                     movement_type,
@@ -539,9 +562,10 @@ async function adjustStockItem({
                     actor_user_id,
                     note
                  )
-                 VALUES ($1, $2, $3, 'adjustment', $4, $5, $6, $7, $8)`,
+                 VALUES ($1, $2, $3, $4, 'adjustment', $5, $6, $7, $8, $9)`,
                 [
                     machineId,
+                    tenantIdInt,
                     after.id,
                     after.item_id,
                     after.current_units - before.current_units,
@@ -559,6 +583,7 @@ async function adjustStockItem({
 
 async function recordSale({
     machineId,
+    tenantId,
     itemId,
     tapId = null
 }) {
@@ -566,23 +591,26 @@ async function recordSale({
     if (!Number.isInteger(itemIdInt) || itemIdInt < 0) {
         return { applied: false, configured: false, reason: 'invalid_item_id' };
     }
+    const tenantIdInt = parseInteger(tenantId, null);
 
     return withTransaction(async (client) => {
         const itemResult = await client.query(
             `SELECT *
              FROM machine_stock_items
              WHERE machine_id = $1
-               AND item_id = $2
+               AND tenant_id = $2
+               AND item_id = $3
                AND active = true
              LIMIT 1
              FOR UPDATE`,
-            [machineId, itemIdInt]
+            [machineId, tenantIdInt, itemIdInt]
         );
 
         if (itemResult.rowCount === 0) {
             await client.query(
                 `INSERT INTO stock_movements(
                     machine_id,
+                    tenant_id,
                     stock_item_id,
                     item_id,
                     movement_type,
@@ -590,9 +618,10 @@ async function recordSale({
                     tap_id,
                     note
                  )
-                 VALUES ($1, NULL, $2, 'unconfigured_sale', -1, $3, $4)`,
+                 VALUES ($1, $2, NULL, $3, 'unconfigured_sale', -1, $4, $5)`,
                 [
                     machineId,
+                    tenantIdInt,
                     itemIdInt,
                     tapId,
                     'Venta confirmada para una selección sin stock configurado'
@@ -615,6 +644,7 @@ async function recordSale({
         await client.query(
             `INSERT INTO stock_movements(
                 machine_id,
+                tenant_id,
                 stock_item_id,
                 item_id,
                 movement_type,
@@ -624,9 +654,10 @@ async function recordSale({
                 tap_id,
                 note
              )
-             VALUES ($1, $2, $3, 'sale', -1, $4, $5, $6, $7)`,
+             VALUES ($1, $2, $3, $4, 'sale', -1, $5, $6, $7, $8)`,
             [
                 machineId,
+                tenantIdInt,
                 after.id,
                 after.item_id,
                 before.current_units,

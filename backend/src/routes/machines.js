@@ -878,7 +878,7 @@ router.post('/pending/:id/reject', requireMachineSetup, async (req, res) => {
 router.get('/', requireMachineOperator, async (req, res) => {
     try {
         const result = await req.db.query('SELECT * FROM machine_status WHERE active = true AND tenant_id = $1 ORDER BY id', [req.user.tenant_id]);
-        const stockSummaryMap = await stock.getMachineStockSummaryMap(result.rows.map(row => row.id));
+        const stockSummaryMap = await stock.getMachineStockSummaryMap(result.rows.map(row => row.id), req.user.tenant_id);
         const now = Date.now();
         const machines = result.rows.map(machine => ({
             ...machine,
@@ -1434,7 +1434,7 @@ router.get('/:id/stock', requireMachineOperator, async (req, res) => {
     try {
         const machine = await getActiveMachineById(req.db, req.user.tenant_id, machineId);
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
-        const data = await stock.getMachineStock(machineId);
+        const data = await stock.getMachineStock(machineId, req.user.tenant_id);
         return res.json({
             machine: {
                 id: machine.id,
@@ -1460,6 +1460,7 @@ router.post('/:id/stock', requireMachineOperator, async (req, res) => {
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const created = await stock.createStockItem({
             machineId,
+            tenantId: req.user.tenant_id,
             itemId: req.body?.item_id,
             productName: req.body?.product_name,
             slotLabel: req.body?.slot_label,
@@ -1509,6 +1510,7 @@ router.patch('/:id/stock/:stockItemId', requireMachineOperator, async (req, res)
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const result = await stock.updateStockItem({
             machineId,
+            tenantId: req.user.tenant_id,
             stockItemId,
             itemId: req.body?.item_id,
             productName: req.body?.product_name,
@@ -1560,6 +1562,7 @@ router.post('/:id/stock/:stockItemId/restock', requireMachineOperator, async (re
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const result = await stock.restockStockItem({
             machineId,
+            tenantId: req.user.tenant_id,
             stockItemId,
             quantity: req.body?.quantity,
             actorUserId: req.user?.id || null,
@@ -1603,6 +1606,7 @@ router.post('/:id/stock/:stockItemId/adjust', requireMachineOperator, async (req
         if (!machine) return res.status(404).json({ error: 'No encontrada' });
         const result = await stock.adjustStockItem({
             machineId,
+            tenantId: req.user.tenant_id,
             stockItemId,
             currentUnits: req.body?.current_units,
             actorUserId: req.user?.id || null,
