@@ -485,7 +485,7 @@ async function queueMachineCommand({ db, machineId, machineName, commandType, pa
 
 async function getActiveMachineById(db, tenantId, machineId) {
     const result = await db.query(
-        `SELECT id, name, location, last_seen
+        `SELECT id, name, location, last_seen, tenant_id
          FROM machines
          WHERE id = $1
            AND tenant_id = $2
