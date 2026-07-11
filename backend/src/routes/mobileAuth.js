@@ -40,14 +40,14 @@ router.post('/login', async (req, res) => {
         });
 
         await audit.logAuditEvent({
-            req: {
-                ...req,
+            req: Object.assign(Object.create(req), {
                 user: {
-                    id: session.user.id,
-                    username: session.user.username,
-                    role: session.user.role
+                    id: user.id,
+                    username: user.username,
+                    role: user.role,
+                    tenant_id: user.tenant_id
                 }
-            },
+            }),
             action: 'mobile_auth.login',
             entityType: 'mobile_session',
             entityId: session.session.id,
