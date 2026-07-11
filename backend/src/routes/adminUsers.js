@@ -3,7 +3,7 @@
 
 const express = require('express');
 const bcrypt  = require('bcryptjs');
-const pool    = require('../db/pool');
+
 const audit = require('../services/audit');
 const { normalizeDepartmentList } = require('../lib/accessScope');
 
@@ -28,21 +28,24 @@ function legacyDepartmentFromScopes(scopes, fallbackDepartment = null) {
     return normalizeOptionalString(fallbackDepartment);
 }
 
-async function syncUserDepartmentScopes(client, userId, scopes) {
+async function syncUserDepartmentScopes(client, userId, scopes, tenantId) {
     const normalizedScopes = normalizeDepartmentList(scopes);
-    await client.query('DELETE FROM admin_user_departments WHERE admin_user_id = $1', [userId]);
+    await client.query(
+        'DELETE FROM admin_user_departments WHERE admin_user_id = $1 AND tenant_id = $2',
+        [userId, tenantId]
+    );
     if (!normalizedScopes.length) return normalizedScopes;
 
     const values = [];
     const params = [];
     normalizedScopes.forEach((department, index) => {
-        const base = index * 2;
-        params.push(userId, department);
-        values.push(`($${base + 1}, $${base + 2})`);
+        const base = index * 3;
+        params.push(userId, department, tenantId);
+        values.push(`($${base + 1}, $${base + 2}, $${base + 3})`);
     });
 
     await client.query(
-        `INSERT INTO admin_user_departments (admin_user_id, department)
+        `INSERT INTO admin_user_departments (admin_user_id, department, tenant_id)
          VALUES ${values.join(', ')}`,
         params
     );
@@ -89,7 +92,7 @@ function onlyGerente(req, res, next) {
 // GET /api/admin-users
 router.get('/', onlyGerente, async (req, res) => {
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT au.id,
                     au.username,
                     au.full_name,
@@ -106,8 +109,10 @@ router.get('/', onlyGerente, async (req, res) => {
              FROM admin_users au
              LEFT JOIN admin_user_departments aud
                ON aud.admin_user_id = au.id
+             WHERE au.tenant_id = $1
              GROUP BY au.id
-             ORDER BY au.role, au.username`
+             ORDER BY au.role, au.username`,
+            [req.user.tenant_id]
         );
         res.json({ users: result.rows.map(row => mapUserWithScopes(row, row.department_scopes)) });
     } catch (err) {
@@ -136,16 +141,14 @@ router.post('/', onlyGerente, async (req, res) => {
         )
         : [];
 
-    const client = await pool.connect();
     try {
-        await client.query('BEGIN');
         const hash = await bcrypt.hash(password, 10);
         const legacyDepartment = role === 'supervisor'
             ? legacyDepartmentFromScopes(requestedScopes, department)
             : normalizeOptionalString(department);
-        const result = await client.query(
-            `INSERT INTO admin_users (username, password_hash, role, full_name, department, email)
-             VALUES ($1, $2, $3, $4, $5, $6)
+        const result = await req.db.query(
+            `INSERT INTO admin_users (username, password_hash, role, full_name, department, email, tenant_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, username, full_name, email, role, is_protected, department, active`,
             [
                 username.trim().toLowerCase(),
@@ -153,11 +156,11 @@ router.post('/', onlyGerente, async (req, res) => {
                 role,
                 normalizeOptionalString(full_name),
                 legacyDepartment,
-                normalizeOptionalString(email)
+                normalizeOptionalString(email),
+                req.user.tenant_id
             ]
         );
-        const scopes = await syncUserDepartmentScopes(client, result.rows[0].id, requestedScopes);
-        await client.query('COMMIT');
+        const scopes = await syncUserDepartmentScopes(req.db, result.rows[0].id, requestedScopes, req.user.tenant_id);
         const user = mapUserWithScopes(result.rows[0], scopes);
         await audit.logAuditEvent({
             req,
@@ -176,12 +179,9 @@ router.post('/', onlyGerente, async (req, res) => {
         });
         res.status(201).json({ user });
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
         if (err.code === '23505')
             return res.status(409).json({ error: 'El nombre de usuario ya existe' });
         res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
     }
 });
 
@@ -193,25 +193,22 @@ router.patch('/:id', onlyGerente, async (req, res) => {
     if (parseInt(req.params.id) === req.user.id && role && role !== req.user.role)
         return res.status(400).json({ error: 'No podés cambiar tu propio rol' });
 
-    const client = await pool.connect();
     try {
-        await client.query('BEGIN');
-        const before = await client.query(
+        const before = await req.db.query(
             `SELECT id, username, full_name, email, role, is_protected, department, active
              FROM admin_users
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1 AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (before.rowCount === 0) {
-            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'Usuario no encontrado' });
         }
-        const beforeScopesResult = await client.query(
+        const beforeScopesResult = await req.db.query(
             `SELECT department
              FROM admin_user_departments
-             WHERE admin_user_id = $1
+             WHERE admin_user_id = $1 AND tenant_id = $2
              ORDER BY LOWER(department), department`,
-            [req.params.id]
+            [req.params.id, req.user.tenant_id]
         );
         const beforeUser = mapUserWithScopes(
             before.rows[0],
@@ -219,13 +216,11 @@ router.patch('/:id', onlyGerente, async (req, res) => {
         );
 
         if (beforeUser.is_protected) {
-            await client.query('ROLLBACK');
             return rejectProtectedAccountMutation(req, res, beforeUser, 'update');
         }
 
         const nextRole = role || beforeUser.role;
         if (!['gerente', 'supervisor', 'admin', 'tecnico', 'distribuidor'].includes(nextRole)) {
-            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Rol inválido' });
         }
         const scopesProvided = Object.prototype.hasOwnProperty.call(req.body, 'department_scopes');
@@ -267,7 +262,8 @@ router.patch('/:id', onlyGerente, async (req, res) => {
             params.push(hash);
         }
 
-        const result = await client.query(
+        params.push(req.user.tenant_id);
+        const result = await req.db.query(
             `UPDATE admin_users SET
                 full_name  = $1,
                 role       = $2,
@@ -275,12 +271,11 @@ router.patch('/:id', onlyGerente, async (req, res) => {
                 email      = $4,
                 active     = $5
                 ${hashUpdate}
-              WHERE id = $6
+              WHERE id = $6 AND tenant_id = $${params.length}
               RETURNING id, username, full_name, email, role, is_protected, department, active`,
             params
         );
-        const scopes = await syncUserDepartmentScopes(client, result.rows[0].id, nextScopes);
-        await client.query('COMMIT');
+        const scopes = await syncUserDepartmentScopes(req.db, result.rows[0].id, nextScopes, req.user.tenant_id);
         const user = mapUserWithScopes(result.rows[0], scopes);
         await audit.logAuditEvent({
             req,
@@ -301,10 +296,7 @@ router.patch('/:id', onlyGerente, async (req, res) => {
         });
         res.json({ user });
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
         res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
     }
 });
 
@@ -313,23 +305,23 @@ router.delete('/:id', onlyGerente, async (req, res) => {
     if (parseInt(req.params.id) === req.user.id)
         return res.status(400).json({ error: 'No podés eliminar tu propia cuenta' });
     try {
-        const before = await pool.query(
+        const before = await req.db.query(
             `SELECT id, username, role, is_protected, department, email, active
              FROM admin_users
-             WHERE id = $1`,
-            [req.params.id]
+             WHERE id = $1 AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (before.rowCount === 0)
             return res.status(404).json({ error: 'Usuario no encontrado' });
         if (before.rows[0].is_protected)
             return rejectProtectedAccountMutation(req, res, before.rows[0], 'deactivate');
 
-        const result = await pool.query(
+        const result = await req.db.query(
             `UPDATE admin_users
              SET active=false
-             WHERE id=$1
+             WHERE id=$1 AND tenant_id=$2
              RETURNING id, username, role, is_protected, department, email`,
-            [req.params.id]
+            [req.params.id, req.user.tenant_id]
         );
         await audit.logAuditEvent({
             req,

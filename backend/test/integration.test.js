@@ -1856,3 +1856,58 @@ test('cuenta protegida no puede cambiar su contraseña desde el panel', async ()
     assert.match(response.json.error, /soporte local/i);
 });
 
+test('CRUD admin-users — crear, listar, editar, desactivar', async () => {
+    const testUsername = `${TEST_PREFIX}_crud_admin`;
+    const testDepartment = `${TEST_PREFIX}_AdminOps`;
+
+    const createRes = await requestJson('POST', '/api/admin-users', {
+        token: adminToken,
+        body: {
+            username: testUsername,
+            password: 'TestPass123',
+            role: 'supervisor',
+            full_name: 'CRUD Admin Test',
+            department: testDepartment,
+            department_scopes: [`${TEST_PREFIX}_Gerencia`, `${TEST_PREFIX}_Ventas`]
+        }
+    });
+    assert.equal(createRes.status, 201);
+    assert.equal(createRes.json.user.username, testUsername);
+    assert.equal(createRes.json.user.role, 'supervisor');
+    assert.equal(createRes.json.user.active, true);
+    assert.deepEqual(
+        [...createRes.json.user.department_scopes].sort(),
+        [`${TEST_PREFIX}_Gerencia`, `${TEST_PREFIX}_Ventas`].sort()
+    );
+    const createdId = createRes.json.user.id;
+
+    const listRes = await requestJson('GET', '/api/admin-users', { token: adminToken });
+    assert.equal(listRes.status, 200);
+    const found = listRes.json.users.find(u => u.id === createdId);
+    assert.ok(found, 'El usuario creado debe aparecer en el listado');
+    assert.equal(found.username, testUsername);
+
+    const editRes = await requestJson('PATCH', `/api/admin-users/${createdId}`, {
+        token: adminToken,
+        body: {
+            full_name: 'CRUD Admin Updated',
+            role: 'tecnico',
+            department_scopes: [`${TEST_PREFIX}_Gerencia`]
+        }
+    });
+    assert.equal(editRes.status, 200);
+    assert.equal(editRes.json.user.full_name, 'CRUD Admin Updated');
+    assert.equal(editRes.json.user.role, 'tecnico');
+
+    const deactivateRes = await requestJson('DELETE', `/api/admin-users/${createdId}`, {
+        token: adminToken
+    });
+    assert.equal(deactivateRes.status, 200);
+    assert.equal(deactivateRes.json.ok, true);
+
+    const listAfterRes = await requestJson('GET', '/api/admin-users', { token: adminToken });
+    const deactivated = listAfterRes.json.users.find(u => u.id === createdId);
+    assert.ok(deactivated, 'El usuario desactivado debe seguir apareciendo en el listado');
+    assert.equal(deactivated.active, false);
+});
+
