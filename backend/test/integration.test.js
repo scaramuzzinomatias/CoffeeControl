@@ -1951,3 +1951,102 @@ test('gerente puede leer y actualizar system-settings (multi-tenant)', async () 
     assert.equal(restoreRes.json.settings.business_timezone, originalTz);
 });
 
+test('audit_logs multi-tenant aislamiento cross-tenant', async () => {
+    const tenantBSlug = `${TEST_PREFIX}_tenb`.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const tenantBName = `${TEST_PREFIX}_tenantB`;
+    const tenantBAdminUser = (`${TEST_PREFIX}_adminb`).toLowerCase();
+    const tenantBAdminPass = 'coffeecontrol2024';
+    let tenantBId;
+
+    try {
+        await withDb(async (client) => {
+            // Sincronizar secuencia SERIAL por si el seed usó id explícito
+            await client.query(
+                "SELECT setval(pg_get_serial_sequence('tenants', 'id'), COALESCE((SELECT MAX(id) FROM tenants), 0))"
+            );
+            const tenantResult = await client.query(
+                `INSERT INTO tenants (slug, name) VALUES ($1, $2) RETURNING id`,
+                [tenantBSlug, tenantBName]
+            );
+            tenantBId = tenantResult.rows[0].id;
+
+            const passwordHash = await bcrypt.hash(tenantBAdminPass, 10);
+            await client.query(
+                `INSERT INTO admin_users(username, password_hash, role, full_name, active, tenant_id)
+                 VALUES ($1, $2, 'gerente', $3, true, $4)`,
+                [tenantBAdminUser, passwordHash, `${TEST_PREFIX}_AdminB`, tenantBId]
+            );
+        });
+
+        // Login via http module para controlar Host header manualmente
+        const http = require('http');
+        const loginRes = await new Promise((resolve, reject) => {
+            const postData = JSON.stringify({ username: tenantBAdminUser, password: tenantBAdminPass });
+            const options = {
+                hostname: '127.0.0.1',
+                port: TEST_PORT,
+                path: '/api/auth/login',
+                method: 'POST',
+                headers: {
+                    'Host': `${tenantBSlug}.localhost:${TEST_PORT}`,
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                }
+            };
+            const req = http.request(options, (res) => {
+                let body = '';
+                res.on('data', chunk => body += chunk);
+                res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(body || '{}') }));
+            });
+            req.on('error', reject);
+            req.write(postData);
+            req.end();
+        });
+        if (loginRes.status !== 200) {
+            console.log('DEBUG loginB status:', loginRes.status, 'body:', JSON.stringify(loginRes.json), 'slug:', tenantBSlug, 'tenantBId:', tenantBId);
+        }
+        assert.equal(loginRes.status, 200, `Login esperaba 200, obtuvo ${loginRes.status}`);
+        const tokenB = loginRes.json.token;
+
+        const bSummary = `${TEST_PREFIX}_tenantB_action`;
+        const putB = await requestJson('PUT', '/api/system-settings', {
+            token: tokenB,
+            body: { business_timezone: 'America/Argentina/Buenos_Aires' }
+        });
+        assert.equal(putB.status, 200);
+
+        const auditA = await requestJson('GET',
+            `/api/audit-logs?q=${encodeURIComponent(bSummary)}`,
+            { token: adminToken }
+        );
+        assert.equal(auditA.status, 200);
+        const leaked = auditA.json.logs.find(log =>
+            log.summary && log.summary.includes(bSummary)
+        );
+        assert.equal(leaked, undefined,
+            `Log de tenant B (${bSummary}) filtrado en tenant A`
+        );
+
+        const auditB = await requestJson('GET',
+            `/api/audit-logs?q=${encodeURIComponent(TEST_PREFIX)}`,
+            { token: tokenB }
+        );
+        assert.equal(auditB.status, 200);
+        const leakedFromB = auditB.json.logs.find(log =>
+            log.actor_username === fixture.manager.username
+        );
+        assert.equal(leakedFromB, undefined,
+            `Log de tenant A (${fixture.manager.username}) filtrado en tenant B`
+        );
+    } finally {
+        if (tenantBId) {
+            await withDb(async (client) => {
+                await client.query('DELETE FROM audit_logs WHERE actor_username = $1', [tenantBAdminUser]);
+                await client.query('DELETE FROM system_settings WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM admin_users WHERE username = $1', [tenantBAdminUser]);
+                await client.query('DELETE FROM tenants WHERE id = $1', [tenantBId]);
+            });
+        }
+    }
+});
+
