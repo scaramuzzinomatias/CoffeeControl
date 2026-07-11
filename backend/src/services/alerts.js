@@ -412,7 +412,7 @@ async function sendTestNotification(input = {}, tenantId) {
         throw new Error('SMTP no configurado en backend. Revisá SMTP_* y ALERT_EMAIL_FROM.');
     }
 
-    const timeZone = await systemSettings.getBusinessTimeZone();
+    const timeZone = await systemSettings.getBusinessTimeZone(tenantId);
     const subject = '[CoffeeControl] Prueba de notificaciones';
     const now = formatDateTimeInZone(new Date(), timeZone);
     const text = [
@@ -438,7 +438,7 @@ async function sendTestNotification(input = {}, tenantId) {
 }
 
 async function notifyEmployeeDailyBlocked({ employeeId, employeeName, dailyLimit, tapsToday, machineName, uid, tenantId }) {
-    const { timeZone, businessDate: dayKey } = await systemSettings.getBusinessTimeContext();
+    const { timeZone, businessDate: dayKey } = await systemSettings.getBusinessTimeContext(tenantId);
     const alertKey = `employee-daily-block-${employeeId}-${dayKey}`;
     const payload = {
         employee_name: employeeName,
@@ -520,7 +520,7 @@ async function notifyEmployeeLimitWarning({ employeeId, dailyLimit, tapsToday, m
     if (!target) return false;
     const settings = await loadNotificationSettings(tenantId);
 
-    const { timeZone, businessDate: dayKey } = await systemSettings.getBusinessTimeContext();
+    const { timeZone, businessDate: dayKey } = await systemSettings.getBusinessTimeContext(tenantId);
     const relationText = tapsToday > dailyLimit
         ? 'superó'
         : tapsToday === dailyLimit
@@ -578,7 +578,7 @@ async function notifyEmployeeLimitWarning({ employeeId, dailyLimit, tapsToday, m
 }
 
 async function notifyMachineBackendDown(machine) {
-    const timeZone = await systemSettings.getBusinessTimeZone();
+    const timeZone = await systemSettings.getBusinessTimeZone(machine.tenant_id);
     const lastSeen = formatDateTimeInZone(machine.last_seen, timeZone);
     const alertKey = `machine-backend-down-${machine.id}`;
     const payload = {
@@ -620,7 +620,7 @@ async function resolveMachineBackendDown(machineId, tenantId) {
 }
 
 async function notifyMachineOffline(machine) {
-    const timeZone = await systemSettings.getBusinessTimeZone();
+    const timeZone = await systemSettings.getBusinessTimeZone(machine.tenant_id);
     const lastSeen = formatDateTimeInZone(machine.last_seen, timeZone);
     const alertKey = `machine-offline-${machine.id}`;
     const payload = {

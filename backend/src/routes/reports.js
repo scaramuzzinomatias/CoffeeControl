@@ -43,7 +43,7 @@ function buildBusinessDateRangeSql(column, fromParamIndex, toParamIndex, timeZon
 }
 
 async function getReportRange(req) {
-    const { timeZone, businessDate, monthStart } = await systemSettings.getBusinessTimeContext();
+    const { timeZone, businessDate, monthStart } = await systemSettings.getBusinessTimeContext(req.user.tenant_id);
     let from = normalizeDateInput(req.query.from) || monthStart;
     let to = normalizeDateInput(req.query.to) || businessDate;
     if (from > to) [from, to] = [to, from];

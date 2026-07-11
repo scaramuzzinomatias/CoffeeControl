@@ -5,9 +5,9 @@ const audit = require('../services/audit');
 
 const router = express.Router();
 
-router.get('/', requireManager, async (_req, res) => {
+router.get('/', requireManager, async (req, res) => {
     try {
-        const settings = await systemSettings.getSystemSettings();
+        const settings = await systemSettings.getSystemSettings(req.user.tenant_id);
         return res.json({ settings });
     } catch (err) {
         return res.status(500).json({ error: err.message });
@@ -16,8 +16,8 @@ router.get('/', requireManager, async (_req, res) => {
 
 router.put('/', requireManager, async (req, res) => {
     try {
-        const before = await systemSettings.getSystemSettings();
-        const settings = await systemSettings.saveSystemSettings(req.body || {});
+        const before = await systemSettings.getSystemSettings(req.user.tenant_id);
+        const settings = await systemSettings.saveSystemSettings(req.user.tenant_id, req.body || {});
         await audit.logAuditEvent({
             req,
             action: 'system_settings.update',

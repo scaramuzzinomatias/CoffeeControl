@@ -75,7 +75,7 @@ async function fetchCardContext(uid, db, tenantId) {
 }
 
 async function countApprovedBeforeTap(employeeId, tappedAt, tenantId, db) {
-    const timeZone = await systemSettings.getBusinessTimeZone();
+    const timeZone = await systemSettings.getBusinessTimeZone(tenantId);
     const businessDate = formatBusinessDate(tappedAt, timeZone);
     const countResult = await db.query(
         `SELECT COUNT(*) AS cnt
@@ -313,7 +313,7 @@ router.post('/', async (req, res) => {
         }
 
         // ── 2. Contar consumo de hoy ─────────────────────────
-        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext(req.machine.tenant_id);
         const countResult = await req.db.query(
             `SELECT COUNT(*) AS taps_today
              FROM taps
@@ -588,7 +588,7 @@ router.post('/decisions', require('../middleware/machineAuth'), async (req, res)
 // ══════════════════════════════════════════════════════
 router.get('/cards', require('../middleware/machineAuth'), async (req, res) => {
     try {
-        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext(req.machine.tenant_id);
         const result = await req.db.query(
             `SELECT
                 nc.uid,

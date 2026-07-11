@@ -1911,3 +1911,43 @@ test('CRUD admin-users — crear, listar, editar, desactivar', async () => {
     assert.equal(deactivated.active, false);
 });
 
+test('gerente puede leer y actualizar system-settings (multi-tenant)', async () => {
+    const getBefore = await requestJson('GET', '/api/system-settings', { token: managerToken });
+    assert.equal(getBefore.status, 200);
+    assert.ok(getBefore.json.settings.business_timezone?.length > 0);
+    const originalTz = getBefore.json.settings.business_timezone;
+
+    const newTz = originalTz === 'America/Argentina/Buenos_Aires'
+        ? 'America/New_York'
+        : 'America/Argentina/Buenos_Aires';
+
+    const putRes = await requestJson('PUT', '/api/system-settings', {
+        token: managerToken,
+        body: { business_timezone: newTz }
+    });
+    assert.equal(putRes.status, 200);
+    assert.equal(putRes.json.settings.business_timezone, newTz);
+
+    const getAfter = await requestJson('GET', '/api/system-settings', { token: managerToken });
+    assert.equal(getAfter.status, 200);
+    assert.equal(getAfter.json.settings.business_timezone, newTz);
+
+    const auditLogs = await requestJson(
+        'GET',
+        `/api/audit-logs?action=system_settings.update&q=${encodeURIComponent(fixture.manager.username)}`,
+        { token: managerToken }
+    );
+    assert.equal(auditLogs.status, 200);
+    const log = auditLogs.json.logs.find(entry => entry.actor_username === fixture.manager.username);
+    assert.ok(log, 'No se encontró el evento de auditoría para system_settings.update');
+    assert.equal(log.action, 'system_settings.update');
+    assert.equal(log.entity_type, 'system_settings');
+
+    const restoreRes = await requestJson('PUT', '/api/system-settings', {
+        token: managerToken,
+        body: { business_timezone: originalTz }
+    });
+    assert.equal(restoreRes.status, 200);
+    assert.equal(restoreRes.json.settings.business_timezone, originalTz);
+});
+

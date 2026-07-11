@@ -144,7 +144,7 @@ function buildSummary(alerts) {
 
 router.get('/active', async (req, res) => {
     try {
-        const { timeZone } = await systemSettings.getBusinessTimeContext();
+        const { timeZone } = await systemSettings.getBusinessTimeContext(req.user.tenant_id);
         const params = [];
         const scope = buildDepartmentScopeClause({
             user: req.user,

@@ -27,7 +27,7 @@ const effectivePolicy = effectivePolicyExpressions('e', 'al');
 // Resumen del día: métricas + ranking + alertas
 router.get('/today', async (req, res) => {
     try {
-        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext(req.user.tenant_id);
         const warningLead = await alerts.getEmployeeLimitWarningLead(req.user.tenant_id);
         const params = [timeZone, businessDate];
         const scope = buildDepartmentScopeClause({
@@ -104,7 +104,7 @@ router.get('/today', async (req, res) => {
 // Resumen del mes actual
 router.get('/monthly', async (req, res) => {
     try {
-        const { timeZone, monthStart } = await systemSettings.getBusinessTimeContext();
+        const { timeZone, monthStart } = await systemSettings.getBusinessTimeContext(req.user.tenant_id);
         const params = [timeZone, monthStart];
         const scope = buildDepartmentScopeClause({
             user: req.user,
@@ -155,7 +155,7 @@ router.get('/monthly', async (req, res) => {
 // Últimos 50 taps del día (para el log en tiempo real)
 router.get('/feed', async (req, res) => {
     try {
-        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
+        const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext(req.user.tenant_id);
         const params = [timeZone, businessDate];
         const scope = buildDepartmentScopeClause({
             user: req.user,

@@ -13,9 +13,8 @@ const FALLBACK_SYSTEM_SETTINGS = Object.freeze({
     business_timezone: normalizeBusinessTimeZone(DEFAULT_BUSINESS_TIMEZONE)
 });
 
-let settingsCache = null;
-let settingsCacheAt = 0;
-let settingsTableMissingLogged = false;
+const settingsCache = new Map();
+const missingLogged = new Set();
 
 function sanitizeSystemSettings(raw = {}) {
     return {
@@ -26,76 +25,75 @@ function sanitizeSystemSettings(raw = {}) {
     };
 }
 
-async function loadSystemSettings(force = false) {
-    if (!force && settingsCache && (Date.now() - settingsCacheAt) < SETTINGS_CACHE_TTL_MS) {
-        return { ...settingsCache };
+async function loadSystemSettings(tenantId, force = false) {
+    const cached = settingsCache.get(tenantId);
+    if (!force && cached && (Date.now() - cached.at) < SETTINGS_CACHE_TTL_MS) {
+        return { ...cached.settings };
     }
 
     try {
         const result = await pool.query(
             `SELECT business_timezone
              FROM system_settings
-             WHERE id = 1`
+             WHERE id = 1 AND tenant_id = $1`,
+            [tenantId]
         );
 
         const settings = result.rowCount > 0
             ? sanitizeSystemSettings(result.rows[0])
             : sanitizeSystemSettings(FALLBACK_SYSTEM_SETTINGS);
 
-        settingsCache = settings;
-        settingsCacheAt = Date.now();
+        settingsCache.set(tenantId, { settings, at: Date.now() });
         return { ...settings };
     } catch (err) {
         if (err.code === '42P01') {
-            if (!settingsTableMissingLogged) {
-                console.warn('[SYSTEM] system_settings todavía no existe; usando fallback de BUSINESS_TIMEZONE/.env');
-                settingsTableMissingLogged = true;
+            if (!missingLogged.has(tenantId)) {
+                console.warn(`[SYSTEM] system_settings todavía no existe para tenant ${tenantId}; usando fallback de BUSINESS_TIMEZONE/.env`);
+                missingLogged.add(tenantId);
             }
             const fallback = sanitizeSystemSettings(FALLBACK_SYSTEM_SETTINGS);
-            settingsCache = fallback;
-            settingsCacheAt = Date.now();
+            settingsCache.set(tenantId, { settings: fallback, at: Date.now() });
             return { ...fallback };
         }
         throw err;
     }
 }
 
-function invalidateSystemSettingsCache() {
-    settingsCache = null;
-    settingsCacheAt = 0;
+function invalidateSystemSettingsCache(tenantId) {
+    settingsCache.delete(tenantId);
 }
 
-async function getSystemSettings() {
-    const settings = await loadSystemSettings();
+async function getSystemSettings(tenantId) {
+    const settings = await loadSystemSettings(tenantId);
     return {
         ...settings,
         timezone_options: COMMON_TIMEZONE_OPTIONS
     };
 }
 
-async function saveSystemSettings(input = {}) {
+async function saveSystemSettings(tenantId, input = {}) {
     const businessTimeZone = assertBusinessTimeZone(input.business_timezone);
 
     await pool.query(
-        `INSERT INTO system_settings(id, business_timezone, updated_at)
-         VALUES (1, $1, NOW())
-         ON CONFLICT (id) DO UPDATE SET
+        `INSERT INTO system_settings(id, tenant_id, business_timezone, updated_at)
+         VALUES (1, $1, $2, NOW())
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
             business_timezone = EXCLUDED.business_timezone,
             updated_at = NOW()`,
-        [businessTimeZone]
+        [tenantId, businessTimeZone]
     );
 
-    invalidateSystemSettingsCache();
-    return getSystemSettings();
+    invalidateSystemSettingsCache(tenantId);
+    return getSystemSettings(tenantId);
 }
 
-async function getBusinessTimeZone() {
-    const settings = await loadSystemSettings();
+async function getBusinessTimeZone(tenantId) {
+    const settings = await loadSystemSettings(tenantId);
     return settings.business_timezone;
 }
 
-async function getBusinessTimeContext(referenceDate = new Date()) {
-    const timeZone = await getBusinessTimeZone();
+async function getBusinessTimeContext(tenantId, referenceDate = new Date()) {
+    const timeZone = await getBusinessTimeZone(tenantId);
     const businessDate = formatBusinessDate(referenceDate, timeZone);
     return {
         timeZone,
