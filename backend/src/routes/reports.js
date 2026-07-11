@@ -608,7 +608,7 @@ router.get('/recent-taps', async (req, res) => {
 router.get('/stock', requireManager, async (req, res) => {
     try {
         const range = await getReportRange(req);
-        const params = [range.from, range.to, range.timeZone];
+        const params = [range.from, range.to, range.timeZone, req.user.tenant_id];
         const movementRangeSql = buildBusinessDateRangeSql('sm.created_at', 1, 2, 3);
 
         const itemsResult = await pool.query(
@@ -624,6 +624,7 @@ router.get('/stock', requireManager, async (req, res) => {
                 FROM stock_movements sm
                 WHERE ${movementRangeSql}
                   AND sm.stock_item_id IS NOT NULL
+                  AND sm.tenant_id = $4
                 GROUP BY sm.stock_item_id
             )
             SELECT
@@ -646,9 +647,10 @@ router.get('/stock', requireManager, async (req, res) => {
                 ms.last_sale_at,
                 ms.last_restock_at
              FROM machine_stock_items si
-             JOIN machines m ON m.id = si.machine_id
+             JOIN machines m ON m.id = si.machine_id AND m.tenant_id = $4
              LEFT JOIN movement_summary ms ON ms.stock_item_id = si.id
              WHERE m.active = true
+               AND si.tenant_id = $4
              ORDER BY
                 CASE
                     WHEN si.active = false THEN 3
@@ -671,7 +673,8 @@ router.get('/stock', requireManager, async (req, res) => {
                 COUNT(*) AS total_movements,
                 MAX(created_at) AS last_movement_at
              FROM stock_movements
-             WHERE ${buildBusinessDateRangeSql('created_at', 1, 2, 3)}`,
+             WHERE ${buildBusinessDateRangeSql('created_at', 1, 2, 3)}
+               AND tenant_id = $4`,
             params
         );
 
@@ -693,10 +696,11 @@ router.get('/stock', requireManager, async (req, res) => {
                 COALESCE(si.product_name, CONCAT('Selección ', sm.item_id::text)) AS product_name,
                 si.slot_label
              FROM stock_movements sm
-             JOIN machines m ON m.id = sm.machine_id
+             JOIN machines m ON m.id = sm.machine_id AND m.tenant_id = $4
              LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
              LEFT JOIN admin_users au ON au.id = sm.actor_user_id
              WHERE ${buildBusinessDateRangeSql('sm.created_at', 1, 2, 3)}
+               AND sm.tenant_id = $4
              ORDER BY sm.created_at DESC, sm.id DESC
              LIMIT 40`,
             params

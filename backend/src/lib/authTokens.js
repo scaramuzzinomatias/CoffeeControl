@@ -100,7 +100,8 @@ async function createMobileSession({ user, deviceName, platform, userAgent = nul
             user_agent,
             refresh_token_hash,
             expires_at,
-            last_used_at
+            last_used_at,
+            tenant_id
         )
          VALUES (
             $1,
@@ -109,7 +110,8 @@ async function createMobileSession({ user, deviceName, platform, userAgent = nul
             $4,
             $5,
             NOW() + make_interval(days => $6),
-            NOW()
+            NOW(),
+            $7
          )
          RETURNING id, device_name, platform, expires_at, created_at, last_used_at`,
         [
@@ -118,7 +120,8 @@ async function createMobileSession({ user, deviceName, platform, userAgent = nul
             normalizePlatform(platform),
             userAgent || null,
             refreshTokenHash,
-            REFRESH_TOKEN_DAYS
+            REFRESH_TOKEN_DAYS,
+            user.tenant_id
         ]
     );
 
