@@ -61,6 +61,7 @@ async function buildAuthPayload(user, { authKind = 'panel', mobileSessionId = nu
     const departmentScopes = await getUserDepartmentScopes(user.id, user.department);
     return {
         id: user.id,
+        tenant_id: user.tenant_id,
         username: user.username,
         role: user.role,
         is_protected: Boolean(user.is_protected),

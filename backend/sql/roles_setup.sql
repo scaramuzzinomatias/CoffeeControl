@@ -98,6 +98,29 @@ GRANT SELECT (
     active
 ) ON machines TO coffeecontrol_bootstrap;
 
+-- registerHandler necesita estas columnas adicionales vía bootstrapPool
+-- (lookup técnico completo + UPDATE de estado de conexión + bump de config version)
+GRANT SELECT (
+    location, last_seen,
+    price_cents, pricing_profile, mdb_feature_level, mdb_country_code,
+    mdb_scale_factor, mdb_decimal_places, mdb_max_response_time, mdb_misc_options,
+    technical_config_version, technical_config_source, technical_config_updated_at,
+    last_reported_technical_config, last_reported_technical_config_at,
+    current_firmware_version, desired_firmware_release_id, desired_firmware_version,
+    firmware_update_status, firmware_update_message, firmware_update_started_at,
+    firmware_update_completed_at,
+    wifi_ssid, wifi_rssi, wifi_ip, backend_url, backend_ok, backend_error
+) ON machines TO coffeecontrol_bootstrap;
+
+GRANT UPDATE (
+    last_seen, wifi_ssid, backend_url, current_firmware_version,
+    wifi_rssi, wifi_ip, backend_ok, backend_error,
+    last_reported_technical_config, last_reported_technical_config_at,
+    technical_config_version, technical_config_source, technical_config_updated_at,
+    firmware_update_status, firmware_update_message, firmware_update_completed_at,
+    firmware_update_started_at, desired_firmware_release_id, desired_firmware_version
+) ON machines TO coffeecontrol_bootstrap;
+
 -- firmware_releases: register → maybeQueuePendingFirmwareUpdate → getFirmwareReleaseById
 -- WHERE usa: id, tenant_id
 GRANT SELECT (
@@ -111,6 +134,15 @@ GRANT SELECT (
     created_by_username,
     tenant_id
 ) ON firmware_releases TO coffeecontrol_bootstrap;
+
+-- machine_commands: registerHandler → maybeQueuePendingFirmwareUpdate → queueFirmwareUpdateForMachine
+-- INSERT para encolar OTA, SELECT para getQueuedMachineCommand, UPDATE para completar
+GRANT SELECT (id, machine_id, command_type, status, queued_at, delivered_at, tenant_id, completed_at, result, payload)
+    ON machine_commands TO coffeecontrol_bootstrap;
+GRANT INSERT (machine_id, command_type, payload, tenant_id)
+    ON machine_commands TO coffeecontrol_bootstrap;
+GRANT UPDATE (status, completed_at, result)
+    ON machine_commands TO coffeecontrol_bootstrap;
 
 -- pending_machines: register INSERT + SELECT
 GRANT SELECT, INSERT, UPDATE ON pending_machines TO coffeecontrol_bootstrap;

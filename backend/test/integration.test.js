@@ -423,8 +423,8 @@ before(async () => {
         stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    serverProcess.stdout.on('data', () => {});
-    serverProcess.stderr.on('data', () => {});
+    serverProcess.stdout.on('data', (d) => process.stdout.write(`[SERVER] ${d}`));
+    serverProcess.stderr.on('data', (d) => process.stderr.write(`[SERVER-ERR] ${d}`));
 
     await waitForHealth();
     fixture = await seedFixtures();
