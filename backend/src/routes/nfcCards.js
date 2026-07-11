@@ -1,6 +1,5 @@
 // src/routes/nfcCards.js
 const express = require('express');
-const pool    = require('../db/pool');
 const { requireManager } = require('../middleware/roleAccess');
 
 const router = express.Router();
@@ -8,7 +7,7 @@ const router = express.Router();
 // GET /api/nfc-cards — listar todos los TAGs NFC con datos de empleado
 router.get('/', requireManager, async (req, res) => {
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 nc.id,
                 nc.uid,
@@ -20,7 +19,9 @@ router.get('/', requireManager, async (req, res) => {
                 e.name AS employee_name
              FROM nfc_cards nc
              LEFT JOIN employees e ON nc.employee_id = e.id
-             ORDER BY nc.created_at DESC`
+            WHERE nc.tenant_id = $1
+             ORDER BY nc.created_at DESC`,
+            [req.user.tenant_id]
         );
         res.json({ cards: result.rows });
     } catch (err) {

@@ -1,0 +1,89 @@
+[WS] Servidor WebSocket listo en /ws
+[ALERT] Monitor de alertas iniciado
+
+ CoffeeControl v2 en http://localhost:3456
+ Red local:    http://192.168.1.76:3456
+ Panel admin:  http://localhost:3456/
+ Monitor op:   http://localhost:3456/coffeecontrol.html
+ Demo:         http://localhost:3456/demo.html
+ Credenciales seed: admin / coffeecontrol | supervisor1 / coffeecontrol2024
+
+2026-07-07T22:21:39.000Z [HTTP] START POST /api/tap/pour from=127.0.0.1:12212 len=0
+2026-07-07T22:21:39.162Z [HTTP] END POST /api/tap/pour status=404 after=162ms from=127.0.0.1:12212
+2026-07-07T22:27:17.573Z [HTTP] START POST /api/tap/ from=127.0.0.1:57707 len=0
+2026-07-07T22:27:17.754Z [HTTP] END POST /api/tap/ status=400 after=181ms from=127.0.0.1:57707
+2026-07-07T22:27:32.708Z [HTTP] START POST /api/auth/login from=127.0.0.1:57726 len=59
+2026-07-07T22:27:32.722Z [HTTP] END POST /api/auth/login status=404 after=14ms from=127.0.0.1:57726
+2026-07-07T22:27:34.802Z [HTTP] START POST /api/auth/login from=127.0.0.1:57730 len=59
+2026-07-07T22:27:34.805Z [HTTP] END POST /api/auth/login status=404 after=4ms from=127.0.0.1:57730
+2026-07-07T22:27:36.887Z [HTTP] START POST /api/auth/login from=127.0.0.1:57733 len=59
+2026-07-07T22:27:36.991Z [HTTP] END POST /api/auth/login status=200 after=104ms from=127.0.0.1:57733
+2026-07-07T22:27:39.057Z [HTTP] START POST /api/auth/change-password from=127.0.0.1:57736 len=85
+2026-07-07T22:27:39.090Z [HTTP] END POST /api/auth/change-password status=403 after=34ms from=127.0.0.1:57736
+2026-07-07T22:27:41.120Z [HTTP] START POST /api/auth/change-password from=127.0.0.1:57739 len=85
+2026-07-07T22:27:41.127Z [HTTP] END POST /api/auth/change-password status=403 after=7ms from=127.0.0.1:57739
+2026-07-07T22:27:43.355Z [HTTP] START GET /api/employees from=127.0.0.1:57742 len=0
+2026-07-07T22:27:43.357Z [HTTP] END GET /api/employees status=401 after=2ms from=127.0.0.1:57742
+2026-07-07T22:27:45.389Z [HTTP] START GET /api/employees from=127.0.0.1:57746 len=0
+2026-07-07T22:27:45.432Z [HTTP] END GET /api/employees status=200 after=44ms from=127.0.0.1:57746
+2026-07-07T22:31:02.789Z [HTTP] START POST /api/auth/login from=127.0.0.1:1447 len=47
+2026-07-07T22:31:02.893Z [HTTP] END POST /api/auth/login status=404 after=104ms from=127.0.0.1:1447
+2026-07-07T22:31:03.831Z [HTTP] START POST /api/auth/login from=127.0.0.1:1447 len=47
+2026-07-07T22:31:03.835Z [HTTP] END POST /api/auth/login status=404 after=4ms from=127.0.0.1:1447
+2026-07-07T22:46:15.642Z [HTTP] START POST /api/auth/login from=127.0.0.1:37274 len=47
+2026-07-07T22:46:15.698Z [HTTP] END POST /api/auth/login status=404 after=56ms from=127.0.0.1:37274
+2026-07-07T22:46:16.527Z [HTTP] START POST /api/auth/login from=127.0.0.1:37274 len=47
+2026-07-07T22:46:16.531Z [HTTP] END POST /api/auth/login status=404 after=4ms from=127.0.0.1:37274
+2026-07-07T22:46:18.801Z [HTTP] START POST /api/auth/login from=127.0.0.1:37274 len=47
+2026-07-07T22:46:18.804Z [HTTP] END POST /api/auth/login status=404 after=3ms from=127.0.0.1:37274
+2026-07-07T22:46:19.824Z [HTTP] START POST /api/auth/login from=127.0.0.1:37274 len=47
+2026-07-07T22:46:19.830Z [HTTP] END POST /api/auth/login status=404 after=6ms from=127.0.0.1:37274
+2026-07-07T23:51:56.816Z [HTTP] START GET /api/admin/login from=127.0.0.1:16671 len=0
+2026-07-07T23:51:56.822Z [HTTP] END GET /api/admin/login status=404 after=6ms from=127.0.0.1:16671
+2026-07-07T23:54:38.913Z [HTTP] START POST /api/auth/login from=127.0.0.1:3493 len=54
+2026-07-07T23:54:39.256Z [HTTP] END POST /api/auth/login status=401 after=343ms from=127.0.0.1:3493
+2026-07-08T00:04:46.508Z [HTTP] START POST /api/auth/login from=127.0.0.1:37953 len=47
+2026-07-08T00:04:46.989Z [HTTP] END POST /api/auth/login status=200 after=481ms from=127.0.0.1:37953
+2026-07-08T00:05:08.033Z [HTTP] START GET /api/access-levels from=127.0.0.1:37978 len=0
+2026-07-08T00:05:08.145Z [HTTP] END GET /api/access-levels status=200 after=112ms from=127.0.0.1:37978
+2026-07-08T00:05:36.484Z [HTTP] START POST /api/access-levels from=127.0.0.1:62222 len=134
+2026-07-08T00:05:36.530Z [HTTP] END POST /api/access-levels status=201 after=46ms from=127.0.0.1:62222
+2026-07-08T00:06:09.471Z [HTTP] START POST /api/access-levels from=127.0.0.1:52574 len=79
+2026-07-08T00:06:09.777Z [HTTP] END POST /api/access-levels status=409 after=306ms from=127.0.0.1:52574
+2026-07-08T00:06:36.748Z [HTTP] START POST /api/access-levels from=127.0.0.1:52605 len=79
+2026-07-08T00:06:36.885Z [HTTP] END POST /api/access-levels status=409 after=138ms from=127.0.0.1:52605
+2026-07-08T00:07:06.551Z [HTTP] START PATCH /api/access-levels/97 from=127.0.0.1:52638 len=47
+2026-07-08T00:07:06.836Z [HTTP] END PATCH /api/access-levels/97 status=200 after=285ms from=127.0.0.1:52638
+2026-07-08T00:07:31.555Z [HTTP] START DELETE /api/access-levels/97 from=127.0.0.1:52666 len=0
+2026-07-08T00:07:31.567Z [HTTP] END DELETE /api/access-levels/97 status=200 after=12ms from=127.0.0.1:52666
+2026-07-08T00:08:00.680Z [HTTP] START GET /api/employees from=127.0.0.1:52710 len=0
+2026-07-08T00:08:00.703Z [HTTP] END GET /api/employees status=200 after=24ms from=127.0.0.1:52710
+2026-07-08T00:08:21.202Z [HTTP] START POST /api/access-levels from=127.0.0.1:52733 len=82
+2026-07-08T00:08:21.213Z [HTTP] END POST /api/access-levels status=201 after=11ms from=127.0.0.1:52733
+2026-07-08T00:08:21.289Z [HTTP] START PATCH /api/employees/11 from=127.0.0.1:52734 len=23
+2026-07-08T00:08:21.301Z [HTTP] END PATCH /api/employees/11 status=200 after=12ms from=127.0.0.1:52734
+2026-07-08T00:08:44.911Z [HTTP] START GET /api/employees from=127.0.0.1:52759 len=0
+2026-07-08T00:08:44.917Z [HTTP] END GET /api/employees status=200 after=6ms from=127.0.0.1:52759
+2026-07-08T00:09:15.220Z [HTTP] START GET /api/dashboard/today from=127.0.0.1:52810 len=0
+2026-07-08T00:09:15.567Z [HTTP] END GET /api/dashboard/today status=200 after=347ms from=127.0.0.1:52810
+2026-07-08T00:09:39.558Z [HTTP] START GET /api/reports/employees from=127.0.0.1:52837 len=0
+2026-07-08T00:09:39.569Z [HTTP] END GET /api/reports/employees status=200 after=11ms from=127.0.0.1:52837
+2026-07-08T00:10:05.017Z [HTTP] START GET /api/machines from=127.0.0.1:52876 len=0
+2026-07-08T00:10:05.046Z [HTTP] END GET /api/machines status=200 after=29ms from=127.0.0.1:52876
+2026-07-08T00:10:29.671Z [HTTP] START GET /api/machines from=127.0.0.1:52902 len=0
+2026-07-08T00:10:29.681Z [HTTP] END GET /api/machines status=200 after=10ms from=127.0.0.1:52902
+2026-07-08T00:11:57.776Z [HTTP] START POST /api/tap from=127.0.0.1:63037 len=22
+[TAP] APROBADO — Mateo Scaramuzzino (1/5 hoy)
+2026-07-08T00:11:58.132Z [HTTP] END POST /api/tap status=200 after=356ms from=127.0.0.1:63037
+2026-07-08T00:13:36.402Z [HTTP] START GET /api/access-levels from=127.0.0.1:63146 len=0
+2026-07-08T00:13:36.681Z [HTTP] END GET /api/access-levels status=500 after=279ms from=127.0.0.1:63146
+2026-07-08T00:13:36.846Z [HTTP] START POST /api/access-levels from=127.0.0.1:63149 len=88
+2026-07-08T00:13:36.997Z [HTTP] END POST /api/access-levels status=500 after=151ms from=127.0.0.1:63149
+2026-07-08T00:13:37.092Z [HTTP] START POST /api/access-levels from=127.0.0.1:63151 len=88
+2026-07-08T00:13:37.228Z [HTTP] END POST /api/access-levels status=500 after=136ms from=127.0.0.1:63151
+2026-07-08T00:40:52.519Z [HTTP] START GET /api/employees from=127.0.0.1:19403 len=0
+2026-07-08T00:40:53.525Z [HTTP] END GET /api/employees status=500 after=1006ms from=127.0.0.1:19403
+2026-07-08T00:49:23.701Z [HTTP] START GET /api/machines from=127.0.0.1:22474 len=0
+2026-07-08T00:49:23.824Z [HTTP] END GET /api/machines status=200 after=123ms from=127.0.0.1:22474
+2026-07-08T00:49:23.854Z [HTTP] START GET /api/reports/employees from=127.0.0.1:22477 len=0
+2026-07-08T00:49:23.865Z [HTTP] END GET /api/reports/employees status=500 after=11ms from=127.0.0.1:22477

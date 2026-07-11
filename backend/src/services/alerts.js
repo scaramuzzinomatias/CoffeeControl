@@ -25,7 +25,7 @@ const FALLBACK_NOTIFICATION_SETTINGS = Object.freeze({
 let monitorHandle = null;
 let transport = null;
 let emailReadyLogged = false;
-let settingsCache = null;
+const settingsCache = {};
 let settingsCacheAt = 0;
 let settingsTableMissingLogged = false;
 
@@ -118,9 +118,9 @@ function buildSettingsApiModel(settings) {
     };
 }
 
-async function loadNotificationSettings(force = false) {
-    if (!force && settingsCache && (Date.now() - settingsCacheAt) < SETTINGS_CACHE_TTL_MS) {
-        return { ...settingsCache };
+async function loadNotificationSettings(tenantId, force = false) {
+    if (!force && settingsCache[tenantId] && (Date.now() - settingsCacheAt) < SETTINGS_CACHE_TTL_MS) {
+        return { ...settingsCache[tenantId] };
     }
 
     try {
@@ -134,14 +134,15 @@ async function loadNotificationSettings(force = false) {
                     notify_machine_backend_down,
                     employee_limit_warning_lead
              FROM notification_settings
-             WHERE id = 1`
+             WHERE id = 1 AND tenant_id = $1`,
+            [tenantId]
         );
 
         const settings = result.rowCount > 0
             ? sanitizeNotificationSettings(result.rows[0])
             : sanitizeNotificationSettings(FALLBACK_NOTIFICATION_SETTINGS);
 
-        settingsCache = settings;
+        settingsCache[tenantId] = settings;
         settingsCacheAt = Date.now();
         return { ...settings };
     } catch (err) {
@@ -151,7 +152,7 @@ async function loadNotificationSettings(force = false) {
                 settingsTableMissingLogged = true;
             }
             const fallback = sanitizeNotificationSettings(FALLBACK_NOTIFICATION_SETTINGS);
-            settingsCache = fallback;
+            settingsCache[tenantId] = fallback;
             settingsCacheAt = Date.now();
             return { ...fallback };
         }
@@ -159,18 +160,18 @@ async function loadNotificationSettings(force = false) {
     }
 }
 
-function invalidateSettingsCache() {
-    settingsCache = null;
+function invalidateSettingsCache(tenantId) {
+    delete settingsCache[tenantId];
     settingsCacheAt = 0;
 }
 
-async function getNotificationSettings() {
-    const settings = await loadNotificationSettings();
+async function getNotificationSettings(tenantId) {
+    const settings = await loadNotificationSettings(tenantId);
     return buildSettingsApiModel(settings);
 }
 
-async function getEmployeeLimitWarningLead() {
-    const settings = await loadNotificationSettings();
+async function getEmployeeLimitWarningLead(tenantId) {
+    const settings = await loadNotificationSettings(tenantId);
     return settings.employee_limit_warning_lead;
 }
 
@@ -182,7 +183,7 @@ function assertSettingsValid(settings, { requireRecipients = true } = {}) {
     return recipients;
 }
 
-async function saveNotificationSettings(input) {
+async function saveNotificationSettings(input, tenantId) {
     const settings = sanitizeNotificationSettings(input);
     if (settings.enabled && (
         settings.notify_employee_daily_blocked
@@ -196,6 +197,7 @@ async function saveNotificationSettings(input) {
     await pool.query(
         `INSERT INTO notification_settings(
             id,
+            tenant_id,
             enabled,
             recipient_emails,
             notify_employee_limit_warning,
@@ -206,8 +208,8 @@ async function saveNotificationSettings(input) {
             employee_limit_warning_lead,
             updated_at
         )
-         VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, NOW())
-         ON CONFLICT (id) DO UPDATE SET
+         VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
             enabled = EXCLUDED.enabled,
             recipient_emails = EXCLUDED.recipient_emails,
             notify_employee_limit_warning = EXCLUDED.notify_employee_limit_warning,
@@ -218,6 +220,7 @@ async function saveNotificationSettings(input) {
             employee_limit_warning_lead = EXCLUDED.employee_limit_warning_lead,
             updated_at = NOW()`,
         [
+            tenantId,
             settings.enabled,
             settings.recipient_emails,
             settings.notify_employee_limit_warning,
@@ -229,8 +232,8 @@ async function saveNotificationSettings(input) {
         ]
     );
 
-    invalidateSettingsCache();
-    return getNotificationSettings();
+    invalidateSettingsCache(tenantId);
+    return getNotificationSettings(tenantId);
 }
 
 function escapeHtml(value) {
@@ -271,19 +274,19 @@ function getTransport() {
     return transport;
 }
 
-async function openAlert({ alertKey, alertType, machineId = null, employeeId = null, payload = null }) {
+async function openAlert({ alertKey, alertType, machineId = null, employeeId = null, payload = null, tenantId }) {
     const existing = await pool.query(
         `SELECT alert_key, status, last_notified_at
          FROM alert_events
-         WHERE alert_key = $1`,
-        [alertKey]
+         WHERE alert_key = $1 AND tenant_id = $2`,
+        [alertKey, tenantId]
     );
 
     if (existing.rowCount === 0) {
         await pool.query(
-            `INSERT INTO alert_events(alert_key, alert_type, status, machine_id, employee_id, payload)
-             VALUES ($1, $2, 'open', $3, $4, $5::jsonb)`,
-            [alertKey, alertType, machineId, employeeId, payload ? JSON.stringify(payload) : null]
+            `INSERT INTO alert_events(alert_key, alert_type, status, machine_id, employee_id, payload, tenant_id)
+             VALUES ($1, $2, 'open', $3, $4, $5::jsonb, $6)`,
+            [alertKey, alertType, machineId, employeeId, payload ? JSON.stringify(payload) : null, tenantId]
         );
         return { shouldNotify: true };
     }
@@ -297,8 +300,8 @@ async function openAlert({ alertKey, alertType, machineId = null, employeeId = n
              last_seen_at = NOW(),
              resolved_at = NULL,
              payload = $4::jsonb
-         WHERE alert_key = $1`,
-        [alertKey, machineId, employeeId, payload ? JSON.stringify(payload) : null]
+         WHERE alert_key = $1 AND tenant_id = $5`,
+        [alertKey, machineId, employeeId, payload ? JSON.stringify(payload) : null, tenantId]
     );
 
     return {
@@ -306,24 +309,25 @@ async function openAlert({ alertKey, alertType, machineId = null, employeeId = n
     };
 }
 
-async function resolveAlert(alertKey) {
+async function resolveAlert(alertKey, tenantId) {
     await pool.query(
         `UPDATE alert_events
          SET status = 'resolved',
              resolved_at = NOW(),
              last_seen_at = NOW()
          WHERE alert_key = $1
+           AND tenant_id = $2
            AND status <> 'resolved'`,
-        [alertKey]
+        [alertKey, tenantId]
     );
 }
 
-async function markAlertNotified(alertKey) {
+async function markAlertNotified(alertKey, tenantId) {
     await pool.query(
         `UPDATE alert_events
          SET last_notified_at = NOW()
-         WHERE alert_key = $1`,
-        [alertKey]
+         WHERE alert_key = $1 AND tenant_id = $2`,
+        [alertKey, tenantId]
     );
 }
 
@@ -374,11 +378,12 @@ async function notifyIfNeeded({
     text,
     html,
     recipients = null,
-    bccOnly = false
+    bccOnly = false,
+    tenantId
 }) {
     try {
-        const state = await openAlert({ alertKey, alertType, machineId, employeeId, payload });
-        const settings = await loadNotificationSettings();
+        const state = await openAlert({ alertKey, alertType, machineId, employeeId, payload, tenantId });
+        const settings = await loadNotificationSettings(tenantId);
         if (!alertTypeEnabled(settings, alertType)) return false;
         if (!state.shouldNotify) return false;
         const deliveryRecipients = Array.isArray(recipients)
@@ -386,7 +391,7 @@ async function notifyIfNeeded({
             : parseRecipients(settings.recipient_emails);
         const sent = await sendEmail({ subject, text, html, recipients: deliveryRecipients, bccOnly });
         if (sent) {
-            await markAlertNotified(alertKey);
+            await markAlertNotified(alertKey, tenantId);
             console.log(`[ALERT] Email enviado: ${alertKey}`);
         }
         return sent;
@@ -396,10 +401,10 @@ async function notifyIfNeeded({
     }
 }
 
-async function sendTestNotification(input = {}) {
+async function sendTestNotification(input = {}, tenantId) {
     const baseSettings = sanitizeNotificationSettings({
         ...FALLBACK_NOTIFICATION_SETTINGS,
-        ...(await loadNotificationSettings()),
+        ...(await loadNotificationSettings(tenantId)),
         ...(input || {})
     });
     const recipients = assertSettingsValid(baseSettings, { requireRecipients: true });
@@ -432,7 +437,7 @@ async function sendTestNotification(input = {}) {
     };
 }
 
-async function notifyEmployeeDailyBlocked({ employeeId, employeeName, dailyLimit, tapsToday, machineName, uid }) {
+async function notifyEmployeeDailyBlocked({ employeeId, employeeName, dailyLimit, tapsToday, machineName, uid, tenantId }) {
     const { timeZone, businessDate: dayKey } = await systemSettings.getBusinessTimeContext();
     const alertKey = `employee-daily-block-${employeeId}-${dayKey}`;
     const payload = {
@@ -458,15 +463,15 @@ async function notifyEmployeeDailyBlocked({ employeeId, employeeName, dailyLimit
         <h2>Empleado bloqueado por límite diario</h2>
         <div>${textToHtml(text)}</div>
     `;
-    return notifyIfNeeded({ alertKey, alertType: 'employee_daily_blocked', employeeId, payload, subject, text, html });
+    return notifyIfNeeded({ alertKey, alertType: 'employee_daily_blocked', employeeId, payload, subject, text, html, tenantId });
 }
 
-async function loadEmployeeWarningRecipients(employeeId) {
+async function loadEmployeeWarningRecipients(employeeId, tenantId) {
     const employeeResult = await pool.query(
         `SELECT id, name, email, department, warning_enabled
          FROM employees
-         WHERE id = $1 AND active = true`,
-        [employeeId]
+         WHERE id = $1 AND active = true AND tenant_id = $2`,
+        [employeeId, tenantId]
     );
 
     if (employeeResult.rowCount === 0) return null;
@@ -486,6 +491,7 @@ async function loadEmployeeWarningRecipients(employeeId) {
              WHERE active = true
                AND role = 'supervisor'
                AND email IS NOT NULL
+               AND tenant_id = $2
                AND TRIM(LOWER(department)) = TRIM(LOWER($1))
              UNION
              SELECT au.email
@@ -495,8 +501,10 @@ async function loadEmployeeWarningRecipients(employeeId) {
              WHERE au.active = true
                AND au.role = 'supervisor'
                AND au.email IS NOT NULL
+               AND au.tenant_id = $2
+               AND aud.tenant_id = $2
                AND TRIM(LOWER(aud.department)) = TRIM(LOWER($1))`,
-            [employee.department]
+            [employee.department, tenantId]
         );
         recipients.push(...supervisorResult.rows.map(row => row.email));
     }
@@ -507,10 +515,10 @@ async function loadEmployeeWarningRecipients(employeeId) {
     };
 }
 
-async function notifyEmployeeLimitWarning({ employeeId, dailyLimit, tapsToday, machineName, uid }) {
-    const target = await loadEmployeeWarningRecipients(employeeId);
+async function notifyEmployeeLimitWarning({ employeeId, dailyLimit, tapsToday, machineName, uid, tenantId }) {
+    const target = await loadEmployeeWarningRecipients(employeeId, tenantId);
     if (!target) return false;
-    const settings = await loadNotificationSettings();
+    const settings = await loadNotificationSettings(tenantId);
 
     const { timeZone, businessDate: dayKey } = await systemSettings.getBusinessTimeContext();
     const relationText = tapsToday > dailyLimit
@@ -564,7 +572,8 @@ async function notifyEmployeeLimitWarning({ employeeId, dailyLimit, tapsToday, m
         text,
         html,
         recipients: target.recipients,
-        bccOnly: true
+        bccOnly: true,
+        tenantId
     });
 }
 
@@ -603,11 +612,11 @@ async function notifyMachineBackendDown(machine) {
           <li>Último contacto: <strong>${escapeHtml(lastSeen)}</strong></li>
         </ul>
     `;
-    return notifyIfNeeded({ alertKey, alertType: 'machine_backend_down', machineId: machine.id, payload, subject, text, html });
+    return notifyIfNeeded({ alertKey, alertType: 'machine_backend_down', machineId: machine.id, payload, subject, text, html, tenantId: machine.tenant_id });
 }
 
-async function resolveMachineBackendDown(machineId) {
-    return resolveAlert(`machine-backend-down-${machineId}`);
+async function resolveMachineBackendDown(machineId, tenantId) {
+    return resolveAlert(`machine-backend-down-${machineId}`, tenantId);
 }
 
 async function notifyMachineOffline(machine) {
@@ -636,11 +645,11 @@ async function notifyMachineOffline(machine) {
         <h2>Máquina offline</h2>
         <div>${textToHtml(text)}</div>
     `;
-    return notifyIfNeeded({ alertKey, alertType: 'machine_offline', machineId: machine.id, payload, subject, text, html });
+    return notifyIfNeeded({ alertKey, alertType: 'machine_offline', machineId: machine.id, payload, subject, text, html, tenantId: machine.tenant_id });
 }
 
-async function resolveMachineOffline(machineId) {
-    return resolveAlert(`machine-offline-${machineId}`);
+async function resolveMachineOffline(machineId, tenantId) {
+    return resolveAlert(`machine-offline-${machineId}`, tenantId);
 }
 
 function stockAlertStatus(stockItem) {
@@ -702,13 +711,14 @@ async function notifyStockLow({ machine, stockItem }) {
         payload,
         subject,
         text,
-        html
+        html,
+        tenantId: machine.tenant_id
     });
 }
 
-async function resolveStockLow(machineId, stockItemId) {
+async function resolveStockLow(machineId, stockItemId, tenantId) {
     if (!machineId || !stockItemId) return false;
-    await resolveAlert(`stock-low-${machineId}-${stockItemId}`);
+    await resolveAlert(`stock-low-${machineId}-${stockItemId}`, tenantId);
     return true;
 }
 
@@ -718,13 +728,13 @@ async function syncStockLowAlert({ machine, stockItem }) {
     if (status.key === 'low' || status.key === 'empty') {
         return notifyStockLow({ machine, stockItem: { ...stockItem, status: status.key, status_label: status.label } });
     }
-    return resolveStockLow(machine.id, stockItem.id);
+    return resolveStockLow(machine.id, stockItem.id, machine.tenant_id);
 }
 
 async function checkMachineOfflineAlerts() {
     try {
         const result = await pool.query(
-            `SELECT id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url
+            `SELECT id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, tenant_id
              FROM machines
              WHERE active = true`
         );
@@ -738,7 +748,7 @@ async function checkMachineOfflineAlerts() {
             if (isOffline) {
                 await notifyMachineOffline(machine);
             } else {
-                await resolveMachineOffline(machine.id);
+                await resolveMachineOffline(machine.id, machine.tenant_id);
             }
         }
     } catch (err) {

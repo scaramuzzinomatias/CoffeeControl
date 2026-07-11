@@ -1,6 +1,6 @@
 // src/routes/employees.js
 const express = require('express');
-const pool    = require('../db/pool');
+
 const { requireManager } = require('../middleware/roleAccess');
 const { normalizeLimitMode } = require('../lib/dailyLimit');
 const { buildDepartmentScopeClause } = require('../lib/accessScope');
@@ -42,12 +42,13 @@ function departmentExpr(column) {
     return `COALESCE(NULLIF(TRIM(${column}), ''), 'Sin área')`;
 }
 
-async function getAccessLevelById(id) {
-    return pool.query(
+// NOTA: filtro tenant_id redundante cuando RLS de access_levels esté activo
+async function getAccessLevelById(db, id, tenantId) {
+    return db.query(
         `SELECT id, code, name, active
          FROM access_levels
-         WHERE id = $1`,
-        [id]
+         WHERE id = $1 AND tenant_id = $2`,
+        [id, tenantId]
     );
 }
 
@@ -61,7 +62,10 @@ router.get('/', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
-        const result = await pool.query(
+        // NOTA: al.tenant_id en el ON del LEFT JOIN preserva el LEFT JOIN
+        // (NULL si no hay match de tenant) y será redundante con RLS activo
+        const params2 = params.concat([req.user.tenant_id]);
+        const result = await req.db.query(
             `SELECT e.*,
                 al.code AS access_level_code,
                 al.name AS access_level_name,
@@ -77,14 +81,15 @@ router.get('/', async (req, res) => {
                     )) FILTER (WHERE nc.id IS NOT NULL), '[]'
                 ) AS nfc_cards
              FROM employees e
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${params.length + 1}
              LEFT JOIN nfc_cards nc ON nc.employee_id = e.id
              WHERE e.active = true
-               ${scope.sql}
+               AND e.tenant_id = $${params.length + 1}
+                ${scope.sql}
              GROUP BY e.id, al.id
              ORDER BY e.name`
             ,
-            params
+            params2
         );
         res.json({
             employees: result.rows,
@@ -106,7 +111,7 @@ router.get('/:id', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
-        const emp = await pool.query(
+        const emp = await req.db.query(
             `SELECT e.*,
                 al.code AS access_level_code,
                 al.name AS access_level_name,
@@ -122,33 +127,36 @@ router.get('/:id', async (req, res) => {
                     )) FILTER (WHERE nc.id IS NOT NULL), '[]'
                 ) AS nfc_cards
              FROM employees e
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${params.length + 1}
              LEFT JOIN nfc_cards nc ON nc.employee_id = e.id
              WHERE e.id = $1
-               ${scope.sql}
+               AND e.tenant_id = $${params.length + 1}
+                ${scope.sql}
              GROUP BY e.id, al.id`,
-            params
+            params.concat([req.user.tenant_id])
         );
         if (emp.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
 
         // Consumo por máquina (mes actual)
-        const machines = await pool.query(
+        const machines = await req.db.query(
             `SELECT machine_name, location, taps_count, spent_cents
              FROM employee_machine_consumption
              WHERE employee_id = $1
+               AND tenant_id = $2
              ORDER BY taps_count DESC`,
-            [req.params.id]
+            [req.params.id, req.user.tenant_id]
         );
 
         // Historial últimos 30 taps
-        const taps = await pool.query(
+        const taps = await req.db.query(
             `SELECT t.id, m.name AS machine_name, t.approved, t.deny_reason,
                     t.amount_cents, t.tapped_at
              FROM taps t
-             JOIN machines m ON m.id = t.machine_id
+             JOIN machines m ON m.id = t.machine_id AND m.tenant_id = $2
              WHERE t.employee_id = $1
+               AND t.tenant_id = $2
              ORDER BY t.tapped_at DESC LIMIT 30`,
-            [req.params.id]
+            [req.params.id, req.user.tenant_id]
         );
 
         res.json({
@@ -176,18 +184,19 @@ router.post('/', requireManager, async (req, res) => {
         const accessLevelId = normalizeAccessLevelId(access_level_id, { allowNull: true });
         let accessLevel = null;
         if (accessLevelId !== null) {
-            const accessLevelResult = await getAccessLevelById(accessLevelId);
+            const accessLevelResult = await getAccessLevelById(req.db, accessLevelId, req.user.tenant_id);
             if (accessLevelResult.rowCount === 0) {
                 return res.status(400).json({ error: 'Nivel de acceso inválido' });
             }
             accessLevel = accessLevelResult.rows[0];
         }
-        const result = await pool.query(
+        const result = await req.db.query(
             `INSERT INTO employees
-                (name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (tenant_id, name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              RETURNING *`,
             [
+                req.user.tenant_id,
                 name.trim(),
                 normalizeOptionalString(department),
                 normalizeOptionalString(email),
@@ -235,10 +244,10 @@ router.post('/', requireManager, async (req, res) => {
 router.patch('/:id', requireManager, async (req, res) => {
     const { name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id, active } = req.body;
     try {
-        const before = await pool.query(
+        const before = await req.db.query(
             `SELECT id, name, department, email, dni, legajo, phone, daily_limit, daily_limit_mode, warning_enabled, access_level_id, active
-             FROM employees WHERE id = $1`,
-            [req.params.id]
+             FROM employees WHERE id = $1 AND tenant_id = $2`,
+            [req.params.id, req.user.tenant_id]
         );
         if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
         const limitValue = normalizeDailyLimit(daily_limit, { allowNull: true });
@@ -251,13 +260,13 @@ router.patch('/:id', requireManager, async (req, res) => {
             : null;
         let accessLevel = null;
         if (hasAccessLevelField && accessLevelId !== null) {
-            const accessLevelResult = await getAccessLevelById(accessLevelId);
+            const accessLevelResult = await getAccessLevelById(req.db, accessLevelId, req.user.tenant_id);
             if (accessLevelResult.rowCount === 0) {
                 return res.status(400).json({ error: 'Nivel de acceso inválido' });
             }
             accessLevel = accessLevelResult.rows[0];
         }
-        const result = await pool.query(
+        const result = await req.db.query(
             `UPDATE employees SET
                 name        = COALESCE($1, name),
                 department  = COALESCE($2, department),
@@ -270,7 +279,9 @@ router.patch('/:id', requireManager, async (req, res) => {
                 warning_enabled  = COALESCE($9, warning_enabled),
                 access_level_id = CASE WHEN $10 THEN $11::int ELSE access_level_id END,
                 active      = COALESCE($12, active)
-             WHERE id = $13 RETURNING *`,
+             WHERE id = $13
+               AND tenant_id = $14
+             RETURNING *`,
             [
                 normalizeOptionalString(name),
                 normalizeOptionalString(department),
@@ -284,7 +295,8 @@ router.patch('/:id', requireManager, async (req, res) => {
                 hasAccessLevelField,
                 accessLevelId,
                 activeValue,
-                req.params.id
+                req.params.id,
+                req.user.tenant_id
             ]
         );
         const action = before.rows[0].active && result.rows[0].active === false
@@ -334,15 +346,15 @@ router.patch('/:id', requireManager, async (req, res) => {
 router.patch('/:id/limit', requireManager, async (req, res) => {
     const { daily_limit } = req.body;
     try {
-        const before = await pool.query(
-            'SELECT id, name, daily_limit FROM employees WHERE id = $1',
-            [req.params.id]
+        const before = await req.db.query(
+            'SELECT id, name, daily_limit FROM employees WHERE id = $1 AND tenant_id = $2',
+            [req.params.id, req.user.tenant_id]
         );
         if (before.rowCount === 0) return res.status(404).json({ error: 'No encontrado' });
         const limitValue = normalizeDailyLimit(daily_limit);
-        const result = await pool.query(
-            'UPDATE employees SET daily_limit=$1 WHERE id=$2 RETURNING id,name,daily_limit',
-            [limitValue, req.params.id]
+        const result = await req.db.query(
+            'UPDATE employees SET daily_limit=$1 WHERE id=$2 AND tenant_id=$3 RETURNING id,name,daily_limit',
+            [limitValue, req.params.id, req.user.tenant_id]
         );
         await audit.logAuditEvent({
             req,
@@ -371,6 +383,8 @@ router.post('/:id/cards', requireManager, async (req, res) => {
     if (!uid) return res.status(400).json({ error: 'uid requerido' });
     try {
         const result = await registerOrAssignCard({
+            db: req.db,
+            tenantId: req.user.tenant_id,
             req,
             employeeId: Number.parseInt(req.params.id, 10),
             uid,
@@ -384,28 +398,26 @@ router.post('/:id/cards', requireManager, async (req, res) => {
 });
 
 // DELETE /api/employees/:id — eliminar empleado (soft delete) + desactivar tarjetas
+// Usa req.db porque authJwt ya abrió la transacción con app.tenant_id seteado.
 router.delete('/:id', requireManager, async (req, res) => {
-    const client = await pool.connect();
     let employee = null;
     try {
-        await client.query('BEGIN');
-        const result = await client.query(
-            'UPDATE employees SET active=false WHERE id=$1 RETURNING id,name',
-            [req.params.id]
+        const result = await req.db.query(
+            'UPDATE employees SET active=false WHERE id=$1 AND tenant_id=$2 RETURNING id,name',
+            [req.params.id, req.user.tenant_id]
         );
         if (result.rowCount === 0) {
-            await client.query('ROLLBACK');
             return res.status(404).json({ error: 'No encontrado' });
         }
         employee = result.rows[0];
         // Desactivar todas las tarjetas del empleado
-        await client.query(
+        await req.db.query(
             `UPDATE nfc_cards
              SET active=false, status='inactive'
-             WHERE employee_id=$1`,
-            [req.params.id]
+             WHERE employee_id=$1
+               AND tenant_id=$2`,
+            [req.params.id, req.user.tenant_id]
         );
-        await client.query('COMMIT');
         await audit.logAuditEvent({
             req,
             action: 'employee.deactivate',
@@ -416,10 +428,7 @@ router.delete('/:id', requireManager, async (req, res) => {
         });
         res.json({ ok: true });
     } catch (err) {
-        await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
     }
 });
 
@@ -428,6 +437,8 @@ router.patch('/:id/cards/:cardId', requireManager, async (req, res) => {
     const { active, label, employee_id, status } = req.body;
     try {
         const result = await updateCardAssignment({
+            db: req.db,
+            tenantId: req.user.tenant_id,
             req,
             cardId: Number.parseInt(req.params.cardId, 10),
             label,
@@ -446,6 +457,8 @@ router.patch('/:id/cards/:cardId', requireManager, async (req, res) => {
 router.delete('/:id/cards/:cardId', requireManager, async (req, res) => {
     try {
         await deactivateCard({
+            db: req.db,
+            tenantId: req.user.tenant_id,
             req,
             cardId: Number.parseInt(req.params.cardId, 10),
             employeeId: Number.parseInt(req.params.id, 10),

@@ -1,4 +1,3 @@
-const pool = require('../db/pool');
 const audit = require('../services/audit');
 
 function normalizeOptionalString(value) {
@@ -51,12 +50,13 @@ function mapCardRow(row) {
     };
 }
 
-async function getEmployeeForCardOperation(employeeId) {
-    const result = await pool.query(
+async function getEmployeeForCardOperation(db, tenantId, employeeId) {
+    const result = await db.query(
         `SELECT id, name, department, email, active
          FROM employees
-         WHERE id = $1`,
-        [employeeId]
+         WHERE id = $1
+           AND tenant_id = $2`,
+        [employeeId, tenantId]
     );
     if (!result.rowCount) {
         const err = new Error('Empleado no encontrado');
@@ -71,10 +71,10 @@ async function getEmployeeForCardOperation(employeeId) {
     return result.rows[0];
 }
 
-async function searchEmployeesForCardOps(query, { limit = 20 } = {}) {
+async function searchEmployeesForCardOps(db, tenantId, query, { limit = 20 } = {}) {
     const normalized = String(query || '').trim();
     if (normalized.length < 2) return [];
-    const result = await pool.query(
+    const result = await db.query(
         `SELECT
             e.id,
             e.name,
@@ -99,24 +99,26 @@ async function searchEmployeesForCardOps(query, { limit = 20 } = {}) {
          FROM employees e
          LEFT JOIN nfc_cards nc
            ON nc.employee_id = e.id
+          AND nc.tenant_id = $1
          WHERE e.active = true
+           AND e.tenant_id = $1
            AND (
-                e.name ILIKE $1
-             OR COALESCE(e.email, '') ILIKE $1
-             OR COALESCE(e.legajo, '') ILIKE $1
-             OR COALESCE(e.dni, '') ILIKE $1
+                e.name ILIKE $2
+             OR COALESCE(e.email, '') ILIKE $2
+             OR COALESCE(e.legajo, '') ILIKE $2
+             OR COALESCE(e.dni, '') ILIKE $2
            )
          GROUP BY e.id
          ORDER BY e.name
-         LIMIT $2`,
-        [`%${normalized}%`, Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 50)]
+         LIMIT $3`,
+        [tenantId, `%${normalized}%`, Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 50)]
     );
     return result.rows;
 }
 
-async function lookupCardByUid(uid) {
+async function lookupCardByUid(db, tenantId, uid) {
     const normalizedUid = normalizeCardUid(uid);
-    const result = await pool.query(
+    const result = await db.query(
         `SELECT
             nc.id,
             nc.uid,
@@ -130,20 +132,22 @@ async function lookupCardByUid(uid) {
          FROM nfc_cards nc
          LEFT JOIN employees e
            ON e.id = nc.employee_id
-         WHERE nc.uid = $1`,
-        [normalizedUid]
+          AND e.tenant_id = $1
+         WHERE nc.uid = $2
+           AND nc.tenant_id = $1`,
+        [tenantId, normalizedUid]
     );
     return result.rowCount ? mapCardRow(result.rows[0]) : null;
 }
 
-async function registerOrAssignCard({ req, employeeId, uid, label, source = 'panel' }) {
+async function registerOrAssignCard({ db, tenantId, req, employeeId, uid, label, source = 'panel' }) {
     const normalizedUid = normalizeCardUid(uid);
-    const employee = await getEmployeeForCardOperation(employeeId);
-    const before = await lookupCardByUid(normalizedUid);
+    const employee = await getEmployeeForCardOperation(db, tenantId, employeeId);
+    const before = await lookupCardByUid(db, tenantId, normalizedUid);
 
-    const result = await pool.query(
-        `INSERT INTO nfc_cards (uid, employee_id, label)
-         VALUES ($1, $2, $3)
+    const result = await db.query(
+        `INSERT INTO nfc_cards (tenant_id, uid, employee_id, label)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (uid) DO UPDATE SET
             employee_id = EXCLUDED.employee_id,
             label = EXCLUDED.label,
@@ -151,6 +155,7 @@ async function registerOrAssignCard({ req, employeeId, uid, label, source = 'pan
             status = 'active'
          RETURNING id, uid, label, employee_id, active, status`,
         [
+            tenantId,
             normalizedUid,
             employeeId,
             normalizeOptionalString(label) || 'Tarjeta'
@@ -190,6 +195,8 @@ async function registerOrAssignCard({ req, employeeId, uid, label, source = 'pan
 }
 
 async function updateCardAssignment({
+    db,
+    tenantId,
     req,
     cardId,
     label,
@@ -198,7 +205,7 @@ async function updateCardAssignment({
     active,
     source = 'panel'
 }) {
-    const beforeResult = await pool.query(
+    const beforeResult = await db.query(
         `SELECT
             nc.id,
             nc.uid,
@@ -210,8 +217,10 @@ async function updateCardAssignment({
          FROM nfc_cards nc
          LEFT JOIN employees e
            ON e.id = nc.employee_id
-         WHERE nc.id = $1`,
-        [cardId]
+          AND e.tenant_id = $1
+         WHERE nc.id = $2
+           AND nc.tenant_id = $1`,
+        [tenantId, cardId]
     );
     if (!beforeResult.rowCount) {
         const err = new Error('TAG NFC no encontrado');
@@ -224,7 +233,7 @@ async function updateCardAssignment({
     const nextEmployeeId = employeeId ?? null;
     let targetEmployee = null;
     if (nextEmployeeId !== null) {
-        targetEmployee = await getEmployeeForCardOperation(nextEmployeeId);
+        targetEmployee = await getEmployeeForCardOperation(db, tenantId, nextEmployeeId);
     }
 
     const normalizedStatus = status === undefined
@@ -240,7 +249,7 @@ async function updateCardAssignment({
                     ? 'active'
                     : 'inactive';
 
-    const result = await pool.query(
+    const result = await db.query(
         `UPDATE nfc_cards SET
             status = COALESCE($1, status, CASE WHEN active THEN 'active' ELSE 'inactive' END),
             active = CASE
@@ -250,12 +259,14 @@ async function updateCardAssignment({
             label = COALESCE($2, label),
             employee_id = COALESCE($3::int, employee_id)
          WHERE id = $4
+           AND tenant_id = $5
          RETURNING id, uid, label, employee_id, active, status`,
         [
             finalStatus,
             normalizeOptionalString(label),
             nextEmployeeId,
-            cardId
+            cardId,
+            tenantId
         ]
     );
 
@@ -298,19 +309,22 @@ async function updateCardAssignment({
 }
 
 async function deactivateCard({
+    db,
+    tenantId,
     req,
     cardId,
     employeeId,
     source = 'panel'
 }) {
-    const result = await pool.query(
+    const result = await db.query(
         `UPDATE nfc_cards
          SET active = false,
              status = 'inactive'
          WHERE id = $1
            AND employee_id = $2
+           AND tenant_id = $3
          RETURNING id, uid, label, employee_id, active, status`,
-        [cardId, employeeId]
+        [cardId, employeeId, tenantId]
     );
     if (!result.rowCount) {
         const err = new Error('TAG NFC no encontrado');

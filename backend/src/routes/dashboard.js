@@ -28,7 +28,7 @@ const effectivePolicy = effectivePolicyExpressions('e', 'al');
 router.get('/today', async (req, res) => {
     try {
         const { timeZone, businessDate } = await systemSettings.getBusinessTimeContext();
-        const warningLead = await alerts.getEmployeeLimitWarningLead();
+        const warningLead = await alerts.getEmployeeLimitWarningLead(req.user.tenant_id);
         const params = [timeZone, businessDate];
         const scope = buildDepartmentScopeClause({
             user: req.user,
@@ -36,7 +36,8 @@ router.get('/today', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
-        const result = await pool.query(
+        // NOTA: al.tenant_id en el ON del LEFT JOIN; redundante con RLS activo
+        const result = await req.db.query(
             `SELECT
                 e.id AS employee_id,
                 e.name AS employee_name,
@@ -51,16 +52,18 @@ router.get('/today', async (req, res) => {
                 COUNT(t.id) FILTER (WHERE t.approved = true AND t.over_limit = true) AS taps_over_limit,
                 COALESCE(SUM(t.amount_cents) FILTER (WHERE t.approved = true), 0) AS spent_today_cents
              FROM employees e
-             LEFT JOIN access_levels al ON al.id = e.access_level_id
+             LEFT JOIN access_levels al ON al.id = e.access_level_id AND al.tenant_id = $${params.length + 1}
              LEFT JOIN taps t
                 ON t.employee_id = e.id
+               AND t.tenant_id = $${params.length + 1}
                AND ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
              WHERE e.active = true
+               AND e.tenant_id = $${params.length + 1}
                ${scope.sql}
              GROUP BY e.id, al.id
              ORDER BY taps_today DESC`
             ,
-            params
+            params.concat([req.user.tenant_id])
         );
 
         const employees = result.rows.map(row => ({
@@ -109,7 +112,8 @@ router.get('/monthly', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
-        const result = await pool.query(
+        params.push(req.user.tenant_id);
+        const result = await req.db.query(
             `SELECT
                 e.id AS employee_id,
                 e.name AS employee_name,
@@ -119,9 +123,11 @@ router.get('/monthly', async (req, res) => {
              FROM employees e
              LEFT JOIN taps t
                 ON t.employee_id = e.id
+               AND t.tenant_id = $${params.length}
                AND t.approved = true
                AND ${buildBusinessMonthRangeSql('t.tapped_at', 1, 2)}
              WHERE e.active = true
+               AND e.tenant_id = $${params.length}
                ${scope.sql}
              GROUP BY e.id, e.name, e.department
              ORDER BY taps_total DESC`
@@ -157,7 +163,8 @@ router.get('/feed', async (req, res) => {
             params,
             column: departmentExpr('e.department')
         });
-        const result = await pool.query(
+        params.push(req.user.tenant_id);
+        const result = await req.db.query(
             `SELECT
                 t.id,
                 t.nfc_uid,
@@ -170,8 +177,11 @@ router.get('/feed', async (req, res) => {
                 t.tapped_at
              FROM taps t
              LEFT JOIN employees e ON e.id = t.employee_id
+               AND e.tenant_id = $${params.length}
              JOIN machines  m ON m.id = t.machine_id
+               AND m.tenant_id = $${params.length}
              WHERE ${buildBusinessDayRangeSql('t.tapped_at', 1, 2)}
+               AND t.tenant_id = $${params.length}
                ${scope.sql}
              ORDER BY t.tapped_at DESC
              LIMIT 50`
@@ -211,7 +221,7 @@ router.get('/uid-history/:uid', requireManager, async (req, res) => {
 // UIDs que tapearon como desconocidos y aún no tienen tarjeta registrada
 router.get('/unknown-uids', requireManager, async (req, res) => {
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT DISTINCT ON (t.nfc_uid)
                 t.nfc_uid         AS uid,
                 m.name            AS machine,
@@ -222,9 +232,12 @@ router.get('/unknown-uids', requireManager, async (req, res) => {
              WHERE t.deny_reason = 'card_unknown'
                AND NOT EXISTS (
                    SELECT 1 FROM nfc_cards nc
-                   WHERE nc.uid = t.nfc_uid AND nc.active = true
+                   WHERE nc.uid = t.nfc_uid
+                     AND nc.active = true
+                     AND nc.tenant_id = $1
                )
-             ORDER BY t.nfc_uid, t.tapped_at DESC`
+             ORDER BY t.nfc_uid, t.tapped_at DESC`,
+            [req.user.tenant_id]
         );
         res.json({ uids: result.rows });
     } catch (err) {

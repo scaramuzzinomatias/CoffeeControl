@@ -153,9 +153,11 @@ router.get('/active', async (req, res) => {
             column: departmentExpr('e.department')
         });
         const limit = normalizeLimit(req.query.limit);
+        params.push(req.user.tenant_id);
+        const tenantIdIdx = params.length;
         params.push(limit);
 
-        const result = await pool.query(
+        const result = await req.db.query(
             `SELECT
                 ae.alert_key,
                 ae.alert_type,
@@ -171,9 +173,11 @@ router.get('/active', async (req, res) => {
                 e.name AS employee_name,
                 ${departmentExpr('e.department')} AS employee_department
              FROM alert_events ae
-             LEFT JOIN machines m ON m.id = ae.machine_id
+             LEFT JOIN machines m ON m.id = ae.machine_id AND m.tenant_id = $${tenantIdIdx}
              LEFT JOIN employees e ON e.id = ae.employee_id
+              AND e.tenant_id = $${tenantIdIdx}
              WHERE ae.status = 'open'
+               AND ae.tenant_id = $${tenantIdIdx}
                ${scope.sql}
              ORDER BY COALESCE(ae.last_notified_at, ae.last_seen_at, ae.first_seen_at) DESC, ae.alert_key
              LIMIT $${params.length}`,

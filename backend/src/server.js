@@ -7,6 +7,8 @@ const { startAlertMonitor } = require('./services/alerts');
 
 const machineAuth  = require('./middleware/machineAuth');
 const authJwt      = require('./middleware/authJwt');
+const resolveTenantFromHost = require('./middleware/resolveTenantFromHost');
+const checkRegistrationSecret = require('./middleware/checkRegistrationSecret');
 
 const authRoutes       = require('./routes/auth');
 const mobileAuthRoutes = require('./routes/mobileAuth');
@@ -75,9 +77,9 @@ app.use((req, res, next) => {
     next();
 });
 
-// Rutas públicas
-app.use('/api/auth', authRoutes);
-app.use('/api/mobile-auth', mobileAuthRoutes);
+// Rutas públicas — requieren resolución de tenant por subdominio
+app.use('/api/auth', resolveTenantFromHost, authRoutes);
+app.use('/api/mobile-auth', resolveTenantFromHost, mobileAuthRoutes);
 
 // Rutas ESP8266 (secret de máquina)
 app.use('/api/tap', machineAuth, tapRoutes);
@@ -87,16 +89,12 @@ app.use('/api/machine-firmware', machineAuth, machineFirmwareRoutes);
 // Rutas del panel (JWT)
 app.use('/api/dashboard',   authJwt, dashboardRoutes);
 app.use('/api/employees',   authJwt, employeeRoutes);
-app.use('/api/machines', (req, res, next) => {
-    if (req.method === 'POST' && req.path === '/register') {
-        const s = req.headers['x-registration-secret'];
-        if (!s || s !== process.env.REGISTRATION_SECRET) {
-            return res.status(401).json({ error: 'Secret de registro inválido' });
-        }
-        return next();
-    }
-    authJwt(req, res, next);
-}, machineRoutes);
+// POST /api/machines/register — ruta pública (solo secret, sin JWT ni MAC)
+// resolveTenantFromHost corre solo acá, no en el resto de /api/machines
+app.post('/api/machines/register', resolveTenantFromHost, checkRegistrationSecret, machineRoutes.registerHandler);
+
+// El resto de /api/machines requiere JWT, sin resolveTenantFromHost
+app.use('/api/machines', authJwt, machineRoutes);
 
 app.use('/api/reports',     authJwt, reportRoutes);
 app.use('/api/admin-users', authJwt, adminUserRoutes);
