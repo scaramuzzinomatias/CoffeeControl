@@ -147,11 +147,41 @@ async function createTenantBWithAdmin(labelSuffix = '') {
                 await client.query('DELETE FROM audit_logs WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM admin_user_departments WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM system_settings WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM mobile_sessions WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM admin_users WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM tenants WHERE id = $1', [tenantBId]);
             });
         }
     };
+}
+
+async function httpRequestWithHost(method, path, hostHeader, body = null, token = null) {
+    const http = require('http');
+    const postData = body ? JSON.stringify(body) : null;
+    const headers = {
+        'Host': hostHeader,
+        'Content-Type': 'application/json'
+    };
+    if (postData) headers['Content-Length'] = Buffer.byteLength(postData);
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: '127.0.0.1',
+            port: TEST_PORT,
+            path,
+            method,
+            headers
+        };
+        const req = http.request(options, (res) => {
+            let responseBody = '';
+            res.on('data', chunk => responseBody += chunk);
+            res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(responseBody || '{}') }));
+        });
+        req.on('error', reject);
+        if (postData) req.write(postData);
+        req.end();
+    });
 }
 
 function tempUid(prefixHex) {
@@ -2163,6 +2193,45 @@ test('admin_user_departments no filtra scopes de departamento entre tenants', as
         assert.equal(listA.status, 200);
         const leaked = listA.json.users.find(u => u.username === `${TEST_PREFIX}_supb_depts`.toLowerCase());
         assert.equal(leaked, undefined, 'Supervisor de tenant B con department_scope filtrado en tenant A');
+    } finally {
+        await tenantB.cleanup();
+    }
+});
+
+test('mobile_sessions: refresh_token de tenant B no funciona en tenant A', async () => {
+    const tenantB = await createTenantBWithAdmin('_mobile');
+    try {
+        // Login móvil en tenant B (gerente puede usar mobile-auth según MOBILE_ROLES)
+        const loginB = await httpRequestWithHost('POST', '/api/mobile-auth/login',
+            `${tenantB.tenantBSlug}.localhost:${TEST_PORT}`,
+            {
+                username: tenantB.tenantBAdminUser,
+                password: 'coffeecontrol2024',
+                device_name: 'Tenant B Device',
+                platform: 'android'
+            }
+        );
+        assert.equal(loginB.status, 200, `Login móvil en tenant B esperaba 200, obtuvo ${loginB.status}: ${JSON.stringify(loginB.json)}`);
+        const refreshTokenB = loginB.json.refresh_token;
+        assert.ok(refreshTokenB, 'No se obtuvo refresh_token de tenant B');
+
+        // Intentar refresh de ese token pero con el Host de tenant A (legacy)
+        const refreshCrossTenant = await httpRequestWithHost('POST', '/api/mobile-auth/refresh',
+            `legacy.localhost:${TEST_PORT}`,
+            { refresh_token: refreshTokenB }
+        );
+        assert.equal(refreshCrossTenant.status, 401,
+            `El refresh_token de tenant B no debería funcionar contra tenant A (esperaba 401, obtuvo ${refreshCrossTenant.status})`
+        );
+
+        // Control: el mismo refresh_token SÍ debe funcionar contra su propio tenant (B)
+        const refreshSameTenant = await httpRequestWithHost('POST', '/api/mobile-auth/refresh',
+            `${tenantB.tenantBSlug}.localhost:${TEST_PORT}`,
+            { refresh_token: refreshTokenB }
+        );
+        assert.equal(refreshSameTenant.status, 200,
+            `El refresh_token de tenant B debería funcionar contra su propio tenant (esperaba 200, obtuvo ${refreshSameTenant.status})`
+        );
     } finally {
         await tenantB.cleanup();
     }
