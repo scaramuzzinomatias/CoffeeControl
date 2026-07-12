@@ -148,6 +148,7 @@ async function createTenantBWithAdmin(labelSuffix = '') {
                 await client.query('DELETE FROM admin_user_departments WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM system_settings WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM mobile_sessions WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM notification_settings WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM admin_users WHERE tenant_id = $1', [tenantBId]);
                 await client.query('DELETE FROM tenants WHERE id = $1', [tenantBId]);
             });
@@ -2232,6 +2233,45 @@ test('mobile_sessions: refresh_token de tenant B no funciona en tenant A', async
         assert.equal(refreshSameTenant.status, 200,
             `El refresh_token de tenant B debería funcionar contra su propio tenant (esperaba 200, obtuvo ${refreshSameTenant.status})`
         );
+    } finally {
+        await tenantB.cleanup();
+    }
+});
+
+test('notification_settings: preferencias no se filtran entre tenants', async () => {
+    const tenantB = await createTenantBWithAdmin('_notif');
+    try {
+        const getBeforeB = await requestJson('GET', '/api/notification-settings', { token: tenantB.tokenB });
+        assert.equal(getBeforeB.status, 200);
+        const originalEnabledB = getBeforeB.json.settings.enabled;
+
+        // Cambiar la config de tenant B a un valor distinguible
+        const putB = await requestJson('PUT', '/api/notification-settings', {
+            token: tenantB.tokenB,
+            body: {
+                enabled: !originalEnabledB,
+                recipient_emails: ['tenantb-cross-test@example.test'],
+                notify_employee_limit_warning: true,
+                notify_employee_daily_blocked: true,
+                notify_machine_offline: true,
+                notify_stock_low: true,
+                notify_machine_backend_down: true,
+                employee_limit_warning_lead: 1
+            }
+        });
+        assert.equal(putB.status, 200, `PUT notification-settings en tenant B esperaba 200, obtuvo ${putB.status}: ${JSON.stringify(putB.json)}`);
+        assert.equal(putB.json.settings.recipient_emails, 'tenantb-cross-test@example.test');
+
+        // Tenant A no debe ver el cambio de tenant B
+        const getA = await requestJson('GET', '/api/notification-settings', { token: adminToken });
+        assert.equal(getA.status, 200);
+        const leaked = getA.json.settings.recipient_emails?.includes('tenantb-cross-test@example.test');
+        assert.equal(leaked, false, 'La configuración de notificaciones de tenant B se filtró a tenant A');
+
+        // Tenant B debe seguir viendo su propio cambio (no lo pisó tenant A ni quedó en un estado compartido)
+        const getAfterB = await requestJson('GET', '/api/notification-settings', { token: tenantB.tokenB });
+        assert.equal(getAfterB.status, 200);
+        assert.equal(getAfterB.json.settings.recipient_emails, 'tenantb-cross-test@example.test');
     } finally {
         await tenantB.cleanup();
     }
