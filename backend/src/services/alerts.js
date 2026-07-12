@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const { withTenantContext } = require('../db/tenantContext');
 const pool = require('../db/pool');
 const bootstrapPool = require('../db/bootstrapPool');
 const notificationTemplates = require('../config/notificationTemplates');
@@ -125,7 +126,7 @@ async function loadNotificationSettings(tenantId, force = false) {
     }
 
     try {
-        const result = await pool.query(
+        const result = await withTenantContext(tenantId, client => client.query(
             `SELECT enabled,
                     recipient_emails,
                     notify_employee_limit_warning,
@@ -137,7 +138,7 @@ async function loadNotificationSettings(tenantId, force = false) {
              FROM notification_settings
              WHERE id = 1 AND tenant_id = $1`,
             [tenantId]
-        );
+        ));
 
         const settings = result.rowCount > 0
             ? sanitizeNotificationSettings(result.rows[0])
@@ -195,7 +196,7 @@ async function saveNotificationSettings(input, tenantId) {
         assertSettingsValid(settings, { requireRecipients: true });
     }
 
-    await pool.query(
+    await withTenantContext(tenantId, client => client.query(
         `INSERT INTO notification_settings(
             id,
             tenant_id,
@@ -231,7 +232,7 @@ async function saveNotificationSettings(input, tenantId) {
             settings.notify_machine_backend_down,
             settings.employee_limit_warning_lead
         ]
-    );
+    ));
 
     invalidateSettingsCache(tenantId);
     return getNotificationSettings(tenantId);
