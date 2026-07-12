@@ -83,6 +83,77 @@ function tempEmail(label) {
     return `${TEST_PREFIX}.${label}@example.test`;
 }
 
+async function createTenantBWithAdmin(labelSuffix = '') {
+    const tenantBSlug = `${TEST_PREFIX}_tenb${labelSuffix}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const tenantBName = `${TEST_PREFIX}_tenantB${labelSuffix}`;
+    const tenantBAdminUser = (`${TEST_PREFIX}_adminb${labelSuffix}`).toLowerCase();
+    const tenantBAdminPass = 'coffeecontrol2024';
+    let tenantBId;
+
+    await withDb(async (client) => {
+        await client.query(
+            "SELECT setval(pg_get_serial_sequence('tenants', 'id'), COALESCE((SELECT MAX(id) FROM tenants), 0))"
+        );
+        const tenantResult = await client.query(
+            `INSERT INTO tenants (slug, name) VALUES ($1, $2) RETURNING id`,
+            [tenantBSlug, tenantBName]
+        );
+        tenantBId = tenantResult.rows[0].id;
+
+        const passwordHash = await bcrypt.hash(tenantBAdminPass, 10);
+        await client.query(
+            `INSERT INTO admin_users(username, password_hash, role, full_name, active, tenant_id)
+             VALUES ($1, $2, 'gerente', $3, true, $4)`,
+            [tenantBAdminUser, passwordHash, `${TEST_PREFIX}_AdminB${labelSuffix}`, tenantBId]
+        );
+    });
+
+    const http = require('http');
+    const loginRes = await new Promise((resolve, reject) => {
+        const postData = JSON.stringify({ username: tenantBAdminUser, password: tenantBAdminPass });
+        const options = {
+            hostname: '127.0.0.1',
+            port: TEST_PORT,
+            path: '/api/auth/login',
+            method: 'POST',
+            headers: {
+                'Host': `${tenantBSlug}.localhost:${TEST_PORT}`,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData)
+            }
+        };
+        const req = http.request(options, (res) => {
+            let body = '';
+            res.on('data', chunk => body += chunk);
+            res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(body || '{}') }));
+        });
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
+    });
+
+    if (loginRes.status !== 200) {
+        throw new Error(`createTenantBWithAdmin: login falló con status ${loginRes.status}: ${JSON.stringify(loginRes.json)}`);
+    }
+
+    return {
+        tenantBId,
+        tenantBSlug,
+        tenantBAdminUser,
+        tokenB: loginRes.json.token,
+        cleanup: async () => {
+            await withDb(async (client) => {
+                // Orden importa por FK: hijos antes que admin_users, admin_users antes que tenants
+                await client.query('DELETE FROM audit_logs WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM admin_user_departments WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM system_settings WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM admin_users WHERE tenant_id = $1', [tenantBId]);
+                await client.query('DELETE FROM tenants WHERE id = $1', [tenantBId]);
+            });
+        }
+    };
+}
+
 function tempUid(prefixHex) {
     const tail = Math.floor(Math.random() * 0xffffffff).toString(16).toUpperCase().padStart(8, '0');
     return `${prefixHex}${tail}`.slice(0, 20);
@@ -2047,6 +2118,53 @@ test('audit_logs multi-tenant aislamiento cross-tenant', async () => {
                 await client.query('DELETE FROM tenants WHERE id = $1', [tenantBId]);
             });
         }
+    }
+});
+
+test('admin_users lista no filtra usuarios entre tenants', async () => {
+    const tenantB = await createTenantBWithAdmin('_users');
+    try {
+        // Tenant A no debe ver el admin de tenant B en su listado
+        const listA = await requestJson('GET', '/api/admin-users', { token: adminToken });
+        assert.equal(listA.status, 200);
+        const leaked = listA.json.users.find(u => u.username === tenantB.tenantBAdminUser);
+        assert.equal(leaked, undefined, `Usuario de tenant B (${tenantB.tenantBAdminUser}) filtrado en el listado de tenant A`);
+
+        // Tenant B no debe ver los usuarios de tenant A
+        const listB = await requestJson('GET', '/api/admin-users', { token: tenantB.tokenB });
+        assert.equal(listB.status, 200);
+        const leakedFromA = listB.json.users.find(u => u.username === fixture.manager.username);
+        assert.equal(leakedFromA, undefined, `Usuario de tenant A (${fixture.manager.username}) filtrado en el listado de tenant B`);
+    } finally {
+        await tenantB.cleanup();
+    }
+});
+
+test('admin_user_departments no filtra scopes de departamento entre tenants', async () => {
+    const tenantB = await createTenantBWithAdmin('_depts');
+    try {
+        const deptName = `${TEST_PREFIX}_CrossTenantDept`;
+
+        // Crear un supervisor en tenant B con un department_scope específico
+        const createRes = await requestJson('POST', '/api/admin-users', {
+            token: tenantB.tokenB,
+            body: {
+                username: `${TEST_PREFIX}_supb_depts`.toLowerCase(),
+                password: 'TestPass123',
+                role: 'supervisor',
+                full_name: 'Supervisor Tenant B',
+                department_scopes: [deptName]
+            }
+        });
+        assert.equal(createRes.status, 201);
+
+        // Tenant A no debe poder ver ni ese usuario ni su scope de departamento
+        const listA = await requestJson('GET', '/api/admin-users', { token: adminToken });
+        assert.equal(listA.status, 200);
+        const leaked = listA.json.users.find(u => u.username === `${TEST_PREFIX}_supb_depts`.toLowerCase());
+        assert.equal(leaked, undefined, 'Supervisor de tenant B con department_scope filtrado en tenant A');
+    } finally {
+        await tenantB.cleanup();
     }
 });
 
