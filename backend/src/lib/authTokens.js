@@ -57,8 +57,8 @@ async function verifyAdminPassword(user, password) {
     return bcrypt.compare(String(password || ''), user.password_hash);
 }
 
-async function buildAuthPayload(user, { authKind = 'panel', mobileSessionId = null } = {}) {
-    const departmentScopes = await getUserDepartmentScopes(user.id, user.department);
+async function buildAuthPayload(user, { authKind = 'panel', mobileSessionId = null } = {}, client = null) {
+    const departmentScopes = await getUserDepartmentScopes(user.id, user.tenant_id, user.department, client);
     return {
         id: user.id,
         tenant_id: user.tenant_id,
@@ -89,7 +89,7 @@ function buildUserResponse(payload) {
     };
 }
 
-async function createMobileSession({ user, deviceName, platform, userAgent = null }) {
+async function createMobileSession({ user, deviceName, platform, userAgent = null, client = null }) {
     const refreshToken = generateRefreshToken();
     const refreshTokenHash = hashRefreshToken(refreshToken);
     const result = await pool.query(
@@ -129,7 +129,7 @@ async function createMobileSession({ user, deviceName, platform, userAgent = nul
     const payload = await buildAuthPayload(user, {
         authKind: 'mobile',
         mobileSessionId: session.id
-    });
+    }, client);
 
     return {
         access_token: signAccessToken(payload),
@@ -140,12 +140,14 @@ async function createMobileSession({ user, deviceName, platform, userAgent = nul
     };
 }
 
-async function getMobileSessionByRefreshToken(refreshToken) {
+async function getMobileSessionByRefreshToken(refreshToken, tenantId, client = null) {
+    const db = client || pool;
     const refreshTokenHash = hashRefreshToken(refreshToken);
-    const result = await pool.query(
+    const result = await db.query(
         `SELECT
             ms.id,
             ms.admin_user_id,
+            ms.tenant_id,
             ms.device_name,
             ms.platform,
             ms.expires_at,
@@ -161,14 +163,15 @@ async function getMobileSessionByRefreshToken(refreshToken) {
          JOIN admin_users au
            ON au.id = ms.admin_user_id
          WHERE ms.refresh_token_hash = $1
+           AND ms.tenant_id = $2
          LIMIT 1`,
-        [refreshTokenHash]
+        [refreshTokenHash, tenantId]
     );
     return result.rowCount ? result.rows[0] : null;
 }
 
-async function rotateMobileSession(refreshToken) {
-    const current = await getMobileSessionByRefreshToken(refreshToken);
+async function rotateMobileSession(refreshToken, tenantId, client = null) {
+    const current = await getMobileSessionByRefreshToken(refreshToken, tenantId, client);
     if (!current || current.revoked_at || !current.active || new Date(current.expires_at).getTime() <= Date.now()) {
         return null;
     }
@@ -181,12 +184,14 @@ async function rotateMobileSession(refreshToken) {
              expires_at = NOW() + make_interval(days => $2),
              last_used_at = NOW()
          WHERE id = $3
+           AND tenant_id = $4
            AND revoked_at IS NULL
          RETURNING id, device_name, platform, expires_at, created_at, last_used_at`,
         [
             nextRefreshTokenHash,
             REFRESH_TOKEN_DAYS,
-            current.id
+            current.id,
+            tenantId
         ]
     );
     if (updated.rowCount === 0) return null;
@@ -194,7 +199,7 @@ async function rotateMobileSession(refreshToken) {
     const payload = await buildAuthPayload(current, {
         authKind: 'mobile',
         mobileSessionId: current.id
-    });
+    }, client);
 
     return {
         access_token: signAccessToken(payload),
@@ -205,16 +210,17 @@ async function rotateMobileSession(refreshToken) {
     };
 }
 
-async function revokeMobileSession(refreshToken) {
+async function revokeMobileSession(refreshToken, tenantId) {
     const refreshTokenHash = hashRefreshToken(refreshToken);
     const result = await pool.query(
         `UPDATE mobile_sessions
          SET revoked_at = NOW(),
              last_used_at = NOW()
          WHERE refresh_token_hash = $1
+           AND tenant_id = $2
            AND revoked_at IS NULL
          RETURNING id, admin_user_id, device_name, platform`,
-        [refreshTokenHash]
+        [refreshTokenHash, tenantId]
     );
     return result.rowCount ? result.rows[0] : null;
 }

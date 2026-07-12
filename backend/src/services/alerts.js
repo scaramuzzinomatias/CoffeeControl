@@ -1,5 +1,6 @@
 const nodemailer = require('nodemailer');
 const pool = require('../db/pool');
+const bootstrapPool = require('../db/bootstrapPool');
 const notificationTemplates = require('../config/notificationTemplates');
 const systemSettings = require('./systemSettings');
 const { classifyStockStatus } = require('./stock');
@@ -733,7 +734,7 @@ async function syncStockLowAlert({ machine, stockItem }) {
 
 async function checkMachineOfflineAlerts() {
     try {
-        const result = await pool.query(
+        const result = await bootstrapPool.query(
             `SELECT id, name, location, last_seen, wifi_ssid, wifi_ip, backend_url, tenant_id
              FROM machines
              WHERE active = true`

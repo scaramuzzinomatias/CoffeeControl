@@ -6,6 +6,7 @@ const pool    = require('../db/pool');
 const bootstrapPool = require('../db/bootstrapPool');
 const audit = require('../services/audit');
 const { getUserDepartmentScopes } = require('../lib/accessScope');
+const { beginTenantTransaction } = require('../middleware/tenantTransaction');
 
 const router  = express.Router();
 const SECRET  = process.env.JWT_SECRET || 'cc-dev-secret-change-in-prod';
@@ -41,7 +42,8 @@ router.post('/login', async (req, res) => {
         if (!valid)
             return res.status(401).json({ error: 'Credenciales incorrectas' });
 
-        const departmentScopes = await getUserDepartmentScopes(user.id, user.department);
+        await beginTenantTransaction(req, res, user.tenant_id);
+        const departmentScopes = await getUserDepartmentScopes(user.id, user.tenant_id, user.department, req.db);
         const token = jwt.sign(
             {
                 id: user.id,
@@ -79,7 +81,7 @@ router.post('/change-password', require('../middleware/authJwt'), async (req, re
         return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 8 caracteres' });
 
     try {
-        const result = await pool.query(
+        const result = await req.db.query(
             'SELECT username, password_hash, is_protected FROM admin_users WHERE id = $1',
             [req.user.id]
         );
@@ -103,7 +105,7 @@ router.post('/change-password', require('../middleware/authJwt'), async (req, re
         if (!valid) return res.status(401).json({ error: 'Contraseña actual incorrecta' });
 
         const hash = await bcrypt.hash(new_password, 10);
-        await pool.query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
+        await req.db.query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
         await audit.logAuditEvent({
             req,
             action: 'auth.change_password',

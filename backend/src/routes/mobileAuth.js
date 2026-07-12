@@ -1,5 +1,6 @@
 const express = require('express');
 const audit = require('../services/audit');
+const { beginTenantTransaction } = require('../middleware/tenantTransaction');
 const {
     canUseMobileAuth,
     getActiveAdminUserByUsername,
@@ -32,11 +33,13 @@ router.post('/login', async (req, res) => {
             return res.status(403).json({ error: 'Este rol no tiene acceso móvil habilitado' });
         }
 
+        await beginTenantTransaction(req, res, user.tenant_id);
         const session = await createMobileSession({
             user,
             deviceName: device_name,
             platform,
-            userAgent: req.headers['user-agent'] || null
+            userAgent: req.headers['user-agent'] || null,
+            client: req.db
         });
 
         await audit.logAuditEvent({
@@ -74,7 +77,8 @@ router.post('/refresh', async (req, res) => {
     }
 
     try {
-        const session = await rotateMobileSession(refresh_token);
+        await beginTenantTransaction(req, res, req.tenant_id);
+        const session = await rotateMobileSession(refresh_token, req.tenant_id, req.db);
         if (!session) {
             return res.status(401).json({ error: 'Sesión móvil inválida o expirada' });
         }
@@ -92,7 +96,7 @@ router.post('/logout', async (req, res) => {
     }
 
     try {
-        const session = await revokeMobileSession(refresh_token);
+        const session = await revokeMobileSession(refresh_token, req.tenant_id);
         if (!session) {
             return res.status(404).json({ error: 'Sesión móvil no encontrada o ya cerrada' });
         }

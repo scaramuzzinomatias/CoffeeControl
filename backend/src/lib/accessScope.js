@@ -62,13 +62,15 @@ function departmentsEqual(a, b) {
     return normalizeDepartmentName(a).toLowerCase() === normalizeDepartmentName(b).toLowerCase();
 }
 
-async function getUserDepartmentScopes(userId, fallbackDepartment = null) {
-    const result = await pool.query(
+async function getUserDepartmentScopes(userId, tenantId, fallbackDepartment = null, client = null) {
+    const db = client || pool;
+    const result = await db.query(
         `SELECT department
          FROM admin_user_departments
          WHERE admin_user_id = $1
+           AND tenant_id = $2
          ORDER BY LOWER(department), department`,
-        [userId]
+        [userId, tenantId]
     );
     const scopes = normalizeDepartmentList(result.rows.map(row => row.department));
     if (scopes.length) return scopes;
