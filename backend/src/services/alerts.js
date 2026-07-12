@@ -277,24 +277,24 @@ function getTransport() {
 }
 
 async function openAlert({ alertKey, alertType, machineId = null, employeeId = null, payload = null, tenantId }) {
-    const existing = await pool.query(
+    const existing = await withTenantContext(tenantId, client => client.query(
         `SELECT alert_key, status, last_notified_at
          FROM alert_events
          WHERE alert_key = $1 AND tenant_id = $2`,
         [alertKey, tenantId]
-    );
+    ));
 
     if (existing.rowCount === 0) {
-        await pool.query(
+        await withTenantContext(tenantId, client => client.query(
             `INSERT INTO alert_events(alert_key, alert_type, status, machine_id, employee_id, payload, tenant_id)
              VALUES ($1, $2, 'open', $3, $4, $5::jsonb, $6)`,
             [alertKey, alertType, machineId, employeeId, payload ? JSON.stringify(payload) : null, tenantId]
-        );
+        ));
         return { shouldNotify: true };
     }
 
     const row = existing.rows[0];
-    await pool.query(
+    await withTenantContext(tenantId, client => client.query(
         `UPDATE alert_events
          SET status = 'open',
              machine_id = COALESCE($2, machine_id),
@@ -304,7 +304,7 @@ async function openAlert({ alertKey, alertType, machineId = null, employeeId = n
              payload = $4::jsonb
          WHERE alert_key = $1 AND tenant_id = $5`,
         [alertKey, machineId, employeeId, payload ? JSON.stringify(payload) : null, tenantId]
-    );
+    ));
 
     return {
         shouldNotify: row.status === 'resolved' || !row.last_notified_at
@@ -312,7 +312,7 @@ async function openAlert({ alertKey, alertType, machineId = null, employeeId = n
 }
 
 async function resolveAlert(alertKey, tenantId) {
-    await pool.query(
+    await withTenantContext(tenantId, client => client.query(
         `UPDATE alert_events
          SET status = 'resolved',
              resolved_at = NOW(),
@@ -321,16 +321,16 @@ async function resolveAlert(alertKey, tenantId) {
            AND tenant_id = $2
            AND status <> 'resolved'`,
         [alertKey, tenantId]
-    );
+    ));
 }
 
 async function markAlertNotified(alertKey, tenantId) {
-    await pool.query(
+    await withTenantContext(tenantId, client => client.query(
         `UPDATE alert_events
          SET last_notified_at = NOW()
          WHERE alert_key = $1 AND tenant_id = $2`,
         [alertKey, tenantId]
-    );
+    ));
 }
 
 function alertTypeEnabled(settings, alertType) {
