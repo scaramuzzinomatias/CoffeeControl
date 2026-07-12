@@ -1,4 +1,4 @@
-const pool = require('../db/pool');
+const { withTenantContext } = require('../db/tenantContext');
 const {
     DEFAULT_BUSINESS_TIMEZONE,
     COMMON_TIMEZONE_OPTIONS,
@@ -32,12 +32,12 @@ async function loadSystemSettings(tenantId, force = false) {
     }
 
     try {
-        const result = await pool.query(
+        const result = await withTenantContext(tenantId, client => client.query(
             `SELECT business_timezone
              FROM system_settings
              WHERE id = 1 AND tenant_id = $1`,
             [tenantId]
-        );
+        ));
 
         const settings = result.rowCount > 0
             ? sanitizeSystemSettings(result.rows[0])
@@ -74,14 +74,14 @@ async function getSystemSettings(tenantId) {
 async function saveSystemSettings(tenantId, input = {}) {
     const businessTimeZone = assertBusinessTimeZone(input.business_timezone);
 
-    await pool.query(
+    await withTenantContext(tenantId, client => client.query(
         `INSERT INTO system_settings(id, tenant_id, business_timezone, updated_at)
          VALUES (1, $1, $2, NOW())
          ON CONFLICT (tenant_id, id) DO UPDATE SET
             business_timezone = EXCLUDED.business_timezone,
             updated_at = NOW()`,
         [tenantId, businessTimeZone]
-    );
+    ));
 
     invalidateSystemSettingsCache(tenantId);
     return getSystemSettings(tenantId);
