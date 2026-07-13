@@ -469,12 +469,12 @@ async function notifyEmployeeDailyBlocked({ employeeId, employeeName, dailyLimit
 }
 
 async function loadEmployeeWarningRecipients(employeeId, tenantId) {
-    const employeeResult = await pool.query(
+    const employeeResult = await withTenantContext(tenantId, client => client.query(
         `SELECT id, name, email, department, warning_enabled
          FROM employees
          WHERE id = $1 AND active = true AND tenant_id = $2`,
         [employeeId, tenantId]
-    );
+    ));
 
     if (employeeResult.rowCount === 0) return null;
 
@@ -487,7 +487,7 @@ async function loadEmployeeWarningRecipients(employeeId, tenantId) {
     if (employee.email) recipients.push(employee.email);
 
     if (employee.department) {
-        const supervisorResult = await pool.query(
+        const supervisorResult = await withTenantContext(tenantId, client => client.query(
             `SELECT email
              FROM admin_users
              WHERE active = true
@@ -507,7 +507,7 @@ async function loadEmployeeWarningRecipients(employeeId, tenantId) {
                AND aud.tenant_id = $2
                AND TRIM(LOWER(aud.department)) = TRIM(LOWER($1))`,
             [employee.department, tenantId]
-        );
+        ));
         recipients.push(...supervisorResult.rows.map(row => row.email));
     }
 
