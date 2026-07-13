@@ -1,4 +1,5 @@
 const pool = require('../db/pool');
+const { withTenantContext } = require('../db/tenantContext');
 
 const SENSITIVE_KEYS = new Set([
     'password',
@@ -60,7 +61,7 @@ async function logAuditEvent({
     const cleanDetails = sanitizeValue(details);
 
     try {
-        await pool.query(
+        await withTenantContext(actor.tenant_id, client => client.query(
             `INSERT INTO audit_logs(
                 actor_user_id,
                 actor_username,
@@ -90,7 +91,7 @@ async function logAuditEvent({
                 cleanDetails ? JSON.stringify(cleanDetails) : null,
                 actor.tenant_id
             ]
-        );
+        ));
     } catch (err) {
         console.error('[AUDIT] Error registrando evento:', err.message);
     }
@@ -121,7 +122,7 @@ async function getAuditLogs({ entityType, action, q, limit = 200, tenantId }) {
     params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
     const whereSql = `WHERE ${clauses.join(' AND ')}`;
 
-    const result = await pool.query(
+    const result = await withTenantContext(tenantId, client => client.query(
         `SELECT
             id,
             actor_user_id,
@@ -141,8 +142,7 @@ async function getAuditLogs({ entityType, action, q, limit = 200, tenantId }) {
          ORDER BY created_at DESC, id DESC
          LIMIT $${params.length}`,
         params
-    );
-
+    ));
     return result.rows;
 }
 

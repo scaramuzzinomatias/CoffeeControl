@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db/pool');
+const { withTenantContext } = require('../db/tenantContext');
 const bootstrapPool = require('../db/bootstrapPool');
 const { broadcast } = require('../ws');
 const {
@@ -203,7 +204,7 @@ function buildMachineTechnicalDrift(desiredConfig, reportedConfig) {
 }
 
 async function getLastMachineTechnicalAudit(machineId, tenantId) {
-    const result = await pool.query(
+    const result = await withTenantContext(tenantId, client => client.query(
         `SELECT action,
                 actor_username,
                 actor_role,
@@ -218,7 +219,7 @@ async function getLastMachineTechnicalAudit(machineId, tenantId) {
          ORDER BY created_at DESC, id DESC
          LIMIT 1`,
         [String(machineId), tenantId]
-    );
+    ));
     if (result.rowCount === 0) return null;
     const row = result.rows[0];
     return {
