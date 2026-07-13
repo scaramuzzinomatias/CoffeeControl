@@ -58,12 +58,8 @@
 
 > Nota: `access_levels`/`firmware_releases`/`machine_commands`/`nfc_cards`/`taps` tenían 100% de su acceso ya vía `req.db` desde antes de esta ronda de migración. `system_settings`, `notification_settings`, `alert_events`, `employees`, `audit_logs`, `stock_movements`, `machine_stock_items` y `mobile_sessions` se migraron explícitamente de `pool.query` a `withTenantContext` como parte de esta migración, y recién después se activó RLS ahí. `admin_user_departments` ya tenía 100% de acceso vía `req.db` (sin `pool.query`).
 
-### Group B — RLS Policies Exist (v34) but NOT Enabled (2 tables)
-
-| Table | Files with `pool.query` | pool.query count | Priority |
-|-------|------------------------|-----------------|----------|
-| `admin_users` | 6 files | 3 + 2 bootstrap | 3 |
-| `machines` | 10 files | 1 + 5 bootstrap | 3 |
+| `admin_users` | v43 | `req.db` | bootstrapPool reads bypass RLS |
+| `machines` | v43 | `req.db` + `bootstrapPool` (register, MAC lookup) | bootstrapPool reads bypass RLS |
 
 ---
 
@@ -82,6 +78,7 @@
 | `backend/sql/migration_v40.sql` | **ENABLE RLS** on `audit_logs` |
 | `backend/sql/migration_v41.sql` | **ENABLE RLS** on `stock_movements`, `machine_stock_items` |
 | `backend/sql/migration_v42.sql` | **ENABLE RLS** on `mobile_sessions` |
+| `backend/sql/migration_v43.sql` | **ENABLE RLS** on `admin_users`, `machines` |
 
 ## Commits (chronological on master)
 4be3bfb feat: activa RLS en mobile_sessions
@@ -175,6 +172,6 @@ SELECT relname, relrowsecurity FROM pg_class WHERE relname = '<table_name>';
 - `stock_movements` + `machine_stock_items` (v41) — 8 queries + 3 reports migrated, `withTransaction` removed, RLS activo.
 - `mobile_sessions` (v42) — 4 queries migrated in `authTokens.js` (`createMobileSession`, `rotateMobileSession`, `revokeMobileSession`), RLS activo.
 
-## Next Steps (Priority Order)
+## Next Steps
 
-1. `admin_users` + `machines` — bootstrapPool access requires architectural consideration
+RLS migration complete — 16/16 tenant-scoped tables with RLS active as of v43.
