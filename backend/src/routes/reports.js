@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db/pool');
+const { withTenantContext } = require('../db/tenantContext');
 const systemSettings = require('../services/systemSettings');
 const { buildDepartmentScopeClause } = require('../lib/accessScope');
 const { requireManager, requireAnalyticsViewer } = require('../middleware/roleAccess');
@@ -611,100 +612,105 @@ router.get('/stock', requireManager, async (req, res) => {
         const params = [range.from, range.to, range.timeZone, req.user.tenant_id];
         const movementRangeSql = buildBusinessDateRangeSql('sm.created_at', 1, 2, 3);
 
-        const itemsResult = await pool.query(
-            `WITH movement_summary AS (
+        const { itemsResult, movementSummaryResult, recentMovementsResult } = await withTenantContext(req.user.tenant_id, async (client) => {
+            const itemsResult = await client.query(
+                `WITH movement_summary AS (
+                    SELECT
+                        sm.stock_item_id,
+                        COALESCE(SUM(CASE WHEN sm.movement_type = 'sale' THEN ABS(sm.quantity_delta) ELSE 0 END), 0) AS sales_units,
+                        COALESCE(SUM(CASE WHEN sm.movement_type = 'restock' THEN GREATEST(sm.quantity_delta, 0) ELSE 0 END), 0) AS restocked_units,
+                        COALESCE(SUM(CASE WHEN sm.movement_type = 'adjustment' THEN sm.quantity_delta ELSE 0 END), 0) AS adjustment_delta,
+                        MAX(sm.created_at) AS last_movement_at,
+                        MAX(sm.created_at) FILTER (WHERE sm.movement_type = 'sale') AS last_sale_at,
+                        MAX(sm.created_at) FILTER (WHERE sm.movement_type = 'restock') AS last_restock_at
+                    FROM stock_movements sm
+                    WHERE ${movementRangeSql}
+                      AND sm.stock_item_id IS NOT NULL
+                      AND sm.tenant_id = $4
+                    GROUP BY sm.stock_item_id
+                )
                 SELECT
+                    si.id,
+                    si.machine_id,
+                    si.item_id,
+                    si.product_name,
+                    si.slot_label,
+                    si.capacity_units,
+                    si.current_units,
+                    si.min_units,
+                    si.active,
+                    si.updated_at,
+                    m.name AS machine_name,
+                    m.location,
+                    ms.sales_units,
+                    ms.restocked_units,
+                    ms.adjustment_delta,
+                    ms.last_movement_at,
+                    ms.last_sale_at,
+                    ms.last_restock_at
+                 FROM machine_stock_items si
+                 JOIN machines m ON m.id = si.machine_id AND m.tenant_id = $4
+                 LEFT JOIN movement_summary ms ON ms.stock_item_id = si.id
+                 WHERE m.active = true
+                   AND si.tenant_id = $4
+                 ORDER BY
+                    CASE
+                        WHEN si.active = false THEN 3
+                        WHEN si.current_units <= 0 THEN 0
+                        WHEN si.current_units <= si.min_units THEN 1
+                        ELSE 2
+                    END,
+                    si.current_units ASC,
+                    m.name ASC,
+                    si.item_id ASC`,
+                params
+            );
+
+            const movementSummaryResult = await client.query(
+                `SELECT
+                    COALESCE(SUM(CASE WHEN movement_type = 'sale' THEN ABS(quantity_delta) ELSE 0 END), 0) AS sales_units,
+                    COALESCE(SUM(CASE WHEN movement_type = 'restock' THEN GREATEST(quantity_delta, 0) ELSE 0 END), 0) AS restocked_units,
+                    COALESCE(SUM(CASE WHEN movement_type = 'adjustment' THEN quantity_delta ELSE 0 END), 0) AS adjustment_delta,
+                    COALESCE(SUM(CASE WHEN movement_type = 'unconfigured_sale' THEN ABS(quantity_delta) ELSE 0 END), 0) AS unconfigured_sales,
+
+                    COUNT(*) AS total_movements,
+                    MAX(created_at) AS last_movement_at
+                 FROM stock_movements
+                 WHERE ${buildBusinessDateRangeSql('created_at', 1, 2, 3)}
+                   AND tenant_id = $4`,
+                params
+            );
+
+            const recentMovementsResult = await client.query(
+                `SELECT
+                    sm.id,
+                    sm.machine_id,
                     sm.stock_item_id,
-                    COALESCE(SUM(CASE WHEN sm.movement_type = 'sale' THEN ABS(sm.quantity_delta) ELSE 0 END), 0) AS sales_units,
-                    COALESCE(SUM(CASE WHEN sm.movement_type = 'restock' THEN GREATEST(sm.quantity_delta, 0) ELSE 0 END), 0) AS restocked_units,
-                    COALESCE(SUM(CASE WHEN sm.movement_type = 'adjustment' THEN sm.quantity_delta ELSE 0 END), 0) AS adjustment_delta,
-                    MAX(sm.created_at) AS last_movement_at,
-                    MAX(sm.created_at) FILTER (WHERE sm.movement_type = 'sale') AS last_sale_at,
-                    MAX(sm.created_at) FILTER (WHERE sm.movement_type = 'restock') AS last_restock_at
-                FROM stock_movements sm
-                WHERE ${movementRangeSql}
-                  AND sm.stock_item_id IS NOT NULL
-                  AND sm.tenant_id = $4
-                GROUP BY sm.stock_item_id
-            )
-            SELECT
-                si.id,
-                si.machine_id,
-                si.item_id,
-                si.product_name,
-                si.slot_label,
-                si.capacity_units,
-                si.current_units,
-                si.min_units,
-                si.active,
-                si.updated_at,
-                m.name AS machine_name,
-                m.location,
-                ms.sales_units,
-                ms.restocked_units,
-                ms.adjustment_delta,
-                ms.last_movement_at,
-                ms.last_sale_at,
-                ms.last_restock_at
-             FROM machine_stock_items si
-             JOIN machines m ON m.id = si.machine_id AND m.tenant_id = $4
-             LEFT JOIN movement_summary ms ON ms.stock_item_id = si.id
-             WHERE m.active = true
-               AND si.tenant_id = $4
-             ORDER BY
-                CASE
-                    WHEN si.active = false THEN 3
-                    WHEN si.current_units <= 0 THEN 0
-                    WHEN si.current_units <= si.min_units THEN 1
-                    ELSE 2
-                END,
-                si.current_units ASC,
-                m.name ASC,
-                si.item_id ASC`,
-            params
-        );
+                    sm.item_id,
+                    sm.movement_type,
+                    sm.quantity_delta,
+                    sm.previous_units,
+                    sm.current_units,
+                    sm.note,
+                    sm.created_at,
+                    m.name AS machine_name,
+                    m.location,
+                    au.username AS actor_username,
+                    COALESCE(si.product_name, CONCAT('Selección ', sm.item_id::text)) AS product_name,
+                    si.slot_label
+                 FROM stock_movements sm
+                 JOIN machines m ON m.id = sm.machine_id AND m.tenant_id = $4
+                 LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
+                 LEFT JOIN admin_users au ON au.id = sm.actor_user_id
+                 WHERE ${buildBusinessDateRangeSql('sm.created_at', 1, 2, 3)}
+                   AND sm.tenant_id = $4
+                 ORDER BY sm.created_at DESC, sm.id DESC
+                 LIMIT 40`,
+                params
+            );
 
-        const movementSummaryResult = await pool.query(
-            `SELECT
-                COALESCE(SUM(CASE WHEN movement_type = 'sale' THEN ABS(quantity_delta) ELSE 0 END), 0) AS sales_units,
-                COALESCE(SUM(CASE WHEN movement_type = 'restock' THEN GREATEST(quantity_delta, 0) ELSE 0 END), 0) AS restocked_units,
-                COALESCE(SUM(CASE WHEN movement_type = 'adjustment' THEN quantity_delta ELSE 0 END), 0) AS adjustment_delta,
-                COALESCE(SUM(CASE WHEN movement_type = 'unconfigured_sale' THEN ABS(quantity_delta) ELSE 0 END), 0) AS unconfigured_sales,
-                COUNT(*) AS total_movements,
-                MAX(created_at) AS last_movement_at
-             FROM stock_movements
-             WHERE ${buildBusinessDateRangeSql('created_at', 1, 2, 3)}
-               AND tenant_id = $4`,
-            params
-        );
-
-        const recentMovementsResult = await pool.query(
-            `SELECT
-                sm.id,
-                sm.machine_id,
-                sm.stock_item_id,
-                sm.item_id,
-                sm.movement_type,
-                sm.quantity_delta,
-                sm.previous_units,
-                sm.current_units,
-                sm.note,
-                sm.created_at,
-                m.name AS machine_name,
-                m.location,
-                au.username AS actor_username,
-                COALESCE(si.product_name, CONCAT('Selección ', sm.item_id::text)) AS product_name,
-                si.slot_label
-             FROM stock_movements sm
-             JOIN machines m ON m.id = sm.machine_id AND m.tenant_id = $4
-             LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
-             LEFT JOIN admin_users au ON au.id = sm.actor_user_id
-             WHERE ${buildBusinessDateRangeSql('sm.created_at', 1, 2, 3)}
-               AND sm.tenant_id = $4
-             ORDER BY sm.created_at DESC, sm.id DESC
-             LIMIT 40`,
-            params
-        );
+            return { itemsResult, movementSummaryResult, recentMovementsResult };
+        });
 
         const items = itemsResult.rows.map(serializeStockReportItem);
         const summary = buildStockReportSummary(items, movementSummaryResult.rows[0]);
