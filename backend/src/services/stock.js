@@ -1,4 +1,5 @@
 const pool = require('../db/pool');
+const { withTenantContext } = require('../db/tenantContext');
 
 function stockError(statusCode, message) {
     const err = new Error(message);
@@ -139,81 +140,67 @@ function validateStockDraft(input = {}, { partial = false } = {}) {
     };
 }
 
-async function withTransaction(work) {
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const result = await work(client);
-        await client.query('COMMIT');
-        return result;
-    } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (_) {}
-        throw err;
-    } finally {
-        client.release();
-    }
-}
-
 async function getMachineStock(machineId, tenantId, { includeInactive = true, movementLimit = 20 } = {}) {
     const machineIdInt = parseInteger(machineId, null);
     if (!Number.isInteger(machineIdInt)) {
         throw stockError(400, 'ID de máquina inválido.');
     }
     const tenantIdInt = parseInteger(tenantId, null);
-    const itemParams = [machineIdInt, tenantIdInt];
     const inactiveSql = includeInactive ? '' : 'AND si.active = true';
-    const itemsResult = await pool.query(
-        `SELECT
-            si.id,
-            si.machine_id,
-            si.item_id,
-            si.product_name,
-            si.slot_label,
-            si.capacity_units,
-            si.current_units,
-            si.min_units,
-            si.active,
-            si.created_at,
-            si.updated_at
-         FROM machine_stock_items si
-         WHERE si.machine_id = $1
-           AND si.tenant_id = $2
-           ${inactiveSql}
-         ORDER BY si.active DESC, si.item_id ASC, si.id ASC`,
-        itemParams
-    );
-    const items = itemsResult.rows.map(serializeStockItem);
-    const movementsResult = await pool.query(
-        `SELECT
-            sm.id,
-            sm.machine_id,
-            sm.stock_item_id,
-            sm.item_id,
-            sm.movement_type,
-            sm.quantity_delta,
-            sm.previous_units,
-            sm.current_units,
-            sm.tap_id,
-            sm.actor_user_id,
-            au.username AS actor_username,
-            COALESCE(si.product_name, CONCAT('Selección ', sm.item_id::text)) AS product_name,
-            si.slot_label,
-            sm.note,
-            sm.created_at
-         FROM stock_movements sm
-         LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
-         LEFT JOIN admin_users au ON au.id = sm.actor_user_id
-         WHERE sm.machine_id = $1
-           AND sm.tenant_id = $2
-         ORDER BY sm.created_at DESC, sm.id DESC
-         LIMIT $3`,
-        [machineIdInt, tenantIdInt, Math.min(Math.max(parseInteger(movementLimit, 20) || 20, 1), 100)]
-    );
-    return {
-        summary: buildSummary(items),
-        items,
-        movements: movementsResult.rows.map(serializeStockMovement)
-    };
+    return withTenantContext(tenantId, async (client) => {
+        const itemsResult = await client.query(
+            `SELECT
+                si.id,
+                si.machine_id,
+                si.item_id,
+                si.product_name,
+                si.slot_label,
+                si.capacity_units,
+                si.current_units,
+                si.min_units,
+                si.active,
+                si.created_at,
+                si.updated_at
+             FROM machine_stock_items si
+             WHERE si.machine_id = $1
+               AND si.tenant_id = $2
+               ${inactiveSql}
+             ORDER BY si.active DESC, si.item_id ASC, si.id ASC`,
+            [machineIdInt, tenantIdInt]
+        );
+        const items = itemsResult.rows.map(serializeStockItem);
+        const movementsResult = await client.query(
+            `SELECT
+                sm.id,
+                sm.machine_id,
+                sm.stock_item_id,
+                sm.item_id,
+                sm.movement_type,
+                sm.quantity_delta,
+                sm.previous_units,
+                sm.current_units,
+                sm.tap_id,
+                sm.actor_user_id,
+                au.username AS actor_username,
+                COALESCE(si.product_name, CONCAT('Selección ', sm.item_id::text)) AS product_name,
+                si.slot_label,
+                sm.note,
+                sm.created_at
+             FROM stock_movements sm
+             LEFT JOIN machine_stock_items si ON si.id = sm.stock_item_id
+             LEFT JOIN admin_users au ON au.id = sm.actor_user_id
+             WHERE sm.machine_id = $1
+               AND sm.tenant_id = $2
+             ORDER BY sm.created_at DESC, sm.id DESC
+             LIMIT $3`,
+            [machineIdInt, tenantIdInt, Math.min(Math.max(parseInteger(movementLimit, 20) || 20, 1), 100)]
+        );
+        return {
+            summary: buildSummary(items),
+            items,
+            movements: movementsResult.rows.map(serializeStockMovement)
+        };
+    });
 }
 
 async function getMachineStockSummaryMap(machineIds = [], tenantId = null) {
@@ -223,7 +210,7 @@ async function getMachineStockSummaryMap(machineIds = [], tenantId = null) {
     if (!ids.length) return new Map();
 
     const tenantIdInt = parseInteger(tenantId, null);
-    const result = await pool.query(
+    const result = await withTenantContext(tenantId, (client) => client.query(
         `SELECT
             machine_id,
             COUNT(*) FILTER (WHERE active = true) AS configured_items,
@@ -236,7 +223,7 @@ async function getMachineStockSummaryMap(machineIds = [], tenantId = null) {
            AND tenant_id = $2
          GROUP BY machine_id`,
         [ids, tenantIdInt]
-    );
+    ));
 
     const map = new Map();
     for (const row of result.rows) {
@@ -275,7 +262,7 @@ async function createStockItem({
     });
     const tenantIdInt = parseInteger(tenantId, null);
 
-    return withTransaction(async (client) => {
+    return withTenantContext(tenantId, async (client) => {
         const insertResult = await client.query(
             `INSERT INTO machine_stock_items(
                 machine_id,
@@ -361,7 +348,7 @@ async function updateStockItem({
     }, { partial: true });
     const tenantIdInt = parseInteger(tenantId, null);
 
-    return withTransaction(async (client) => {
+    return withTenantContext(tenantId, async (client) => {
         const existingResult = await client.query(
             `SELECT *
              FROM machine_stock_items
@@ -458,7 +445,7 @@ async function restockStockItem({
     }
     const tenantIdInt = parseInteger(tenantId, null);
 
-    return withTransaction(async (client) => {
+    return withTenantContext(tenantId, async (client) => {
         const existingResult = await client.query(
             `SELECT *
              FROM machine_stock_items
@@ -526,7 +513,7 @@ async function adjustStockItem({
     }
     const tenantIdInt = parseInteger(tenantId, null);
 
-    return withTransaction(async (client) => {
+    return withTenantContext(tenantId, async (client) => {
         const existingResult = await client.query(
             `SELECT *
              FROM machine_stock_items
@@ -593,7 +580,7 @@ async function recordSale({
     }
     const tenantIdInt = parseInteger(tenantId, null);
 
-    return withTransaction(async (client) => {
+    return withTenantContext(tenantId, async (client) => {
         const itemResult = await client.query(
             `SELECT *
              FROM machine_stock_items
