@@ -37,7 +37,7 @@
 
 ## Inventory: 16 Tenant-Scoped Tables
 
-### Group A — RLS Active (14 tables)
+### Group A — RLS Active (16 tables)
 
 | Table | Enabled By | Access Pattern | Notes |
 |-------|-----------|----------------|-------|
@@ -55,11 +55,10 @@
 | `stock_movements` | v41 | `withTenantContext` | 8 queries + 3 reports migrated |
 | `machine_stock_items` | v41 | `withTenantContext` | 12 queries migrated |
 | `mobile_sessions` | v42 | `client \|\| pool` + `withTenantContext` | 4 queries migrated in authTokens.js |
-
-> Nota: `access_levels`/`firmware_releases`/`machine_commands`/`nfc_cards`/`taps` tenían 100% de su acceso ya vía `req.db` desde antes de esta ronda de migración. `system_settings`, `notification_settings`, `alert_events`, `employees`, `audit_logs`, `stock_movements`, `machine_stock_items` y `mobile_sessions` se migraron explícitamente de `pool.query` a `withTenantContext` como parte de esta migración, y recién después se activó RLS ahí. `admin_user_departments` ya tenía 100% de acceso vía `req.db` (sin `pool.query`).
-
 | `admin_users` | v43 | `req.db` | bootstrapPool reads bypass RLS |
 | `machines` | v43 | `req.db` + `bootstrapPool` (register, MAC lookup) | bootstrapPool reads bypass RLS |
+
+> Nota: `access_levels`/`firmware_releases`/`machine_commands`/`nfc_cards`/`taps` tenían 100% de su acceso ya vía `req.db` desde antes de esta ronda de migración. `system_settings`, `notification_settings`, `alert_events`, `employees`, `audit_logs`, `stock_movements`, `machine_stock_items` y `mobile_sessions` se migraron explícitamente de `pool.query` a `withTenantContext` como parte de esta migración, y recién después se activó RLS ahí. `admin_user_departments` ya tenía 100% de acceso vía `req.db` (sin `pool.query`).
 
 ---
 
