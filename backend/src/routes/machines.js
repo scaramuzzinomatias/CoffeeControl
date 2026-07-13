@@ -1,5 +1,4 @@
 const express = require('express');
-const pool = require('../db/pool');
 const { withTenantContext } = require('../db/tenantContext');
 const bootstrapPool = require('../db/bootstrapPool');
 const { broadcast } = require('../ws');
