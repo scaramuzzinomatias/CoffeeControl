@@ -37,7 +37,7 @@
 
 ## Inventory: 16 Tenant-Scoped Tables
 
-### Group A — RLS Active (11 tables)
+### Group A — RLS Active (14 tables)
 
 | Table | Enabled By | Access Pattern | Notes |
 |-------|-----------|----------------|-------|
@@ -52,16 +52,16 @@
 | `employees` | v38 | `withTenantContext` | 2 queries migrated (loadEmployeeWarningRecipients) |
 | `admin_user_departments` | v39 | `req.db` | Ya 100% vía req.db antes de activar RLS |
 | `audit_logs` | v40 | `withTenantContext` | 3 queries migrated (logAuditEvent, getAuditLogs, getLastMachineTechnicalAudit) |
+| `stock_movements` | v41 | `withTenantContext` | 8 queries + 3 reports migrated |
+| `machine_stock_items` | v41 | `withTenantContext` | 12 queries migrated |
+| `mobile_sessions` | v42 | `client \|\| pool` + `withTenantContext` | 4 queries migrated in authTokens.js |
 
-> Nota: `access_levels`/`firmware_releases`/`machine_commands`/`nfc_cards`/`taps` tenían 100% de su acceso ya vía `req.db` desde antes de esta ronda de migración. `system_settings`, `notification_settings`, `alert_events`, `employees` y `audit_logs` se migraron explícitamente de `pool.query` a `withTenantContext` como parte de esta migración, y recién después se activó RLS ahí. `admin_user_departments` ya tenía 100% de acceso vía `req.db` (sin `pool.query`).
+> Nota: `access_levels`/`firmware_releases`/`machine_commands`/`nfc_cards`/`taps` tenían 100% de su acceso ya vía `req.db` desde antes de esta ronda de migración. `system_settings`, `notification_settings`, `alert_events`, `employees`, `audit_logs`, `stock_movements`, `machine_stock_items` y `mobile_sessions` se migraron explícitamente de `pool.query` a `withTenantContext` como parte de esta migración, y recién después se activó RLS ahí. `admin_user_departments` ya tenía 100% de acceso vía `req.db` (sin `pool.query`).
 
-### Group B — RLS Policies Exist (v34) but NOT Enabled (5 tables)
+### Group B — RLS Policies Exist (v34) but NOT Enabled (2 tables)
 
 | Table | Files with `pool.query` | pool.query count | Priority |
 |-------|------------------------|-----------------|----------|
-| `stock_movements` | `services/stock.js`, `routes/reports.js` | 10 | 1 |
-| `machine_stock_items` | `services/stock.js`, `routes/reports.js` | 12 | 1 |
-| `mobile_sessions` | `lib/authTokens.js` | 4 | 2 |
 | `admin_users` | 6 files | 3 + 2 bootstrap | 3 |
 | `machines` | 10 files | 1 + 5 bootstrap | 3 |
 
@@ -80,8 +80,16 @@
 | `backend/sql/migration_v38.sql` | **ENABLE RLS** on `employees` |
 | `backend/sql/migration_v39.sql` | **ENABLE RLS** on `admin_user_departments` |
 | `backend/sql/migration_v40.sql` | **ENABLE RLS** on `audit_logs` |
+| `backend/sql/migration_v41.sql` | **ENABLE RLS** on `stock_movements`, `machine_stock_items` |
+| `backend/sql/migration_v42.sql` | **ENABLE RLS** on `mobile_sessions` |
 
 ## Commits (chronological on master)
+4be3bfb feat: activa RLS en mobile_sessions
+4e2a5bc feat: migra mobile_sessions a withTenantContext (authTokens.js)
+d2bd29c add migration_v41.sql (RLS on stock_movements + machine_stock_items)
+6af4c14 migrate reports.js /stock handler to withTenantContext (stock_movements + machine_stock_items)
+c5b51ce migrate stock.js to withTenantContext (stock_movements + machine_stock_items)
+a168d3b docs: actualiza AGENTS.md tras activar RLS en employees, admin_user_departments y audit_logs
 824ac56 feat: activa RLS en audit_logs
 2fce942 feat: migra audit_logs a withTenantContext
 4144e3f feat: activa RLS en admin_user_departments
@@ -107,8 +115,8 @@ be2ad56 feat: cierra el frente de RLS — políticas creadas en 11 tablas
 | `backend/src/services/systemSettings.js` | Migrated to `withTenantContext` (pilot) |
 | `backend/src/services/alerts.js` | `notification_settings` + `alert_events` + `employees` migrated to `withTenantContext`. Zero `pool.query`/`pool.connect` calls remain |
 | `backend/src/services/audit.js` | Migrated to `withTenantContext` — 3 queries (logAuditEvent, getAuditLogs, getLastMachineTechnicalAudit) |
-| `backend/src/services/stock.js` | Uses `pool.query` + `pool.connect()` — pending migration |
-| `backend/src/lib/authTokens.js` | Uses `pool.query` — pending migration (auth path) |
+| `backend/src/services/stock.js` | Fully migrated — `withTransaction` removed, 8 queries via `withTenantContext` |
+| `backend/src/lib/authTokens.js` | Uses `client \|\| pool` + `withTenantContext` — migrated (mobile_sessions) |
 | `backend/src/lib/accessScope.js` | No migration needed — `getUserDepartmentScopes` receives `client` from both callers |
 | `backend/test/integration.test.js` | 41 tests including 5 cross-tenant isolation tests |
 
@@ -164,9 +172,9 @@ SELECT relname, relrowsecurity FROM pg_class WHERE relname = '<table_name>';
 - `employees` (v38) — 2 queries (`loadEmployeeWarningRecipients`) migrated to `withTenantContext`, RLS activo.
 - `admin_user_departments` (v39) — RLS activo (ya 100% vía req.db).
 - `audit_logs` (v40) — 3 queries (`logAuditEvent`, `getAuditLogs`, `getLastMachineTechnicalAudit`) migrated, RLS activo.
+- `stock_movements` + `machine_stock_items` (v41) — 8 queries + 3 reports migrated, `withTransaction` removed, RLS activo.
+- `mobile_sessions` (v42) — 4 queries migrated in `authTokens.js` (`createMobileSession`, `rotateMobileSession`, `revokeMobileSession`), RLS activo.
 
 ## Next Steps (Priority Order)
 
-1. `stock_movements` + `machine_stock_items` — refactor `services/stock.js` transactions (highest query count, most complex)
-2. `mobile_sessions` — refactor `lib/authTokens.js` (auth critical path — extra care needed)
-3. `admin_users` + `machines` — bootstrapPool access requires architectural consideration
+1. `admin_users` + `machines` — bootstrapPool access requires architectural consideration
