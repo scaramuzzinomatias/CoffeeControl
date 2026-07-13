@@ -1,3 +1,4 @@
+const pool = require('../db/pool');
 const bootstrapPool = require('../db/bootstrapPool');
 const { beginTenantTransaction } = require('./tenantTransaction');
 
@@ -35,7 +36,7 @@ async function machineAuth(req, res, next) {
 
         await beginTenantTransaction(req, res, machine.tenant_id);
 
-        req.db.query(
+        pool.query(
             'UPDATE machines SET last_seen = NOW() WHERE id = $1 AND tenant_id = $2',
             [machine.id, machine.tenant_id]
         ).catch(() => {});
