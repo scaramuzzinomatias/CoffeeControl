@@ -9,14 +9,21 @@
 const bootstrapPool = require('../db/bootstrapPool');
 
 async function resolveTenantFromHost(req, res, next) {
-    const host = req.headers['x-forwarded-host'] || req.headers['host'];
-    if (!host) {
-        return res.status(400).json({ error: 'Host header requerido' });
+    const headerSlug = req.headers['x-tenant-slug'];
+
+    let slug;
+    if (headerSlug && typeof headerSlug === 'string' && headerSlug.trim()) {
+        slug = headerSlug.trim().toLowerCase();
+    } else {
+        const host = req.headers['x-forwarded-host'] || req.headers['host'];
+        if (!host) {
+            return res.status(400).json({ error: 'Host header requerido' });
+        }
+        slug = host.split('.')[0].toLowerCase();
     }
 
-    const slug = host.split('.')[0].toLowerCase();
     if (!slug) {
-        return res.status(400).json({ error: 'Host header inválido', host });
+        return res.status(400).json({ error: 'No se pudo determinar el tenant (slug vacío)' });
     }
 
     try {
@@ -24,11 +31,9 @@ async function resolveTenantFromHost(req, res, next) {
             'SELECT id, slug, active FROM tenants WHERE slug = $1 AND active = true',
             [slug]
         );
-
         if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Tenant no encontrado', slug });
         }
-
         req.tenant_id = result.rows[0].id;
         next();
     } catch (err) {

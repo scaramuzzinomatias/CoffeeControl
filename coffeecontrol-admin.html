@@ -1077,8 +1077,12 @@ tr:hover td{background:var(--bg2);}
 <div class="login-box">
   <div class="login-logo">CoffeeControl</div>
   <div class="login-sub">Panel de administración</div>
-  <div class="login-err" id="loginErr"></div>
-  <div class="field"><label>Usuario</label><input type="text" id="loginUser" value="admin" autocomplete="username"></div>
+      <div class="login-err" id="loginErr"></div>
+      <div class="field">
+        <label>Empresa (slug)</label>
+        <input type="text" id="loginTenantSlug" placeholder="mi-empresa" autocomplete="organization" style="text-transform:lowercase">
+      </div>
+      <div class="field"><label>Usuario</label><input type="text" id="loginUser" value="admin" autocomplete="username"></div>
   <div class="field">
     <label>Contraseña</label>
     <input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password">
@@ -1207,6 +1211,8 @@ const AV=[{bg:'#e6f1fb',c:'#0c447c'},{bg:'#faeeda',c:'#633806'},{bg:'#e1f5ee',c:
 //  Init
 // ══════════════════════════════════════════════════════
 document.getElementById('loginUrl').value = BASE;
+const savedSlug = localStorage.getItem('cc_tenant_slug');
+if (savedSlug) document.getElementById('loginTenantSlug').value = savedSlug;
 if(TOKEN) showApp();
 
 // ══════════════════════════════════════════════════════
@@ -1222,16 +1228,23 @@ function toggleLoginPassword(){
 async function doLogin(){
   BASE = document.getElementById('loginUrl').value.trim().replace(/\/$/,'');
   localStorage.setItem('cc_url2', BASE);
+  const tenantSlug = document.getElementById('loginTenantSlug').value.trim().toLowerCase();
   const u = document.getElementById('loginUser').value.trim();
   const p = document.getElementById('loginPass').value;
   const err = document.getElementById('loginErr');
   err.style.display='none';
+  if(!tenantSlug){
+    err.textContent = 'Ingresá el slug de tu empresa';
+    err.style.display='block';
+    return;
+  }
   try{
-    const res = await fetch(BASE+'/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const res = await fetch(BASE+'/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json','X-Tenant-Slug':tenantSlug},body:JSON.stringify({username:u,password:p})});
     const d = await res.json();
     if(!res.ok) throw new Error(d.error||'Error');
     TOKEN = d.token;
     localStorage.setItem('cc_token', TOKEN);
+    localStorage.setItem('cc_tenant_slug', tenantSlug);
     showApp();
   }catch(e){
     err.textContent = e.message;

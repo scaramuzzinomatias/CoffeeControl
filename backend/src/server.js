@@ -9,6 +9,8 @@ const machineAuth  = require('./middleware/machineAuth');
 const authJwt      = require('./middleware/authJwt');
 const resolveTenantFromHost = require('./middleware/resolveTenantFromHost');
 const checkRegistrationSecret = require('./middleware/checkRegistrationSecret');
+const authSuperadmin = require('./middleware/authSuperadmin');
+const tenantRoutes = require('./routes/tenants');
 
 const authRoutes       = require('./routes/auth');
 const mobileAuthRoutes = require('./routes/mobileAuth');
@@ -106,6 +108,7 @@ app.use('/api/audit-logs', authJwt, auditLogsRoutes);
 app.use('/api/mobile-tech', authJwt, mobileTechRoutes);
 app.use('/api/alerts', authJwt, alertsRoutes);
 app.use('/api/firmware', authJwt, firmwareRoutes);
+app.use('/api/superadmin/tenants', authSuperadmin, tenantRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
