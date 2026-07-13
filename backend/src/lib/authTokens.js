@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
+const { withTenantContext } = require('../db/tenantContext');
 const bootstrapPool = require('../db/bootstrapPool');
 const { getUserDepartmentScopes } = require('./accessScope');
 
@@ -92,7 +93,8 @@ function buildUserResponse(payload) {
 async function createMobileSession({ user, deviceName, platform, userAgent = null, client = null }) {
     const refreshToken = generateRefreshToken();
     const refreshTokenHash = hashRefreshToken(refreshToken);
-    const result = await pool.query(
+    const db = client || pool;
+    const result = await db.query(
         `INSERT INTO mobile_sessions (
             admin_user_id,
             device_name,
@@ -178,7 +180,8 @@ async function rotateMobileSession(refreshToken, tenantId, client = null) {
 
     const nextRefreshToken = generateRefreshToken();
     const nextRefreshTokenHash = hashRefreshToken(nextRefreshToken);
-    const updated = await pool.query(
+    const db = client || pool;
+    const updated = await db.query(
         `UPDATE mobile_sessions
          SET refresh_token_hash = $1,
              expires_at = NOW() + make_interval(days => $2),
@@ -212,7 +215,7 @@ async function rotateMobileSession(refreshToken, tenantId, client = null) {
 
 async function revokeMobileSession(refreshToken, tenantId) {
     const refreshTokenHash = hashRefreshToken(refreshToken);
-    const result = await pool.query(
+    const result = await withTenantContext(tenantId, (client) => client.query(
         `UPDATE mobile_sessions
          SET revoked_at = NOW(),
              last_used_at = NOW()
@@ -221,7 +224,7 @@ async function revokeMobileSession(refreshToken, tenantId) {
            AND revoked_at IS NULL
          RETURNING id, admin_user_id, device_name, platform`,
         [refreshTokenHash, tenantId]
-    );
+    ));
     return result.rowCount ? result.rows[0] : null;
 }
 
