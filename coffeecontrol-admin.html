@@ -1079,8 +1079,9 @@ tr:hover td{background:var(--bg2);}
   <div class="login-sub">Panel de administración</div>
       <div class="login-err" id="loginErr"></div>
       <div class="field">
-        <label>Empresa (slug)</label>
-        <input type="text" id="loginTenantSlug" placeholder="mi-empresa" autocomplete="organization" style="text-transform:lowercase">
+        <label>Empresa</label>
+        <input type="text" id="loginTenantSlug" placeholder="mi-empresa" autocomplete="organization" style="text-transform:lowercase" oninput="onTenantSlugInput()">
+        <div id="tenantSlugFeedback" style="font-size:11px;margin-top:4px;min-height:14px"></div>
       </div>
       <div class="field"><label>Usuario</label><input type="text" id="loginUser" value="admin" autocomplete="username"></div>
   <div class="field">
@@ -1250,6 +1251,49 @@ async function doLogin(){
     err.textContent = e.message;
     err.style.display='block';
   }
+}
+
+// ══════════════════════════════════════════════════════
+//  Validación en vivo del slug de empresa (debounce)
+// ══════════════════════════════════════════════════════
+let tenantCheckTimer = null;
+let tenantCheckSeq = 0;
+
+function onTenantSlugInput(){
+  const fb = document.getElementById('tenantSlugFeedback');
+  const slug = document.getElementById('loginTenantSlug').value.trim().toLowerCase();
+  clearTimeout(tenantCheckTimer);
+  if(!slug){
+    fb.textContent = '';
+    return;
+  }
+  fb.style.color = 'var(--tx3)';
+  fb.textContent = 'Verificando...';
+  const mySeq = ++tenantCheckSeq;
+  tenantCheckTimer = setTimeout(async () => {
+    const base = document.getElementById('loginUrl').value.trim().replace(/\/$/,'');
+    try{
+      const res = await fetch(base+'/api/auth/tenant-check?slug='+encodeURIComponent(slug));
+      const d = await res.json();
+      if(mySeq !== tenantCheckSeq) return;
+      if(res.status === 429){
+        fb.style.color = 'var(--txw)';
+        fb.textContent = 'Demasiadas consultas, esperá un momento.';
+        return;
+      }
+      if(d.valid){
+        fb.style.color = 'var(--txs)';
+        fb.textContent = '✓ ' + d.name;
+      }else{
+        fb.style.color = 'var(--txd)';
+        fb.textContent = 'Empresa no encontrada';
+      }
+    }catch(e){
+      if(mySeq !== tenantCheckSeq) return;
+      fb.style.color = 'var(--txd)';
+      fb.textContent = 'No se pudo verificar';
+    }
+  }, 400);
 }
 document.getElementById('loginPass').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 

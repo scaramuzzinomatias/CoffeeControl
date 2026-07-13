@@ -12,7 +12,7 @@ const router  = express.Router();
 const SECRET  = process.env.JWT_SECRET || 'cc-dev-secret-change-in-prod';
 
 // POST /api/auth/login
-router.post('/login', async (req, res) => {
+router.post('/login', require('../middleware/rateLimiters').loginLimiter, async (req, res) => {
     const { username, password } = req.body;
 
     if (!username || !password)

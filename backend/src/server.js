@@ -13,6 +13,7 @@ const authSuperadmin = require('./middleware/authSuperadmin');
 const tenantRoutes = require('./routes/tenants');
 
 const authRoutes       = require('./routes/auth');
+const publicAuthRoutes = require('./routes/publicAuth');
 const mobileAuthRoutes = require('./routes/mobileAuth');
 const tapRoutes        = require('./routes/tap');
 const dashboardRoutes  = require('./routes/dashboard');
@@ -80,6 +81,7 @@ app.use((req, res, next) => {
 });
 
 // Rutas públicas — requieren resolución de tenant por subdominio
+app.use('/api/auth', publicAuthRoutes);
 app.use('/api/auth', resolveTenantFromHost, authRoutes);
 app.use('/api/mobile-auth', resolveTenantFromHost, mobileAuthRoutes);
 
