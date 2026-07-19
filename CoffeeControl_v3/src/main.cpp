@@ -935,13 +935,26 @@ void ledTagRejectedPattern() {
 }
 
 void updateStatusLed() {
-    bool ready = !portalMode && wifiReady && backendReady && (WiFi.status() == WL_CONNECTED);
-    if (!ready || (long)(statusLedSuppressUntilMs - millis()) > 0) {
+    if ((long)(statusLedSuppressUntilMs - millis()) > 0) return;
+
+    if (portalMode) {
         ledWrite(false);
         return;
     }
 
-    // "Late" corto cada 1 segundo para indicar que el equipo sigue vivo.
+    bool wifiOk = WiFi.status() == WL_CONNECTED;
+    bool backendOk = wifiReady && backendReady;
+
+    if (!wifiOk) {
+        ledWrite(true);
+        return;
+    }
+
+    if (!backendOk) {
+        ledWrite((millis() % 250UL) < 120UL);
+        return;
+    }
+
     ledWrite((millis() % 1000UL) < 60UL);
 }
 

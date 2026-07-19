@@ -78,8 +78,11 @@
 | `backend/sql/migration_v41.sql` | **ENABLE RLS** on `stock_movements`, `machine_stock_items` |
 | `backend/sql/migration_v42.sql` | **ENABLE RLS** on `mobile_sessions` |
 | `backend/sql/migration_v43.sql` | **ENABLE RLS** on `admin_users`, `machines` |
+| `backend/sql/migration_v44.sql` | `ALTER TABLE taps ALTER COLUMN employee_id DROP NOT NULL` — permite taps de tarjetas desconocidas |
 
 ## Commits (chronological on master)
+988f0a8 fix: funciona offline sin WiFi — reintenta cada 30s en vez de entrar en portal + LED status
+ffa8254 feat: permite employee_id NULL en taps para tarjetas desconocidas
 4be3bfb feat: activa RLS en mobile_sessions
 4e2a5bc feat: migra mobile_sessions a withTenantContext (authTokens.js)
 d2bd29c add migration_v41.sql (RLS on stock_movements + machine_stock_items)
@@ -170,6 +173,17 @@ SELECT relname, relrowsecurity FROM pg_class WHERE relname = '<table_name>';
 - `audit_logs` (v40) — 3 queries (`logAuditEvent`, `getAuditLogs`, `getLastMachineTechnicalAudit`) migrated, RLS activo.
 - `stock_movements` + `machine_stock_items` (v41) — 8 queries + 3 reports migrated, `withTransaction` removed, RLS activo.
 - `mobile_sessions` (v42) — 4 queries migrated in `authTokens.js` (`createMobileSession`, `rotateMobileSession`, `revokeMobileSession`), RLS activo.
+- `taps` (v44) — `employee_id DROP NOT NULL` para permitir taps de tarjetas desconocidas.
+
+## Firmware Changes (CoffeeControl_v3)
+
+- **Offline mode sin WiFi**: si WiFi falla al boot con SSID configurado, el ESP **no entra en portal** — funciona offline con auth local y reintenta WiFi cada 30s. Portal solo accesible por botón BOOT (5s hold) o sin SSID configurado.
+- **LED status**:
+  - Sin WiFi → encendido fijo
+  - WiFi OK, backend no → parpadeo rápido cada 250ms
+  - WiFi + backend OK → parpadeo breve cada 1s
+  - Portal → apagado
+  - Tag leída → pulso largo (aprobada) / 4 parpadeos rápidos (rechazada)
 
 ## Next Steps
 
