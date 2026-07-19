@@ -98,7 +98,7 @@
 // ── Modo de deployment ────────────────────────────────
 // Opción B — servidor local (URL configurable en el portal)
 #define DEPLOYMENT_MODE       "local"
-#define BACKEND_URL           "http://192.168.1.50:3000"   // fallback si campo vacío
+#define BACKEND_URL           "http://coffeecontrol.smartq.com.ar:3000"   // fallback si campo vacío
 #define REGISTRATION_SECRET   "coffeecontrol-registro-2024"
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION      "3.1.21"
@@ -319,8 +319,8 @@ MdbGatewaySnapshot mdbGatewaySnapshot{};
 MdbGatewayRuntimeState mdbGatewayRuntime;
 
 // ── WiFi / backend ────────────────────────────────────
-String wifiSSID    = "";
-String wifiPass    = "";
+String wifiSSID    = "Tiziana";
+String wifiPass    = "Mateo123";
 String backendBase = BACKEND_URL;
 String macAddress  = "";
 String backendLastError = "";
@@ -1702,6 +1702,8 @@ String testPortalConnection(const String& rawSsid, const String& rawPass, const 
     delay(150);
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(ssid.c_str(), pass.c_str());
+    //WiFi.setTxPower(WIFI_POWER_2dBm); 
+    //Serial.printf("Set TX power: %d dBm\n", WIFI_POWER_2dBm);
 
     unsigned long started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < 12000) {
@@ -2053,9 +2055,11 @@ bool connectWiFi() {
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+    //WiFi.setTxPower(WIFI_POWER_2dBm); 
     Serial.printf("[WiFi] Conectando a %s", wifiSSID.c_str());
-
+    //Serial.printf("Set TX power: %d dBm\n", WIFI_POWER_2dBm);
     int t = 0;
+
     while (WiFi.status() != WL_CONNECTED && t++ < 30) {
         delay(500);
         Serial.print(".");
@@ -3434,8 +3438,7 @@ void setup() {
         startPortal();
     } else {
         if (!connectWiFi()) {
-            Serial.println("[BOOT] Fallo WiFi → modo portal");
-            startPortal();
+            Serial.println("[BOOT] Fallo WiFi → funcionando offline (reintento cada 30s)");
         } else {
             Serial.printf("[CFG] Backend: %s\n", backendBase.c_str());
 
